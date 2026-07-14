@@ -23,11 +23,11 @@ st0x-alpaca = { git = "ssh://git@github.com/ST0x-Technology/st0x.alpaca", featur
   `APCA-API-SECRET-KEY` headers), and the exponential-backoff retry policy.
   `AlpacaError` is the shared error taxonomy; surface modules add their own
   invariant variants on top.
-- **Neutral wire types**: quantities and money are `rust_decimal::Decimal`
-  exactly as Alpaca encodes them (JSON strings, numbers accepted on
-  deserialization). Consumers convert to their own domain newtypes at the
-  boundary; domain policy (positivity, precision truncation, telemetry) stays in
-  the consuming service.
+- **Shared finance types**: validated symbols, equity quantities, USD values,
+  and USDC amounts use `st0x-finance` while preserving Alpaca's JSON
+  string-or-number decoding. Asset-dependent position quantities remain wire
+  decimals because one position endpoint returns equities, options, crypto, and
+  USDC rows.
 - **Telemetry-free**: no `tracing` dependency; consumers wrap calls with their
   own instrumentation.
 
