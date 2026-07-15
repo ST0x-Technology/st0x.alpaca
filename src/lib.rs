@@ -22,7 +22,9 @@
 //! instrumentation. Wire types are neutral (strings, decimals, addresses);
 //! consumers convert to their domain newtypes at the boundary.
 
+mod auth;
 pub mod core;
+mod rate_limit;
 
 #[cfg(feature = "broker")]
 pub mod broker;
@@ -33,4 +35,6 @@ pub mod market_data;
 #[cfg(feature = "wallet")]
 pub mod wallet;
 
-pub use core::{AlpacaAuth, AlpacaClient, AlpacaError};
+pub use auth::{ALPACA_SANDBOX_TOKEN_URL, ALPACA_TOKEN_URL, AuthRuntime, KmsJwtAuth, KmsJwtError};
+pub use core::{AlpacaAuth, AlpacaClient, AlpacaError, Backpressure, Permanence};
+pub use rate_limit::retry_after_from_response_headers;

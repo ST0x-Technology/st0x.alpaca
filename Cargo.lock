@@ -1681,6 +1681,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e7c1832837b905bbfb5101e07cc24c8deddf52f93225eee6ead5f4d63d53ddcb"
 dependencies = [
  "const-oid",
+ "pem-rfc7468",
  "zeroize",
 ]
 
@@ -1840,6 +1841,7 @@ dependencies = [
  "ff",
  "generic-array",
  "group",
+ "pem-rfc7468",
  "pkcs8",
  "rand_core 0.6.4",
  "sec1",
@@ -3099,6 +3101,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "pem-rfc7468"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "88b39c9bfcfc231068454382784bb460aae594343fb030d46e9f50a645418412"
+dependencies = [
+ "base64ct",
+]
+
+[[package]]
 name = "percent-encoding"
 version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3666,6 +3677,7 @@ dependencies = [
  "rustls-platform-verifier",
  "serde",
  "serde_json",
+ "serde_urlencoded",
  "sync_wrapper",
  "tokio",
  "tokio-rustls",
@@ -4130,6 +4142,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "ryu"
+version = "1.0.23"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
+
+[[package]]
 name = "same-file"
 version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4374,6 +4392,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_urlencoded"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d3491c14715ca2294c4d6a88f15e84739788c1d030eed8c110436aafdaa2f3fd"
+dependencies = [
+ "form_urlencoded",
+ "itoa",
+ "ryu",
+ "serde",
+]
+
+[[package]]
 name = "serde_with"
 version = "3.21.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4553,13 +4583,16 @@ dependencies = [
  "alloy-primitives",
  "async-trait",
  "backon",
+ "base64",
  "chrono",
  "chrono-tz",
  "httpmock",
+ "p256",
  "reqwest",
  "rust_decimal",
  "serde",
  "serde_json",
+ "sha2",
  "st0x-finance",
  "thiserror",
  "tokio",
@@ -4569,8 +4602,8 @@ dependencies = [
 
 [[package]]
 name = "st0x-finance"
-version = "0.1.0"
-source = "git+https://github.com/ST0x-Technology/st0x.finance?rev=819b6f6bd04c9dcd0f9c0cdded0a07038cd06139#819b6f6bd04c9dcd0f9c0cdded0a07038cd06139"
+version = "0.2.0"
+source = "git+https://github.com/ST0x-Technology/st0x.finance?tag=v0.2.0#49cf157109508516ff6a01868d471c7649234b2f"
 dependencies = [
  "alloy-primitives",
  "rain-math-float",
@@ -4582,16 +4615,16 @@ dependencies = [
 
 [[package]]
 name = "st0x-float-macro"
-version = "0.1.0"
-source = "git+https://github.com/ST0x-Technology/st0x.finance?rev=819b6f6bd04c9dcd0f9c0cdded0a07038cd06139#819b6f6bd04c9dcd0f9c0cdded0a07038cd06139"
+version = "0.2.0"
+source = "git+https://github.com/ST0x-Technology/st0x.finance?tag=v0.2.0#49cf157109508516ff6a01868d471c7649234b2f"
 dependencies = [
  "rain-math-float",
 ]
 
 [[package]]
 name = "st0x-float-serde"
-version = "0.1.0"
-source = "git+https://github.com/ST0x-Technology/st0x.finance?rev=819b6f6bd04c9dcd0f9c0cdded0a07038cd06139#819b6f6bd04c9dcd0f9c0cdded0a07038cd06139"
+version = "0.2.0"
+source = "git+https://github.com/ST0x-Technology/st0x.finance?tag=v0.2.0#49cf157109508516ff6a01868d471c7649234b2f"
 dependencies = [
  "rain-math-float",
  "serde",

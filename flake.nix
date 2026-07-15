@@ -17,7 +17,11 @@
         packages = rainix.packages.${system};
 
         devShells.default = pkgs.mkShell {
-          inherit (rainix.devShells.${system}.default) buildInputs nativeBuildInputs shellHook;
+          packages = [
+            rainix.rust-toolchain.${system}
+            pkgs.git
+            pkgs.pkg-config
+          ];
         };
       }
     );

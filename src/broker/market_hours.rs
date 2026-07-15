@@ -1,6 +1,6 @@
 //! Market-session classification from Alpaca's trading calendar.
 
-use chrono::{DateTime, NaiveDate, NaiveTime, Utc};
+use chrono::{DateTime, Days, LocalResult, NaiveDate, NaiveTime, TimeZone, Timelike, Utc};
 use chrono_tz::America::New_York;
 use serde::Deserialize;
 use std::cmp::Ordering;
@@ -9,7 +9,7 @@ use super::{BrokerApiError, get_json};
 use crate::core::AlpacaClient;
 
 /// The market session a given instant falls into.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, Deserialize)]
 pub enum MarketSession {
     /// Regular trading hours (typically 09:30-16:00 ET).
     Regular,
@@ -17,8 +17,72 @@ pub enum MarketSession {
     /// 04:00-09:30 and 16:00-20:00 ET). Alpaca only allows
     /// `extended_hours: true` on limit orders, not market orders.
     Extended,
+    /// Overnight Blue Ocean session (20:00-04:00 ET) when its trade date is open.
+    Overnight,
     /// Outside every trading session, including non-trading days.
     Closed,
+}
+
+/// Market-session classification together with Alpaca's raw calendar bounds.
+///
+/// `bounds` is absent when Alpaca reports that the queried date is not a
+/// trading day. Consumers can inspect the raw bounds to detect changes in
+/// Alpaca's undocumented extended-session semantics without coupling telemetry
+/// to this crate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct MarketSessionDetails {
+    pub session: MarketSession,
+    pub bounds: Option<MarketSessionBounds>,
+}
+
+/// Alpaca calendar bounds for one trading day.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct MarketSessionBounds {
+    pub date: NaiveDate,
+    pub regular_open: NaiveTime,
+    pub regular_close: NaiveTime,
+    pub session_open: NaiveTime,
+    pub session_close: NaiveTime,
+}
+
+/// Classification of the gap after an extended-hours close.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PostCloseGap {
+    OrdinaryOvernight,
+    MultiDayClosure,
+    Unknown,
+    Unavailable,
+}
+
+/// Session classification with close metadata for consumer policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarketSessionStatus {
+    Regular,
+    Extended {
+        closes_at: Option<DateTime<Utc>>,
+        post_close_gap: PostCloseGap,
+    },
+    Overnight,
+    Closed,
+}
+
+impl MarketSessionStatus {
+    /// Creates a status when an executor can classify the session but cannot
+    /// supply extended-close metadata.
+    #[must_use]
+    pub const fn without_close_metadata(session: MarketSession) -> Self {
+        match session {
+            MarketSession::Regular => Self::Regular,
+            MarketSession::Extended => Self::Extended {
+                closes_at: None,
+                post_close_gap: PostCloseGap::Unavailable,
+            },
+            MarketSession::Overnight => Self::Overnight,
+            MarketSession::Closed => Self::Closed,
+        }
+    }
 }
 
 /// Response from the Alpaca calendar endpoint
@@ -83,6 +147,57 @@ pub async fn market_session(client: &AlpacaClient) -> Result<MarketSession, Brok
     market_session_at(client, Utc::now()).await
 }
 
+/// Returns the current session together with Alpaca's raw calendar bounds.
+///
+/// # Errors
+///
+/// Returns the same errors as [`market_session_details_at`].
+pub async fn market_session_details(
+    client: &AlpacaClient,
+) -> Result<MarketSessionDetails, BrokerApiError> {
+    market_session_details_at(client, Utc::now()).await
+}
+
+/// Returns the current session and extended-close metadata.
+///
+/// # Errors
+///
+/// Returns an error when calendar lookup or local-time conversion fails.
+pub async fn market_session_status(
+    client: &AlpacaClient,
+) -> Result<MarketSessionStatus, BrokerApiError> {
+    market_session_status_at(client, Utc::now()).await
+}
+
+/// Returns the session and close-gap classification at `now`.
+///
+/// # Errors
+///
+/// Returns an error when calendar lookup or local-time conversion fails.
+pub async fn market_session_status_at(
+    client: &AlpacaClient,
+    now: DateTime<Utc>,
+) -> Result<MarketSessionStatus, BrokerApiError> {
+    let details = market_session_details_at(client, now).await?;
+
+    match details.session {
+        MarketSession::Regular => Ok(MarketSessionStatus::Regular),
+        MarketSession::Overnight => Ok(MarketSessionStatus::Overnight),
+        MarketSession::Closed => Ok(MarketSessionStatus::Closed),
+        MarketSession::Extended => {
+            let bounds = details
+                .bounds
+                .ok_or(BrokerApiError::MissingCalendarBounds {
+                    date: now.with_timezone(&New_York).date_naive(),
+                })?;
+            Ok(MarketSessionStatus::Extended {
+                closes_at: Some(local_market_time_to_utc(bounds.date, bounds.session_close)?),
+                post_close_gap: classify_post_close_gap(client, bounds.date).await,
+            })
+        }
+    }
+}
+
 /// Returns the market session at the given time.
 ///
 /// The broker may answer a non-trading-day query with the NEAREST trading
@@ -102,17 +217,49 @@ pub async fn market_session_at(
     client: &AlpacaClient,
     now: DateTime<Utc>,
 ) -> Result<MarketSession, BrokerApiError> {
+    Ok(market_session_details_at(client, now).await?.session)
+}
+
+/// Returns the session and Alpaca's raw calendar bounds at the given time.
+///
+/// The classification and date-mismatch behavior are identical to
+/// [`market_session_at`]. The raw bounds are returned without logging so the
+/// consumer owns any telemetry policy around unexpected broker values.
+///
+/// # Errors
+///
+/// Returns [`BrokerApiError::CalendarDateMismatch`] when the calendar answers
+/// with an earlier date than queried, and [`BrokerApiError::Alpaca`] on
+/// transport or API failures.
+pub async fn market_session_details_at(
+    client: &AlpacaClient,
+    now: DateTime<Utc>,
+) -> Result<MarketSessionDetails, BrokerApiError> {
     let now_et = now.with_timezone(&New_York);
     let today = now_et.date_naive();
 
     let calendar = get_calendar(client, today, today).await?;
 
     let Some(today_calendar) = calendar.into_iter().next() else {
-        return Ok(MarketSession::Closed);
+        if now_et.time().hour() >= 20 && is_trading_day(client, next_day(today)?).await? {
+            return Ok(MarketSessionDetails {
+                session: MarketSession::Overnight,
+                bounds: None,
+            });
+        }
+        return Ok(MarketSessionDetails {
+            session: MarketSession::Closed,
+            bounds: None,
+        });
     };
 
     match today_calendar.date.cmp(&today) {
-        Ordering::Greater => return Ok(MarketSession::Closed),
+        Ordering::Greater => {
+            return Ok(MarketSessionDetails {
+                session: MarketSession::Closed,
+                bounds: None,
+            });
+        }
         Ordering::Less => {
             return Err(BrokerApiError::CalendarDateMismatch {
                 queried: today,
@@ -123,16 +270,84 @@ pub async fn market_session_at(
     }
 
     let now_time = now_et.time();
+    let overnight = if now_time.hour() < 4 {
+        true
+    } else if now_time.hour() >= 20 {
+        is_trading_day(client, next_day(today)?).await?
+    } else {
+        false
+    };
 
     let session = if now_time >= today_calendar.open && now_time < today_calendar.close {
         MarketSession::Regular
     } else if now_time >= today_calendar.session_open && now_time < today_calendar.session_close {
         MarketSession::Extended
+    } else if overnight {
+        MarketSession::Overnight
     } else {
         MarketSession::Closed
     };
 
-    Ok(session)
+    Ok(MarketSessionDetails {
+        session,
+        bounds: Some(MarketSessionBounds {
+            date: today_calendar.date,
+            regular_open: today_calendar.open,
+            regular_close: today_calendar.close,
+            session_open: today_calendar.session_open,
+            session_close: today_calendar.session_close,
+        }),
+    })
+}
+
+fn next_day(date: NaiveDate) -> Result<NaiveDate, BrokerApiError> {
+    date.checked_add_days(Days::new(1))
+        .ok_or(BrokerApiError::CalendarDateOverflow { date })
+}
+
+async fn is_trading_day(client: &AlpacaClient, date: NaiveDate) -> Result<bool, BrokerApiError> {
+    Ok(get_calendar(client, date, date)
+        .await?
+        .into_iter()
+        .any(|day| day.date == date))
+}
+
+async fn classify_post_close_gap(client: &AlpacaClient, trading_day: NaiveDate) -> PostCloseGap {
+    let Some(start) = trading_day.checked_add_days(Days::new(1)) else {
+        return PostCloseGap::Unknown;
+    };
+    let Some(end) = trading_day.checked_add_days(Days::new(14)) else {
+        return PostCloseGap::Unknown;
+    };
+    let Ok(calendar) = get_calendar(client, start, end).await else {
+        return PostCloseGap::Unknown;
+    };
+    let Some(next) = calendar
+        .into_iter()
+        .map(|day| day.date)
+        .filter(|date| *date > trading_day)
+        .min()
+    else {
+        return PostCloseGap::Unknown;
+    };
+
+    if next == start {
+        PostCloseGap::OrdinaryOvernight
+    } else {
+        PostCloseGap::MultiDayClosure
+    }
+}
+
+fn local_market_time_to_utc(
+    date: NaiveDate,
+    time: NaiveTime,
+) -> Result<DateTime<Utc>, BrokerApiError> {
+    match New_York.from_local_datetime(&date.and_time(time)) {
+        LocalResult::Single(value) => Ok(value.with_timezone(&Utc)),
+        LocalResult::Ambiguous(_, _) | LocalResult::None => {
+            Err(BrokerApiError::InvalidCalendarLocalTime { date, time })
+        }
+    }
 }
 
 /// Returns true if the market is open for regular trading at the given
@@ -214,6 +429,28 @@ mod tests {
         });
     }
 
+    fn mock_calendar_range(server: &MockServer, start: &str, end: &str, trading_dates: &[&str]) {
+        let days = trading_dates
+            .iter()
+            .map(|date| {
+                json!({
+                    "date": date,
+                    "open": "09:30",
+                    "close": "16:00",
+                    "session_open": "0400",
+                    "session_close": "2000"
+                })
+            })
+            .collect::<Vec<_>>();
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/calendar")
+                .query_param("start", start)
+                .query_param("end", end);
+            then.status(200).json_body(json!(days));
+        });
+    }
+
     /// Constructs a UTC timestamp for a specific ET time on a given date.
     fn et_time_as_utc(date: &str, hour: u32, minute: u32) -> DateTime<Utc> {
         let naive_date = NaiveDate::parse_from_str(date, "%Y-%m-%d").unwrap();
@@ -240,6 +477,77 @@ mod tests {
         assert_eq!(
             calendar[0].close,
             NaiveTime::from_hms_opt(16, 0, 0).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn market_session_details_exposes_raw_calendar_bounds() {
+        let server = MockServer::start();
+        mock_calendar_day(&server, "2025-07-03", "09:30", "13:00", "0500", "1700");
+
+        let client = test_client(server.base_url());
+        let after_regular_close = et_time_as_utc("2025-07-03", 13, 1);
+
+        let details = market_session_details_at(&client, after_regular_close)
+            .await
+            .unwrap();
+        let bounds = details.bounds.unwrap();
+
+        assert_eq!(details.session, MarketSession::Extended);
+        assert_eq!(bounds.date, NaiveDate::from_ymd_opt(2025, 7, 3).unwrap());
+        assert_eq!(
+            bounds.regular_open,
+            NaiveTime::from_hms_opt(9, 30, 0).unwrap()
+        );
+        assert_eq!(
+            bounds.regular_close,
+            NaiveTime::from_hms_opt(13, 0, 0).unwrap()
+        );
+        assert_eq!(
+            bounds.session_open,
+            NaiveTime::from_hms_opt(5, 0, 0).unwrap()
+        );
+        assert_eq!(
+            bounds.session_close,
+            NaiveTime::from_hms_opt(17, 0, 0).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn sunday_evening_starts_monday_overnight_session() {
+        let server = MockServer::start();
+        mock_non_trading_day(&server, "2025-01-05");
+        mock_trading_day(&server, "2025-01-06");
+
+        let status = market_session_status_at(
+            &test_client(server.base_url()),
+            et_time_as_utc("2025-01-05", 21, 0),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(status, MarketSessionStatus::Overnight);
+    }
+
+    #[tokio::test]
+    async fn friday_extended_session_reports_multi_day_post_close_gap() {
+        let server = MockServer::start();
+        mock_trading_day(&server, "2025-01-03");
+        mock_calendar_range(&server, "2025-01-04", "2025-01-17", &["2025-01-06"]);
+
+        let status = market_session_status_at(
+            &test_client(server.base_url()),
+            et_time_as_utc("2025-01-03", 18, 0),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            status,
+            MarketSessionStatus::Extended {
+                closes_at: Some(et_time_as_utc("2025-01-03", 20, 0)),
+                post_close_gap: PostCloseGap::MultiDayClosure,
+            }
         );
     }
 
@@ -313,6 +621,16 @@ mod tests {
                 || error.to_string().contains("invalid characters"),
             "expected parse error for minute 60, got: {error}"
         );
+    }
+
+    #[test]
+    fn next_day_rejects_calendar_overflow() {
+        assert!(matches!(
+            next_day(NaiveDate::MAX),
+            Err(BrokerApiError::CalendarDateOverflow {
+                date: NaiveDate::MAX
+            })
+        ));
     }
 
     #[tokio::test]
@@ -486,7 +804,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn market_session_closed_before_extended_session() {
+    async fn market_session_overnight_before_extended_session() {
         let server = MockServer::start();
         mock_trading_day(&server, "2025-01-06");
 
@@ -495,23 +813,24 @@ mod tests {
 
         assert_eq!(
             market_session_at(&client, overnight).await.unwrap(),
-            MarketSession::Closed,
-            "3:00 AM ET is before session_open (4:00), should be Closed"
+            MarketSession::Overnight,
+            "3:00 AM ET on a trading day is the overnight morning leg"
         );
     }
 
     #[tokio::test]
-    async fn market_session_closed_after_extended_session() {
+    async fn market_session_overnight_after_extended_session() {
         let server = MockServer::start();
         mock_trading_day(&server, "2025-01-06");
+        mock_trading_day(&server, "2025-01-07");
 
         let client = test_client(server.base_url());
         let late_night = et_time_as_utc("2025-01-06", 21, 0);
 
         assert_eq!(
             market_session_at(&client, late_night).await.unwrap(),
-            MarketSession::Closed,
-            "9:00 PM ET is after session_close (20:00), should be Closed"
+            MarketSession::Overnight,
+            "9:00 PM ET starts the next trading day's overnight session"
         );
     }
 
@@ -598,21 +917,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn market_session_closed_at_session_close_boundary() {
+    async fn market_session_overnight_at_session_close_boundary() {
         // The extended window is half-open: `now < session_close`, so 20:00
-        // ET exactly (the documented after-hours close) is already Closed.
-        // Pins the top edge of the session so a `<=` regression would be
-        // caught.
+        // ET exactly (the documented after-hours close) begins Overnight.
+        // Pins both sides of the shared boundary.
         let server = MockServer::start();
         mock_trading_day(&server, "2025-01-06");
+        mock_trading_day(&server, "2025-01-07");
 
         let client = test_client(server.base_url());
         let at_session_close = et_time_as_utc("2025-01-06", 20, 0);
 
         assert_eq!(
             market_session_at(&client, at_session_close).await.unwrap(),
-            MarketSession::Closed,
-            "Exactly at session_close (20:00 ET) the extended session has ended -> Closed"
+            MarketSession::Overnight,
+            "Exactly at 20:00 ET the overnight session begins"
         );
     }
 }

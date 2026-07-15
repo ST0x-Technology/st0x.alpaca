@@ -13,7 +13,6 @@ default = []
 issuer = [
   "dep:alloy-primitives",
   "dep:async-trait",
-  "dep:chrono",
   "dep:rust_decimal",
   "dep:st0x-finance",
   "dep:uuid",
@@ -21,23 +20,15 @@ issuer = [
 # Broker API trading surface: orders, positions, journals, account, clock
 # (st0x.liquidity).
 broker = [
-  "dep:chrono",
   "dep:chrono-tz",
   "dep:rust_decimal",
   "dep:st0x-finance",
-  "dep:tokio",
   "dep:url",
   "dep:uuid",
 ]
 # Crypto wallet surface: funding wallets, transfers, whitelists
 # (st0x.liquidity).
-wallet = [
-  "dep:alloy-primitives",
-  "dep:chrono",
-  "dep:st0x-finance",
-  "dep:tokio",
-  "dep:uuid",
-]
+wallet = ["dep:alloy-primitives", "dep:st0x-finance", "dep:uuid"]
 # Market data surface: quotes/snapshots (st0x.liquidity).
 market-data = ["dep:st0x-finance"]
 
@@ -45,18 +36,28 @@ market-data = ["dep:st0x-finance"]
 alloy-primitives = { version = "1", features = ["serde"], optional = true }
 async-trait = { version = "0.1", optional = true }
 backon = "1"
-chrono = { version = "0.4", features = ["serde"], optional = true }
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = { version = "0.10", optional = true }
+p256 = { version = "0.13", default-features = false, features = [
+  "ecdsa",
+  "pem",
+  "pkcs8",
+  "std",
+] }
 reqwest = { version = "0.13", default-features = false, features = [
+  "form",
   "json",
+  "query",
   "rustls",
 ] }
 rust_decimal = { version = "1", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-st0x-finance = { git = "https://github.com/ST0x-Technology/st0x.finance", rev = "819b6f6bd04c9dcd0f9c0cdded0a07038cd06139", version = "0.1.0", optional = true }
+sha2 = "0.10"
+st0x-finance = { git = "https://github.com/ST0x-Technology/st0x.finance", version = "0.2.0", optional = true, tag = "v0.2.0" }
 thiserror = "2"
-tokio = { version = "1", features = ["time"], optional = true }
+tokio = { version = "1", features = ["time", "sync"] }
 url = { version = "2", features = ["serde"], optional = true }
 uuid = { version = "1", features = ["serde", "v4"], optional = true }
 

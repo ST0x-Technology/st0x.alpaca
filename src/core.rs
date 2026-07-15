@@ -7,20 +7,48 @@ use backon::{ExponentialBuilder, Retryable};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
+use crate::auth::{AuthRuntime, KmsJwtError};
+
 /// Alpaca API credentials applied to every request.
-#[derive(Clone)]
-pub struct AlpacaAuth {
-    pub api_key: String,
-    pub api_secret: String,
+#[derive(Clone, Deserialize)]
+#[serde(untagged)]
+pub enum AlpacaAuth {
+    Basic {
+        api_key: String,
+        api_secret: String,
+    },
+    KmsJwt {
+        client_id: String,
+        kms_key_version: String,
+    },
+    PrivateKeyJwt {
+        client_id: String,
+        private_key_pem: String,
+    },
 }
 
 impl std::fmt::Debug for AlpacaAuth {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("AlpacaAuth")
-            .field("api_key", &"<redacted>")
-            .field("api_secret", &"<redacted>")
-            .finish()
+        match self {
+            Self::Basic { .. } => formatter
+                .debug_struct("Basic")
+                .field("api_key", &"<redacted>")
+                .field("api_secret", &"<redacted>")
+                .finish(),
+            Self::KmsJwt {
+                client_id,
+                kms_key_version,
+            } => formatter
+                .debug_struct("KmsJwt")
+                .field("client_id", client_id)
+                .field("kms_key_version", kms_key_version)
+                .finish(),
+            Self::PrivateKeyJwt { client_id, .. } => formatter
+                .debug_struct("PrivateKeyJwt")
+                .field("client_id", client_id)
+                .field("private_key_pem", &"<redacted>")
+                .finish(),
+        }
     }
 }
 
@@ -31,13 +59,24 @@ impl std::fmt::Debug for AlpacaAuth {
 /// [`Self::base_url`] and [`Self::account_id`], send requests through the
 /// authenticated [`Self::get`] / [`Self::post`] builders, and wrap
 /// idempotent calls in [`Self::with_retry`].
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AlpacaClient {
     http: reqwest::Client,
     base_url: String,
     account_id: String,
-    auth: AlpacaAuth,
+    auth: AuthRuntime,
     max_retries: usize,
+}
+
+impl std::fmt::Debug for AlpacaClient {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AlpacaClient")
+            .field("base_url", &self.base_url)
+            .field("account_id", &self.account_id)
+            .field("max_retries", &self.max_retries)
+            .finish_non_exhaustive()
+    }
 }
 
 impl AlpacaClient {
@@ -55,6 +94,35 @@ impl AlpacaClient {
         connect_timeout: Duration,
         request_timeout: Duration,
     ) -> Result<Self, AlpacaError> {
+        Self::with_auth(
+            base_url,
+            account_id,
+            AlpacaAuth::Basic {
+                api_key,
+                api_secret,
+            },
+            "",
+            connect_timeout,
+            request_timeout,
+        )
+    }
+
+    /// Builds a client supporting Basic, KMS JWT, or local private-key JWT authentication.
+    ///
+    /// `token_url` is ignored for Basic auth and must name the environment's
+    /// Alpaca authx token endpoint for either JWT variant.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the HTTP client or authentication runtime cannot be built.
+    pub fn with_auth(
+        base_url: String,
+        account_id: String,
+        auth: AlpacaAuth,
+        token_url: &str,
+        connect_timeout: Duration,
+        request_timeout: Duration,
+    ) -> Result<Self, AlpacaError> {
         let http = reqwest::Client::builder()
             .connect_timeout(connect_timeout)
             .timeout(request_timeout)
@@ -63,10 +131,7 @@ impl AlpacaClient {
             http,
             base_url,
             account_id,
-            auth: AlpacaAuth {
-                api_key,
-                api_secret,
-            },
+            auth: AuthRuntime::build(auth, token_url)?,
             max_retries: 5,
         })
     }
@@ -92,33 +157,65 @@ impl AlpacaClient {
     }
 
     /// Authenticated GET request builder for the given URL.
-    pub fn get(&self, url: &str) -> reqwest::RequestBuilder {
-        self.authenticate(self.http.get(url))
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AlpacaError`] when authentication cannot be prepared.
+    pub async fn get(&self, url: &str) -> Result<reqwest::RequestBuilder, AlpacaError> {
+        self.authenticate(self.http.get(url)).await
     }
 
     /// Authenticated POST request builder for the given URL.
-    pub fn post(&self, url: &str) -> reqwest::RequestBuilder {
-        self.authenticate(self.http.post(url))
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AlpacaError`] when authentication cannot be prepared.
+    pub async fn post(&self, url: &str) -> Result<reqwest::RequestBuilder, AlpacaError> {
+        self.authenticate(self.http.post(url)).await
     }
 
     /// Authenticated DELETE request builder for the given URL.
-    pub fn delete(&self, url: &str) -> reqwest::RequestBuilder {
-        self.authenticate(self.http.delete(url))
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AlpacaError`] when authentication cannot be prepared.
+    pub async fn delete(&self, url: &str) -> Result<reqwest::RequestBuilder, AlpacaError> {
+        self.authenticate(self.http.delete(url)).await
     }
 
     /// Authenticated PATCH request builder for the given URL.
-    pub fn patch(&self, url: &str) -> reqwest::RequestBuilder {
-        self.authenticate(self.http.patch(url))
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AlpacaError`] when authentication cannot be prepared.
+    pub async fn patch(&self, url: &str) -> Result<reqwest::RequestBuilder, AlpacaError> {
+        self.authenticate(self.http.patch(url)).await
     }
 
     /// Applies Alpaca's dual authentication to a request: HTTP Basic auth
     /// plus the legacy `APCA-API-KEY-ID` / `APCA-API-SECRET-KEY` headers.
     /// Alpaca's tokenization endpoints require both.
-    pub fn authenticate(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        builder
-            .basic_auth(&self.auth.api_key, Some(&self.auth.api_secret))
-            .header("APCA-API-KEY-ID", &self.auth.api_key)
-            .header("APCA-API-SECRET-KEY", &self.auth.api_secret)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AlpacaError`] when authentication cannot be prepared.
+    pub async fn authenticate(
+        &self,
+        builder: reqwest::RequestBuilder,
+    ) -> Result<reqwest::RequestBuilder, AlpacaError> {
+        self.auth.apply_wallet(builder).await.map_err(Into::into)
+    }
+
+    /// Applies the Market Data API's APCA/bearer authentication.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AlpacaError`] when authentication cannot be prepared.
+    pub async fn market_data_get(&self, url: &str) -> Result<reqwest::RequestBuilder, AlpacaError> {
+        self.auth
+            .apply_apca(self.http.get(url))
+            .await
+            .map_err(Into::into)
     }
 
     /// Runs `operation` under the shared retry policy: exponential backoff
@@ -153,6 +250,8 @@ impl AlpacaClient {
 pub enum AlpacaError {
     #[error("Reqwest error")]
     Reqwest(#[from] reqwest::Error),
+    #[error(transparent)]
+    Jwt(#[from] KmsJwtError),
     /// Failed to parse response after 200 OK - NOT retryable
     #[error("Failed to parse response: {source}")]
     Parse {
@@ -166,6 +265,11 @@ pub enum AlpacaError {
     /// Alpaca API returned an error response
     #[error("API error {status_code}: {body}")]
     Api { status_code: u16, body: String },
+    #[error("API rate limited the request: {body}")]
+    RateLimited {
+        body: String,
+        retry_after: Option<Duration>,
+    },
     /// HTTP 404 from the keyed endpoint. Treated as "definitively absent" for
     /// recovery purposes (empirically verified 2026-06-12, not a published
     /// Alpaca guarantee). `body` contains the raw 404 response for operator
@@ -192,11 +296,61 @@ impl AlpacaError {
             Self::Api { status_code, .. } => {
                 matches!(status_code, 500..=599 | 429)
             }
+            Self::RateLimited { .. } => true,
+            Self::Jwt(error) => !error.is_deterministic(),
             Self::Parse { .. }
             | Self::Auth(_)
             | Self::RequestNotFound { .. }
             | Self::ResponseIdMismatch { .. } => false,
         }
+    }
+
+    #[must_use]
+    pub fn backpressure(&self) -> Option<Backpressure> {
+        match self {
+            Self::RateLimited { retry_after, .. } => Some(Backpressure {
+                retry_after: *retry_after,
+            }),
+            Self::Jwt(error) if error.is_rate_limited() => Some(Backpressure {
+                retry_after: error.retry_after(),
+            }),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub fn permanence(&self) -> Permanence {
+        match self {
+            Self::Reqwest(error) if error.is_builder() || error.is_decode() => {
+                Permanence::Permanent
+            }
+            Self::Jwt(error) if error.is_deterministic() => Permanence::Permanent,
+            Self::Reqwest(_) | Self::Jwt(_) | Self::RateLimited { .. } => Permanence::Transient,
+            Self::Api { status_code, .. } => status_permanence(*status_code),
+            Self::Parse { .. }
+            | Self::Auth(_)
+            | Self::RequestNotFound { .. }
+            | Self::ResponseIdMismatch { .. } => Permanence::Permanent,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Backpressure {
+    pub retry_after: Option<Duration>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Permanence {
+    Permanent,
+    Transient,
+}
+
+const fn status_permanence(status_code: u16) -> Permanence {
+    if status_code == 408 || status_code == 429 || status_code >= 500 {
+        Permanence::Transient
+    } else {
+        Permanence::Permanent
     }
 }
 
@@ -229,14 +383,20 @@ impl std::fmt::Display for TokenizationRequestId {
 
 /// Blockchain network a tokenized asset lives on.
 ///
-/// A closed set -- only `base` is supported today. Serialized as the
-/// lowercase wire string (`"base"`). Modeling it as an enum (rather than an
+/// A closed set of networks currently issued by st0x and accepted by Alpaca.
+/// Modeling it as an enum (rather than an
 /// opaque `String`) means an unsupported network is a deserialization error
 /// instead of a value that silently flows through.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Network {
     Base,
+    Ethereum,
+    #[serde(rename = "hyperevm")]
+    HyperEvm,
+    Robinhood,
+    #[serde(rename = "binance")]
+    BnbSmartChain,
 }
 
 impl Network {
@@ -246,6 +406,10 @@ impl Network {
     pub const fn as_str(&self) -> &'static str {
         match self {
             Self::Base => "base",
+            Self::Ethereum => "ethereum",
+            Self::HyperEvm => "hyperevm",
+            Self::Robinhood => "robinhood",
+            Self::BnbSmartChain => "binance",
         }
     }
 }
@@ -253,5 +417,58 @@ impl Network {
 impl std::fmt::Display for Network {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(self.as_str())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn issued_networks_use_alpaca_wire_names() {
+        for (network, wire) in [
+            (Network::Base, "base"),
+            (Network::Ethereum, "ethereum"),
+            (Network::HyperEvm, "hyperevm"),
+            (Network::Robinhood, "robinhood"),
+            (Network::BnbSmartChain, "binance"),
+        ] {
+            assert_eq!(
+                serde_json::to_string(&network).unwrap(),
+                format!("\"{wire}\"")
+            );
+            assert_eq!(
+                serde_json::from_str::<Network>(&format!("\"{wire}\"")).unwrap(),
+                network
+            );
+        }
+    }
+
+    #[test]
+    fn auth_variants_deserialize_from_flattened_consumer_config() {
+        assert!(matches!(
+            serde_json::from_value::<AlpacaAuth>(serde_json::json!({
+                "api_key": "key",
+                "api_secret": "secret"
+            }))
+            .unwrap(),
+            AlpacaAuth::Basic { .. }
+        ));
+        assert!(matches!(
+            serde_json::from_value::<AlpacaAuth>(serde_json::json!({
+                "client_id": "client",
+                "kms_key_version": "projects/p/locations/l/keyRings/r/cryptoKeys/k/cryptoKeyVersions/1"
+            }))
+            .unwrap(),
+            AlpacaAuth::KmsJwt { .. }
+        ));
+        assert!(matches!(
+            serde_json::from_value::<AlpacaAuth>(serde_json::json!({
+                "client_id": "client",
+                "private_key_pem": "pem"
+            }))
+            .unwrap(),
+            AlpacaAuth::PrivateKeyJwt { .. }
+        ));
     }
 }

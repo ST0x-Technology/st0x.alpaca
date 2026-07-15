@@ -15,6 +15,7 @@ use st0x_finance::{EmptySymbolError, FractionalShares, Symbol};
 use uuid::Uuid;
 
 use crate::core::{AlpacaClient, AlpacaError, Network, TokenizationRequestId};
+use crate::rate_limit::retry_after_from_response_headers;
 
 /// Issuer-side operations against Alpaca's tokenization endpoints.
 ///
@@ -167,7 +168,11 @@ pub enum TokenizationRequest {
         quantity: Qty,
         #[serde(rename = "wallet_address")]
         wallet: Address,
-        #[serde(rename = "tx_hash", deserialize_with = "deserialize_optional_b256")]
+        #[serde(
+            rename = "tx_hash",
+            default,
+            deserialize_with = "deserialize_optional_b256"
+        )]
         tx_hash: Option<B256>,
         updated_at: Option<DateTime<Utc>>,
     },
@@ -230,12 +235,17 @@ impl IssuerApi for AlpacaClient {
         );
 
         self.with_retry(|| async {
-            let response = self.post(&url).json(&request).send().await?;
+            let response = self.post(&url).await?.json(&request).send().await?;
 
             let status = response.status();
+            let retry_after = retry_after_from_response_headers(response.headers());
 
             match status {
                 StatusCode::OK => Ok(()),
+                StatusCode::TOO_MANY_REQUESTS => {
+                    let body = response.text().await?;
+                    Err(AlpacaError::RateLimited { body, retry_after })
+                }
                 StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
                     let body = response.text().await?;
                     Err(AlpacaError::Auth(body))
@@ -262,27 +272,36 @@ impl IssuerApi for AlpacaClient {
             self.account_id()
         );
 
-        let response = self.post(&url).json(&request).send().await?;
+        self.with_retry(|| async {
+            let response = self.post(&url).await?.json(&request).send().await?;
 
-        let status = response.status();
+            let status = response.status();
+            let retry_after = retry_after_from_response_headers(response.headers());
 
-        match status {
-            StatusCode::OK => {
-                let body = response.text().await?;
-                serde_json::from_str(&body).map_err(|source| AlpacaError::Parse { body, source })
+            match status {
+                StatusCode::OK => {
+                    let body = response.text().await?;
+                    serde_json::from_str(&body)
+                        .map_err(|source| AlpacaError::Parse { body, source })
+                }
+                StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
+                    let body = response.text().await?;
+                    Err(AlpacaError::Auth(body))
+                }
+                StatusCode::TOO_MANY_REQUESTS => {
+                    let body = response.text().await?;
+                    Err(AlpacaError::RateLimited { body, retry_after })
+                }
+                status => {
+                    let body = response.text().await?;
+                    Err(AlpacaError::Api {
+                        status_code: status.as_u16(),
+                        body,
+                    })
+                }
             }
-            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
-                let body = response.text().await?;
-                Err(AlpacaError::Auth(body))
-            }
-            status => {
-                let body = response.text().await?;
-                Err(AlpacaError::Api {
-                    status_code: status.as_u16(),
-                    body,
-                })
-            }
-        }
+        })
+        .await
     }
 
     async fn poll_request_status(
@@ -299,9 +318,10 @@ impl IssuerApi for AlpacaClient {
         );
 
         self.with_retry(|| async {
-            let response = self.get(&url).send().await?;
+            let response = self.get(&url).await?.send().await?;
 
             let status = response.status();
+            let retry_after = retry_after_from_response_headers(response.headers());
 
             match status {
                 StatusCode::OK => {
@@ -333,6 +353,10 @@ impl IssuerApi for AlpacaClient {
                     let body = response.text().await?;
                     Err(AlpacaError::Auth(body))
                 }
+                StatusCode::TOO_MANY_REQUESTS => {
+                    let body = response.text().await?;
+                    Err(AlpacaError::RateLimited { body, retry_after })
+                }
                 status => {
                     let body = response.text().await?;
                     Err(AlpacaError::Api {
@@ -350,11 +374,12 @@ fn deserialize_optional_b256<'de, D>(deserializer: D) -> Result<Option<B256>, D:
 where
     D: serde::Deserializer<'de>,
 {
-    let raw: String = serde::Deserialize::deserialize(deserializer)?;
-    if raw.is_empty() {
-        Ok(None)
-    } else {
-        raw.parse().map(Some).map_err(serde::de::Error::custom)
+    let raw = Option::<String>::deserialize(deserializer)?;
+
+    match raw {
+        None => Ok(None),
+        Some(value) if value.is_empty() => Ok(None),
+        Some(value) => value.parse().map(Some).map_err(serde::de::Error::custom),
     }
 }
 
@@ -765,7 +790,7 @@ pub mod mock {
 mod tests {
     use alloy_primitives::{address, b256};
     use httpmock::prelude::*;
-    use serde_json::json;
+    use serde_json::{Value, json};
     use st0x_finance::FractionalShares;
     use std::time::Duration;
     use uuid::Uuid;
@@ -807,6 +832,36 @@ mod tests {
             Duration::from_secs(30),
         )
         .unwrap()
+    }
+
+    fn redeem_tokenization_request_json(tx_hash: Option<Value>) -> Value {
+        let mut request = json!({
+            "type": "redeem",
+            "tokenization_request_id": "tok-456",
+            "issuer_request_id": "red-574378e0",
+            "status": "pending",
+            "underlying_symbol": "AAPL",
+            "token_symbol": "tAAPL",
+            "qty": "50.00",
+            "wallet_address": "0x9999999999999999999999999999999999999999",
+            "updated_at": "2025-09-12T17:30:00.000000-04:00"
+        });
+
+        if let Some(tx_hash) = tx_hash {
+            request
+                .as_object_mut()
+                .unwrap()
+                .insert("tx_hash".to_string(), tx_hash);
+        }
+
+        request
+    }
+
+    fn assert_redeem_tx_hash_is_none(request: &TokenizationRequest) {
+        assert!(matches!(
+            request,
+            TokenizationRequest::Redeem { tx_hash: None, .. }
+        ));
     }
 
     #[test]
@@ -937,6 +992,29 @@ mod tests {
 
         let request: TokenizationRequest = serde_json::from_value(json).unwrap();
         assert!(matches!(request, TokenizationRequest::Redeem { .. }));
+    }
+
+    #[test]
+    fn test_tokenization_request_redeem_accepts_omitted_tx_hash() {
+        let request = serde_json::from_value(redeem_tokenization_request_json(None)).unwrap();
+
+        assert_redeem_tx_hash_is_none(&request);
+    }
+
+    #[test]
+    fn test_tokenization_request_redeem_accepts_null_tx_hash() {
+        let request =
+            serde_json::from_value(redeem_tokenization_request_json(Some(Value::Null))).unwrap();
+
+        assert_redeem_tx_hash_is_none(&request);
+    }
+
+    #[test]
+    fn test_tokenization_request_redeem_accepts_empty_tx_hash() {
+        let request =
+            serde_json::from_value(redeem_tokenization_request_json(Some(json!("")))).unwrap();
+
+        assert_redeem_tx_hash_is_none(&request);
     }
 
     #[test]
@@ -1802,6 +1880,60 @@ mod tests {
         ));
         assert!(result.unwrap_err().is_retryable());
         mock.assert_calls(1);
+    }
+
+    #[tokio::test]
+    async fn test_429_preserves_retry_after_backpressure() {
+        let server = MockServer::start();
+
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/accounts/test-account/tokenization/callback/redeem");
+            then.status(429)
+                .header("retry-after", "120")
+                .body("Slow down");
+        });
+
+        let client =
+            make_client(&server, "test-account", "test-key", "test-secret").with_max_retries(0);
+        let error = client
+            .call_redeem_endpoint(create_redeem_request())
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error.backpressure(),
+            Some(crate::Backpressure {
+                retry_after: Some(Duration::from_mins(2)),
+            })
+        );
+        assert_eq!(error.permanence(), crate::Permanence::Transient);
+        mock.assert_calls(1);
+    }
+
+    #[tokio::test]
+    async fn test_call_redeem_endpoint_retries_transient_server_errors() {
+        let server = MockServer::start();
+
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/accounts/test-account/tokenization/callback/redeem");
+            then.status(500).body("Internal Server Error");
+        });
+
+        let client =
+            make_client(&server, "test-account", "test-key", "test-secret").with_max_retries(2);
+
+        let result = client.call_redeem_endpoint(create_redeem_request()).await;
+
+        assert!(matches!(
+            result,
+            Err(AlpacaError::Api {
+                status_code: 500,
+                ..
+            })
+        ));
+        mock.assert_calls(3);
     }
 
     #[tokio::test]

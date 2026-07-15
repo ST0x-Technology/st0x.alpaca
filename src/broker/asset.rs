@@ -18,6 +18,23 @@ pub enum AssetStatus {
 pub struct Asset {
     pub status: AssetStatus,
     pub tradable: bool,
+    #[serde(default)]
+    pub fractionable: Option<bool>,
+    #[serde(default)]
+    pub attributes: Option<Vec<String>>,
+}
+
+impl Asset {
+    /// Reports whether Alpaca supplied `name` in the asset attributes.
+    ///
+    /// Returns `None` when the response omitted the attributes field, which
+    /// preserves the distinction between "not enabled" and "unknown".
+    #[must_use]
+    pub fn attribute(&self, name: &str) -> Option<bool> {
+        self.attributes
+            .as_ref()
+            .map(|attributes| attributes.iter().any(|attribute| attribute == name))
+    }
 }
 
 /// Fetches asset information for `symbol`.
@@ -57,7 +74,9 @@ mod tests {
                     "id": "904837e3-3b76-47ec-b432-046db621571b",
                     "symbol": "AAPL",
                     "status": "active",
-                    "tradable": true
+                    "tradable": true,
+                    "fractionable": true,
+                    "attributes": ["fractional_eh_enabled", "overnight_tradable"]
                 }));
         });
 
@@ -67,6 +86,29 @@ mod tests {
         mock.assert();
         assert_eq!(asset.status, AssetStatus::Active);
         assert!(asset.tradable);
+        assert_eq!(asset.fractionable, Some(true));
+        assert_eq!(asset.attribute("fractional_eh_enabled"), Some(true));
+        assert_eq!(asset.attribute("overnight_halted"), Some(false));
+    }
+
+    #[tokio::test]
+    async fn get_asset_preserves_missing_optional_capabilities() {
+        let server = MockServer::start();
+
+        server.mock(|when, then| {
+            when.method(GET).path("/v1/assets/AAPL");
+            then.status(200).json_body(json!({
+                "status": "active",
+                "tradable": true
+            }));
+        });
+
+        let asset = get_asset(&test_client(server.base_url()), &symbol("AAPL"))
+            .await
+            .unwrap();
+
+        assert_eq!(asset.fractionable, None);
+        assert_eq!(asset.attribute("overnight_tradable"), None);
     }
 
     #[tokio::test]
@@ -91,5 +133,29 @@ mod tests {
             panic!("expected Api error, got {error:?}");
         };
         assert_eq!(status_code, 404);
+    }
+
+    #[tokio::test]
+    async fn get_asset_preserves_rate_limit_backpressure() {
+        let server = MockServer::start();
+
+        server.mock(|when, then| {
+            when.method(GET).path("/v1/assets/AAPL");
+            then.status(429)
+                .header("retry-after", "60")
+                .body("slow down");
+        });
+
+        let error = get_asset(&test_client(server.base_url()), &symbol("AAPL"))
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error.backpressure(),
+            Some(crate::Backpressure {
+                retry_after: Some(std::time::Duration::from_mins(1)),
+            })
+        );
+        assert_eq!(error.permanence(), crate::Permanence::Transient);
     }
 }

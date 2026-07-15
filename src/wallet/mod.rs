@@ -25,12 +25,13 @@ use alloy_primitives::{Address, TxHash};
 use reqwest::StatusCode;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use st0x_finance::Usdc;
+use st0x_finance::{Positive, Usdc};
 use std::borrow::Cow;
 use std::time::Duration;
 use thiserror::Error;
 
-use crate::core::{AlpacaClient, AlpacaError};
+use crate::core::{AlpacaClient, AlpacaError, Backpressure, Permanence};
+use crate::rate_limit::retry_after_from_response_headers;
 
 mod asset;
 mod status;
@@ -64,7 +65,7 @@ impl AlpacaWalletService {
     /// if the API call fails.
     pub async fn initiate_withdrawal(
         &self,
-        amount: Usdc,
+        amount: Positive<Usdc>,
         asset: &TokenSymbol,
         to_address: &Address,
     ) -> Result<Transfer, AlpacaWalletError> {
@@ -120,6 +121,19 @@ impl AlpacaWalletService {
         tx_hash: &TxHash,
     ) -> Result<Transfer, AlpacaWalletError> {
         status::poll_deposit_by_tx_hash(&self.client, tx_hash, &self.polling_config).await
+    }
+
+    /// Looks up an incoming deposit by its on-chain transaction hash.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the API call fails or the transfer list cannot be
+    /// parsed.
+    pub async fn find_deposit_by_tx_hash(
+        &self,
+        tx_hash: &TxHash,
+    ) -> Result<Option<Transfer>, AlpacaWalletError> {
+        transfer::find_deposit_by_tx_hash(&self.client, tx_hash).await
     }
 
     /// Gets or creates a wallet deposit address for an asset and network.
@@ -280,12 +294,40 @@ pub enum AlpacaWalletError {
     },
 }
 
+impl AlpacaWalletError {
+    /// Returns broker backpressure metadata when the underlying request was
+    /// rate limited.
+    #[must_use]
+    pub fn backpressure(&self) -> Option<Backpressure> {
+        match self {
+            Self::Alpaca(error) => error.backpressure(),
+            _ => None,
+        }
+    }
+
+    /// Classifies whether retrying the same wallet operation can plausibly
+    /// succeed.
+    #[must_use]
+    pub fn permanence(&self) -> Permanence {
+        match self {
+            Self::Alpaca(error) => error.permanence(),
+            Self::TransferTimeout { .. }
+            | Self::DepositTimeout { .. }
+            | Self::TransferNotFound { .. } => Permanence::Transient,
+            Self::InvalidStatusTransition { .. }
+            | Self::AddressNotWhitelisted { .. }
+            | Self::NoWhitelistEntries { .. }
+            | Self::InvalidDepositTransition { .. } => Permanence::Permanent,
+        }
+    }
+}
+
 /// Sends an authenticated GET and parses the JSON response body.
 async fn get_json<Response: DeserializeOwned>(
     client: &AlpacaClient,
     url: &str,
 ) -> Result<Response, AlpacaWalletError> {
-    request_json(client.get(url)).await
+    request_json(client.get(url).await?).await
 }
 
 /// Sends an authenticated POST with a JSON body and parses the JSON
@@ -295,12 +337,17 @@ async fn post_json<Response: DeserializeOwned, Body: Serialize + Sync>(
     url: &str,
     body: &Body,
 ) -> Result<Response, AlpacaWalletError> {
-    request_json(client.post(url).json(body)).await
+    request_json(client.post(url).await?.json(body)).await
 }
 
 /// Sends an authenticated DELETE, expecting no response body.
 async fn delete(client: &AlpacaClient, url: &str) -> Result<(), AlpacaWalletError> {
-    let response = client.delete(url).send().await.map_err(AlpacaError::from)?;
+    let response = client
+        .delete(url)
+        .await?
+        .send()
+        .await
+        .map_err(AlpacaError::from)?;
 
     read_empty_response(response).await
 }
@@ -314,6 +361,7 @@ async fn patch<Body: Serialize + Sync>(
 ) -> Result<(), AlpacaWalletError> {
     let response = client
         .patch(url)
+        .await?
         .json(body)
         .send()
         .await
@@ -327,6 +375,7 @@ async fn request_json<Response: DeserializeOwned>(
 ) -> Result<Response, AlpacaWalletError> {
     let response = builder.send().await.map_err(AlpacaError::from)?;
     let status = response.status();
+    let retry_after = retry_after_from_response_headers(response.headers());
 
     let bytes = match response.bytes().await {
         Ok(bytes) => bytes,
@@ -334,7 +383,7 @@ async fn request_json<Response: DeserializeOwned>(
         // body stream fails to read, so the poll retry predicate (which only
         // retries 5xx API errors) still fires on a transient 5xx.
         Err(_) if !status.is_success() => {
-            return Err(api_error(status, b"Unknown error"));
+            return Err(api_error(status, b"Unknown error", retry_after));
         }
         Err(error) => return Err(AlpacaError::from(error).into()),
     };
@@ -351,21 +400,22 @@ async fn request_json<Response: DeserializeOwned>(
         });
     }
 
-    Err(api_error(status, &bytes))
+    Err(api_error(status, &bytes, retry_after))
 }
 
 async fn read_empty_response(response: reqwest::Response) -> Result<(), AlpacaWalletError> {
     let status = response.status();
+    let retry_after = retry_after_from_response_headers(response.headers());
 
     if status.is_success() {
         return Ok(());
     }
 
     let Ok(bytes) = response.bytes().await else {
-        return Err(api_error(status, b"Unknown error"));
+        return Err(api_error(status, b"Unknown error", retry_after));
     };
 
-    Err(api_error(status, &bytes))
+    Err(api_error(status, &bytes, retry_after))
 }
 
 /// Maps a non-2xx response into the shared [`AlpacaError::Api`] variant.
@@ -373,11 +423,20 @@ async fn read_empty_response(response: reqwest::Response) -> Result<(), AlpacaWa
 /// The stored body is surfaced via `Display`/`Debug` and typically ends up
 /// in consumer logs, so the Travel Rule beneficiary identity is scrubbed
 /// before storing it.
-fn api_error(status: StatusCode, bytes: &[u8]) -> AlpacaWalletError {
-    AlpacaWalletError::Alpaca(AlpacaError::Api {
-        status_code: status.as_u16(),
-        body: redact_beneficiary(&String::from_utf8_lossy(bytes)).into_owned(),
-    })
+fn api_error(
+    status: StatusCode,
+    bytes: &[u8],
+    retry_after: Option<std::time::Duration>,
+) -> AlpacaWalletError {
+    let body = redact_beneficiary(&String::from_utf8_lossy(bytes)).into_owned();
+    if status == StatusCode::TOO_MANY_REQUESTS {
+        AlpacaWalletError::Alpaca(AlpacaError::RateLimited { body, retry_after })
+    } else {
+        AlpacaWalletError::Alpaca(AlpacaError::Api {
+            status_code: status.as_u16(),
+            body,
+        })
+    }
 }
 
 /// Redacts `beneficiary_entity_name` values from a response body destined
@@ -462,10 +521,12 @@ mod tests {
         TokenSymbol::new(value).unwrap_or_else(|error| panic!("invalid test token symbol: {error}"))
     }
 
-    fn usdc(value: &str) -> Usdc {
-        value
+    fn positive_usdc(value: &str) -> Positive<Usdc> {
+        let amount = value
             .parse()
-            .unwrap_or_else(|error| panic!("invalid test USDC amount: {error}"))
+            .unwrap_or_else(|error| panic!("invalid test USDC amount: {error}"));
+        Positive::new(amount)
+            .unwrap_or_else(|error| panic!("non-positive test USDC amount: {error}"))
     }
 
     fn test_service(server: &MockServer) -> AlpacaWalletService {
@@ -531,6 +592,34 @@ mod tests {
             })
         ));
         error_mock.assert();
+    }
+
+    #[tokio::test]
+    async fn get_json_preserves_rate_limit_backpressure() {
+        let server = MockServer::start();
+
+        server.mock(|when, then| {
+            when.method(GET).path("/v1/rate-limited");
+            then.status(429)
+                .header("retry-after", "30")
+                .body("slow down");
+        });
+
+        let client = test_client(server.base_url());
+        let error = get_json::<serde_json::Value>(
+            &client,
+            &format!("{}/v1/rate-limited", client.base_url()),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            error.backpressure(),
+            Some(Backpressure {
+                retry_after: Some(Duration::from_secs(30)),
+            })
+        );
+        assert_eq!(error.permanence(), Permanence::Transient);
     }
 
     #[tokio::test]
@@ -765,7 +854,7 @@ mod tests {
 
         let asset = token_symbol("USDC");
         let to_address = address!("0x1234567890abcdef1234567890abcdef12345678");
-        let amount = usdc("100");
+        let amount = positive_usdc("100");
 
         assert!(matches!(
             service
@@ -800,7 +889,7 @@ mod tests {
         });
 
         let asset = token_symbol("USDC");
-        let amount = usdc("100");
+        let amount = positive_usdc("100");
 
         assert!(matches!(
             service
@@ -857,7 +946,7 @@ mod tests {
         });
 
         let asset = token_symbol("USDC");
-        let amount = usdc("100");
+        let amount = positive_usdc("100");
 
         let result = service
             .initiate_withdrawal(amount, &asset, &to_address)

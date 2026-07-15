@@ -6,7 +6,7 @@
 use alloy_primitives::{Address, TxHash};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use st0x_finance::{EmptySymbolError, Symbol, Usdc};
+use st0x_finance::{EmptySymbolError, Positive, Symbol, Usdc};
 use uuid::Uuid;
 
 use super::{AlpacaWalletError, get_json, post_json};
@@ -158,12 +158,12 @@ struct WithdrawalRequest<'a> {
 
 pub(super) async fn initiate_withdrawal(
     client: &AlpacaClient,
-    amount: Usdc,
+    amount: Positive<Usdc>,
     asset: &TokenSymbol,
     address: &Address,
 ) -> Result<Transfer, AlpacaWalletError> {
     let request = WithdrawalRequest {
-        amount,
+        amount: amount.inner(),
         asset,
         // None = standard EIP-55 checksum (no chain-specific EIP-1191
         // encoding). Alpaca requires checksummed addresses for whitelist
@@ -220,19 +220,19 @@ pub(super) async fn list_all_transfers(
     get_json(client, &url).await
 }
 
-/// Finds a transfer by its transaction hash.
+/// Finds an incoming deposit by its transaction hash.
 ///
 /// Fetches all transfers and filters by `tx_hash`. Returns the first match
 /// or `None` if no transfer with that tx hash exists.
-pub(super) async fn find_transfer_by_tx_hash(
+pub(super) async fn find_deposit_by_tx_hash(
     client: &AlpacaClient,
     tx_hash: &TxHash,
 ) -> Result<Option<Transfer>, AlpacaWalletError> {
     let transfers = list_all_transfers(client).await?;
 
-    Ok(transfers
-        .into_iter()
-        .find(|transfer| transfer.tx.as_ref() == Some(tx_hash)))
+    Ok(transfers.into_iter().find(|transfer| {
+        transfer.direction == TransferDirection::Incoming && transfer.tx.as_ref() == Some(tx_hash)
+    }))
 }
 
 #[cfg(test)]
@@ -252,6 +252,11 @@ mod tests {
         value
             .parse()
             .unwrap_or_else(|error| panic!("invalid test USDC amount: {error}"))
+    }
+
+    fn positive_usdc(value: &str) -> Positive<Usdc> {
+        Positive::new(usdc(value))
+            .unwrap_or_else(|error| panic!("non-positive test USDC amount: {error}"))
     }
 
     #[tokio::test]
@@ -290,7 +295,7 @@ mod tests {
         });
 
         let client = test_client(server.base_url());
-        let amount = usdc("100.5");
+        let amount = positive_usdc("100.5");
         let asset = token_symbol("USDC");
 
         let transfer = initiate_withdrawal(&client, amount, &asset, &to_address)
@@ -307,6 +312,27 @@ mod tests {
         withdrawal_mock.assert();
     }
 
+    #[test]
+    fn initiate_withdrawal_rejects_zero_amount() {
+        let error = Positive::new(usdc("0")).unwrap_err();
+
+        assert!(matches!(
+            error,
+            st0x_finance::NotPositive::Constraint { value } if value == usdc("0")
+        ));
+    }
+
+    #[test]
+    fn initiate_withdrawal_rejects_negative_amount() {
+        let amount = usdc("-100");
+        let error = Positive::new(amount).unwrap_err();
+
+        assert!(matches!(
+            error,
+            st0x_finance::NotPositive::Constraint { value } if value == amount
+        ));
+    }
+
     #[tokio::test]
     async fn initiate_withdrawal_invalid_asset() {
         let server = MockServer::start();
@@ -321,7 +347,7 @@ mod tests {
         });
 
         let client = test_client(server.base_url());
-        let amount = usdc("100");
+        let amount = positive_usdc("100");
         let asset = token_symbol("INVALID");
         let addr = address!("0x1234567890abcdef1234567890abcdef12345678");
 
@@ -350,7 +376,7 @@ mod tests {
         });
 
         let client = test_client(server.base_url());
-        let amount = usdc("100");
+        let amount = positive_usdc("100");
         let asset = token_symbol("USDC");
         let addr = address!("0x1234567890abcdef1234567890abcdef12345678");
 
@@ -646,7 +672,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn find_transfer_by_tx_hash_found() {
+    async fn find_deposit_by_tx_hash_ignores_outgoing_transfer_with_same_hash() {
         let server = MockServer::start();
         let tx_hash: TxHash =
             fixed_bytes!("0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890");
@@ -668,7 +694,7 @@ mod tests {
                         "from_address": "0xabcdef1234567890abcdef1234567890abcdef12",
                         "to_address": "0x1234567890abcdef1234567890abcdef12345678",
                         "status": "COMPLETE",
-                        "tx_hash": "0x1111111111111111111111111111111111111111111111111111111111111111",
+                        "tx_hash": tx_hash,
                         "created_at": "2024-01-01T00:00:00Z",
                         "network_fee": "0",
                         "fees": "0"
@@ -693,7 +719,7 @@ mod tests {
 
         let client = test_client(server.base_url());
 
-        let transfer = find_transfer_by_tx_hash(&client, &tx_hash)
+        let transfer = find_deposit_by_tx_hash(&client, &tx_hash)
             .await
             .unwrap()
             .unwrap();
@@ -706,7 +732,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn find_transfer_by_tx_hash_not_found() {
+    async fn find_deposit_by_tx_hash_not_found() {
         let server = MockServer::start();
         let tx_hash: TxHash =
             fixed_bytes!("0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890");
@@ -737,7 +763,7 @@ mod tests {
 
         let client = test_client(server.base_url());
 
-        let result = find_transfer_by_tx_hash(&client, &tx_hash).await.unwrap();
+        let result = find_deposit_by_tx_hash(&client, &tx_hash).await.unwrap();
 
         assert_eq!(result.map(|transfer| transfer.id), None);
 
@@ -745,7 +771,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn find_transfer_by_tx_hash_empty_list() {
+    async fn find_deposit_by_tx_hash_empty_list() {
         let server = MockServer::start();
         let tx_hash: TxHash =
             fixed_bytes!("0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890");
@@ -760,7 +786,7 @@ mod tests {
 
         let client = test_client(server.base_url());
 
-        let result = find_transfer_by_tx_hash(&client, &tx_hash).await.unwrap();
+        let result = find_deposit_by_tx_hash(&client, &tx_hash).await.unwrap();
 
         assert_eq!(result.map(|transfer| transfer.id), None);
 
@@ -768,7 +794,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn find_transfer_by_tx_hash_api_error() {
+    async fn find_deposit_by_tx_hash_api_error() {
         let server = MockServer::start();
         let tx_hash: TxHash =
             fixed_bytes!("0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890");
@@ -781,7 +807,7 @@ mod tests {
 
         let client = test_client(server.base_url());
 
-        let error = find_transfer_by_tx_hash(&client, &tx_hash)
+        let error = find_deposit_by_tx_hash(&client, &tx_hash)
             .await
             .unwrap_err();
 

@@ -11,7 +11,7 @@ use tokio::time::{Instant, sleep};
 
 use super::AlpacaWalletError;
 use super::transfer::{
-    AlpacaTransferId, Transfer, TransferStatus, find_transfer_by_tx_hash, get_transfer_status,
+    AlpacaTransferId, Transfer, TransferStatus, find_deposit_by_tx_hash, get_transfer_status,
 };
 use crate::core::{AlpacaClient, AlpacaError};
 
@@ -33,10 +33,10 @@ impl Default for PollingConfig {
     fn default() -> Self {
         Self {
             interval: Duration::from_secs(10),
-            timeout: Duration::from_secs(30 * 60),
+            timeout: Duration::from_mins(30),
             max_retries: 10,
             min_retry_delay: Duration::from_secs(1),
-            max_retry_delay: Duration::from_secs(60),
+            max_retry_delay: Duration::from_mins(1),
         }
     }
 }
@@ -103,7 +103,7 @@ pub(super) async fn poll_deposit_by_tx_hash(
     loop {
         check_deposit_timeout(&start, config.timeout, *tx_hash)?;
 
-        let maybe_transfer = (|| async { find_transfer_by_tx_hash(client, tx_hash).await })
+        let maybe_transfer = (|| async { find_deposit_by_tx_hash(client, tx_hash).await })
             .retry(retry_strategy)
             .when(is_transient_server_error)
             .await?;
