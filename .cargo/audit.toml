@@ -1,0 +1,16 @@
+[advisories]
+ignore = [
+  # Lockfile-only optional arkworks R1CS dependency. It is absent from the
+  # all-features/all-targets graph, and ark-relations has no compatible fix.
+  "RUSTSEC-2025-0055",
+  # Unmaintained transitive dependencies in the pinned Rain/Revm graph. None
+  # are selected directly by st0x-alpaca; revisit with each Rain pin update.
+  "RUSTSEC-2024-0388",
+  "RUSTSEC-2024-0436",
+  "RUSTSEC-2025-0141",
+  "RUSTSEC-2025-0161",
+  "RUSTSEC-2026-0173",
+]
+
+[yanked]
+enabled = false
