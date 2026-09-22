@@ -166,6 +166,7 @@ pub enum TokenizationRequest {
         token: TokenSymbol,
         #[serde(rename = "qty")]
         quantity: Qty,
+        network: Network,
         #[serde(rename = "wallet_address")]
         wallet: Address,
         #[serde(
@@ -403,7 +404,7 @@ pub mod mock {
         RedeemRequestStatus, RedeemResponse, TokenSymbol, TokenizationRequest,
         TokenizationRequestType, UnderlyingSymbol,
     };
-    use crate::core::{AlpacaError, TokenizationRequestId};
+    use crate::core::{AlpacaError, Network, TokenizationRequestId};
 
     fn underlying_symbol(value: &str) -> UnderlyingSymbol {
         UnderlyingSymbol::new(value)
@@ -524,6 +525,7 @@ pub mod mock {
                     underlying: underlying_symbol("AAPL"),
                     token: token_symbol("tAAPL"),
                     quantity: quantity("100"),
+                    network: Network::Base,
                     wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
                     tx_hash: Some(b256!(
                         "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
@@ -843,6 +845,7 @@ mod tests {
             "underlying_symbol": "AAPL",
             "token_symbol": "tAAPL",
             "qty": "50.00",
+            "network": "base",
             "wallet_address": "0x9999999999999999999999999999999999999999",
             "updated_at": "2025-09-12T17:30:00.000000-04:00"
         });
@@ -985,6 +988,7 @@ mod tests {
             "underlying_symbol": "AAPL",
             "token_symbol": "tAAPL",
             "qty": "50.00",
+            "network": "base",
             "wallet_address": "0x9999999999999999999999999999999999999999",
             "tx_hash": "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
             "updated_at": "2025-09-12T17:30:00.000000-04:00"
@@ -1039,6 +1043,7 @@ mod tests {
                 "underlying_symbol": "AAPL",
                 "token_symbol": "tAAPL",
                 "qty": "50.00",
+                "network": "base",
                 "wallet_address": "0x9999999999999999999999999999999999999999",
                 "tx_hash": "",
                 "updated_at": "2025-09-12T17:30:00.000000-04:00"
@@ -1958,9 +1963,15 @@ mod tests {
 
         let request = result.unwrap();
         match &request {
-            TokenizationRequest::Redeem { id, status, .. } => {
+            TokenizationRequest::Redeem {
+                id,
+                status,
+                network,
+                ..
+            } => {
                 assert_eq!(id.0, target_id);
                 assert!(matches!(status, RedeemRequestStatus::Completed));
+                assert_eq!(*network, Network::Base);
             }
             other @ TokenizationRequest::Mint { .. } => {
                 panic!("Expected Redeem variant, got {other:?}")
