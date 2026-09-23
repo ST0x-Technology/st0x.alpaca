@@ -9,13 +9,14 @@ use alloy_primitives::{Address, B256};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use reqwest::StatusCode;
-use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize, Serializer};
-use st0x_finance::{EmptySymbolError, FractionalShares, Symbol};
+use st0x_finance::{EmptySymbolError, FractionalShares, Symbol, Usd};
 use uuid::Uuid;
 
 use crate::core::{AlpacaClient, AlpacaError, Network, TokenizationRequestId};
 use crate::rate_limit::retry_after_from_response_headers;
+
+pub mod itn;
 
 /// Issuer-side operations against Alpaca's tokenization endpoints.
 ///
@@ -140,10 +141,14 @@ pub enum RedeemRequestStatus {
     Rejected,
 }
 
-/// Fee amount attached to a redeem response, as a decimal string on the
-/// wire.
-#[derive(Debug, Clone, Deserialize)]
-pub struct Fees(pub Decimal);
+/// Fee Alpaca charged for a redeem request, in USD. A decimal string on the
+/// wire in every observed production response (`"0"`, `"0.0"`, `"0.01"`,
+/// `"0.5"`); a JSON number is accepted too. Parsed into a Rain Float so
+/// consumers can use it in exact arithmetic; the lexical scale is not
+/// preserved because the value is never sent back to Alpaca.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(transparent)]
+pub struct Fees(pub Usd);
 
 /// A tokenization request returned by Alpaca's keyed request endpoint.
 ///
@@ -264,14 +269,13 @@ impl Serialize for RedeemQty {
 #[async_trait]
 impl IssuerApi for AlpacaClient {
     async fn send_mint_callback(&self, request: MintCallbackRequest) -> Result<(), AlpacaError> {
-        let url = format!(
-            "{}/v1/accounts/{}/tokenization/callback/mint",
-            self.base_url(),
+        let path = format!(
+            "/v1/accounts/{}/tokenization/callback/mint",
             self.account_id()
         );
 
         self.with_retry(|| async {
-            let response = self.post(&url).await?.json(&request).send().await?;
+            let response = self.post(&path).await?.json(&request).send().await?;
 
             let status = response.status();
             let retry_after = retry_after_from_response_headers(response.headers());
@@ -302,14 +306,20 @@ impl IssuerApi for AlpacaClient {
         &self,
         request: RedeemRequest,
     ) -> Result<RedeemResponse, AlpacaError> {
-        let url = format!(
-            "{}/v1/accounts/{}/tokenization/callback/redeem",
-            self.base_url(),
+        if !itn::accepts_network_wire_string(request.network.as_str()) {
+            return Err(AlpacaError::UnsupportedTokenizationNetwork {
+                network: request.network,
+                reference: itn::REDEEM_CALLBACK_OPENAPI_REFERENCE,
+            });
+        }
+
+        let path = format!(
+            "/v1/accounts/{}/tokenization/callback/redeem",
             self.account_id()
         );
 
         self.with_retry(|| async {
-            let response = self.post(&url).await?.json(&request).send().await?;
+            let response = self.post(&path).await?.json(&request).send().await?;
 
             let status = response.status();
             let retry_after = retry_after_from_response_headers(response.headers());
@@ -346,15 +356,14 @@ impl IssuerApi for AlpacaClient {
     ) -> Result<TokenizationRequest, AlpacaError> {
         // Alpaca tokenization_request_ids are server-generated UUIDs, so the
         // path segment needs no percent-encoding.
-        let url = format!(
-            "{}/v1/accounts/{}/tokenization/requests/{}",
-            self.base_url(),
+        let path = format!(
+            "/v1/accounts/{}/tokenization/requests/{}",
             self.account_id(),
             tokenization_request_id
         );
 
         self.with_retry(|| async {
-            let response = self.get(&url).await?.send().await?;
+            let response = self.get(&path).await?.send().await?;
 
             let status = response.status();
             let retry_after = retry_after_from_response_headers(response.headers());
@@ -429,8 +438,7 @@ pub mod mock {
     use alloy_primitives::{address, b256};
     use async_trait::async_trait;
     use chrono::Utc;
-    use rust_decimal::Decimal;
-    use st0x_finance::FractionalShares;
+    use st0x_finance::{FractionalShares, HasZero, Usd};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -534,7 +542,7 @@ pub mod mock {
                     network: request.network,
                     wallet: request.wallet,
                     tx_hash: request.tx_hash,
-                    fees: Some(Fees(Decimal::ZERO)),
+                    fees: Some(Fees(Usd::ZERO)),
                 }),
                 Behavior::Fail { error_message } => Err(AlpacaError::Api {
                     status_code: 500,
@@ -831,10 +839,14 @@ mod tests {
     use std::time::Duration;
     use uuid::Uuid;
 
+    use st0x_finance::{HasZero, Usd};
+    use st0x_float_macro::float;
+
+    use super::itn::{REDEEM_CALLBACK_OPENAPI_REFERENCE, accepts_network_wire_string};
     use super::{
-        ClientId, IssuerApi, IssuerRequestId, MintCallbackRequest, RedeemQty, RedeemRequest,
-        RedeemRequestStatus, TokenSymbol, TokenizationRequest, TokenizationRequestType,
-        UnderlyingSymbol,
+        ClientId, Fees, IssuerApi, IssuerRequestId, MintCallbackRequest, RedeemQty, RedeemRequest,
+        RedeemRequestStatus, RedeemResponse, TokenSymbol, TokenizationRequest,
+        TokenizationRequestType, UnderlyingSymbol,
     };
     use crate::core::{AlpacaClient, AlpacaError, Network, TokenizationRequestId};
 
@@ -854,7 +866,7 @@ mod tests {
         api_secret: &str,
     ) -> AlpacaClient {
         AlpacaClient::new(
-            server.base_url(),
+            &server.base_url(),
             account_id.to_string(),
             api_key.to_string(),
             api_secret.to_string(),
@@ -926,6 +938,128 @@ mod tests {
             json!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd")
         );
         assert_eq!(serialized["network"], json!("base"));
+    }
+
+    #[test]
+    fn test_redeem_request_serialization_ethereum_network() {
+        let client_id = ClientId("55051234-0000-4abc-9000-4aabcdef0045".parse().unwrap());
+        let tx_hash = b256!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd");
+
+        let request = RedeemRequest {
+            issuer_request_id: IssuerRequestId(
+                "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd".to_string(),
+            ),
+            underlying: underlying_symbol("TSLA"),
+            token: token_symbol("tTSLA"),
+            client_id,
+            quantity: RedeemQty::new("10").unwrap(),
+            network: Network::Ethereum,
+            wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
+            tx_hash,
+        };
+
+        let serialized = serde_json::to_value(&request).unwrap();
+        let wire = serialized["network"].as_str().unwrap();
+
+        assert!(
+            accepts_network_wire_string(wire),
+            "redeem callback network must be a published Alpaca TokenizationNetwork \
+             value -- see {REDEEM_CALLBACK_OPENAPI_REFERENCE}"
+        );
+        assert_eq!(wire, "ethereum");
+    }
+
+    fn redeem_response_with_fees(fees: Option<Value>) -> RedeemResponse {
+        let mut response = json!({
+            "tokenization_request_id": "tok-fees",
+            "issuer_request_id": "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd",
+            "created_at": "2025-09-12T17:28:48.642437-04:00",
+            "type": "redeem",
+            "status": "pending",
+            "underlying_symbol": "AAPL",
+            "token_symbol": "tAAPL",
+            "qty": "100",
+            "issuer": "st0x",
+            "network": "base",
+            "wallet_address": "0x1234567890abcdef1234567890abcdef12345678",
+            "tx_hash": "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
+        });
+
+        if let Some(fees) = fees {
+            response
+                .as_object_mut()
+                .unwrap()
+                .insert("fees".to_string(), fees);
+        }
+
+        serde_json::from_value(response).unwrap()
+    }
+
+    #[test]
+    fn redeem_response_fees_parse_every_production_string_encoding() {
+        for (wire, expected) in [
+            ("0", float!(0)),
+            ("0.0", float!(0)),
+            ("0.00", float!(0)),
+            ("0.001", float!(0.001)),
+            ("0.01", float!(0.01)),
+            ("0.5", float!(0.5)),
+            ("0.567", float!(0.567)),
+        ] {
+            let Some(Fees(fees)) = redeem_response_with_fees(Some(json!(wire))).fees else {
+                panic!("fees {wire} should parse");
+            };
+            assert!(
+                fees.inner().eq(expected).unwrap(),
+                "fees {wire} parsed as {fees}"
+            );
+        }
+    }
+
+    #[test]
+    fn redeem_response_zero_fee_encodings_are_zero() {
+        for wire in ["0", "0.0", "0.00"] {
+            let Some(Fees(fees)) = redeem_response_with_fees(Some(json!(wire))).fees else {
+                panic!("fees {wire} should parse");
+            };
+            assert!(fees.is_zero().unwrap(), "fees {wire} should be zero");
+        }
+    }
+
+    #[test]
+    fn redeem_response_fees_accept_a_json_number() {
+        let Some(Fees(fees)) = redeem_response_with_fees(Some(json!(0.25))).fees else {
+            panic!("numeric fees should parse");
+        };
+        assert_eq!(fees, Usd::new(float!(0.25)));
+    }
+
+    #[test]
+    fn redeem_response_fees_absent_or_null_are_none() {
+        assert_eq!(redeem_response_with_fees(None).fees, None);
+        assert_eq!(redeem_response_with_fees(Some(Value::Null)).fees, None);
+    }
+
+    #[test]
+    fn redeem_response_rejects_non_numeric_fees() {
+        let error = serde_json::from_value::<RedeemResponse>(json!({
+            "tokenization_request_id": "tok-fees",
+            "issuer_request_id": "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd",
+            "created_at": "2025-09-12T17:28:48.642437-04:00",
+            "type": "redeem",
+            "status": "pending",
+            "underlying_symbol": "AAPL",
+            "token_symbol": "tAAPL",
+            "qty": "100",
+            "issuer": "st0x",
+            "network": "base",
+            "wallet_address": "0x1234567890abcdef1234567890abcdef12345678",
+            "tx_hash": "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd",
+            "fees": "free"
+        }))
+        .unwrap_err();
+
+        assert!(error.is_data(), "{error}");
     }
 
     #[test]
@@ -1318,6 +1452,7 @@ mod tests {
         );
         assert!(matches!(response.r#type, TokenizationRequestType::Redeem));
         assert!(matches!(response.status, RedeemRequestStatus::Pending));
+        assert_eq!(response.fees, Some(Fees(Usd::new(float!(0.5)))));
         mock.assert();
     }
 
@@ -1352,6 +1487,52 @@ mod tests {
 
         mock.assert();
         assert!(matches!(error, AlpacaError::Parse { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_call_redeem_endpoint_sends_ethereum_network_wire_string() {
+        let server = MockServer::start();
+
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/accounts/test-account/tokenization/callback/redeem")
+                .header("content-type", "application/json")
+                .json_body_includes(r#"{"network": "ethereum"}"#);
+            then.status(200).json_body(serde_json::json!({
+                "tokenization_request_id": "tok-eth-002",
+                "issuer_request_id": "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd",
+                "created_at": "2025-09-12T17:28:48.642437-04:00",
+                "type": "redeem",
+                "status": "pending",
+                "underlying_symbol": "TSLA",
+                "token_symbol": "tTSLA",
+                "qty": "100",
+                "issuer": "test-issuer",
+                "network": "ethereum",
+                "wallet_address": "0x1234567890abcdef1234567890abcdef12345678",
+                "tx_hash": "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd",
+                "fees": "0.0"
+            }));
+        });
+
+        let client = make_client(&server, "test-account", "test-key", "test-secret");
+
+        let mut request = create_redeem_request();
+        request.underlying = underlying_symbol("TSLA");
+        request.token = token_symbol("tTSLA");
+        request.network = Network::Ethereum;
+
+        let response = client.call_redeem_endpoint(request).await.unwrap();
+
+        let wire = response.network.as_str();
+        assert!(
+            accepts_network_wire_string(wire),
+            "redeem callback network must be a published Alpaca TokenizationNetwork \
+             value -- see {REDEEM_CALLBACK_OPENAPI_REFERENCE}"
+        );
+        assert_eq!(response.network, Network::Ethereum);
+        assert_eq!(response.fees, Some(Fees(Usd::ZERO)));
+        mock.assert();
     }
 
     #[tokio::test]
@@ -1974,6 +2155,40 @@ mod tests {
             })
         ));
         mock.assert_calls(3);
+    }
+
+    #[tokio::test]
+    async fn test_poll_request_status_parses_ethereum_network_wire_string() {
+        let target_id = "00000000-0000-0000-0000-000000000002";
+        let ethereum_redeem_json = r#"{"tokenization_request_id":"00000000-0000-0000-0000-000000000002","issuer_request_id":"0x2222222222222222222222222222222222222222222222222222222222222222","type":"redeem","status":"completed","underlying_symbol":"AAPL","token_symbol":"tAAPL","qty":"1","client_external_account_id":"00000000-0000-0000-0000-000000000003","created_at":"2026-06-11T00:02:27.467568Z","updated_at":"2026-06-11T04:02:33.530523Z","wallet_address":"0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","network":"ethereum","issuer":"st0x","fees":"0","tx_hash":"0x2222222222222222222222222222222222222222222222222222222222222222"}"#;
+
+        let server = MockServer::start();
+
+        let mock = server.mock(|when, then| {
+            when.method(GET).path(format!(
+                "/v1/accounts/test-account/tokenization/requests/{target_id}"
+            ));
+            then.status(200).body(ethereum_redeem_json);
+        });
+
+        let client = make_client(&server, "test-account", "test-key", "test-secret");
+
+        let TokenizationRequest::Redeem { network, .. } = client
+            .poll_request_status(&TokenizationRequestId::new(target_id))
+            .await
+            .unwrap()
+        else {
+            panic!("Expected Redeem poll response");
+        };
+
+        let wire = network.as_str();
+        assert!(
+            accepts_network_wire_string(wire),
+            "poll response network must be a published Alpaca TokenizationNetwork \
+             value -- see {REDEEM_CALLBACK_OPENAPI_REFERENCE}"
+        );
+        assert_eq!(network, Network::Ethereum);
+        mock.assert();
     }
 
     #[tokio::test]

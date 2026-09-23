@@ -23,6 +23,14 @@ jobs:
             command: cargo check --locked --no-default-features
           - name: issuer
             command: cargo check --locked --no-default-features --features issuer
+          - name: broker
+            command: cargo check --locked --no-default-features --features broker
+          - name: wallet
+            command: cargo check --locked --no-default-features --features wallet
+          - name: tokenization
+            command: cargo check --locked --no-default-features --features tokenization
+          - name: mock
+            command: cargo check --locked --no-default-features --features mock
           - name: test
             command: cargo test --locked --all-features
           - name: clippy

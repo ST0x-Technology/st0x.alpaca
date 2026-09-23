@@ -38,8 +38,10 @@ use reqwest::header::{AUTHORIZATION, HeaderName, HeaderValue};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
+use tracing::{info, warn};
 
 use crate::core::AlpacaAuth;
+use crate::endpoint::{EndpointError, EndpointRole, validate_origin};
 use crate::rate_limit::retry_after_from_response_headers;
 
 /// Alpaca's token endpoint for live broker partners. Doubles as the
@@ -127,6 +129,8 @@ pub enum KmsJwtError {
     InvalidHeader(#[from] reqwest::header::InvalidHeaderValue),
     #[error("system clock is before the UNIX epoch")]
     ClockBeforeEpoch,
+    #[error(transparent)]
+    InvalidTokenUrl(#[from] EndpointError),
 }
 
 impl KmsJwtError {
@@ -149,7 +153,8 @@ impl KmsJwtError {
             | Self::Pkcs8PrivateKey(_)
             | Self::Claims(_)
             | Self::InvalidHeader(_)
-            | Self::ClockBeforeEpoch => true,
+            | Self::ClockBeforeEpoch
+            | Self::InvalidTokenUrl(_) => true,
             Self::Http(_) => false,
         }
     }
@@ -185,7 +190,7 @@ impl KmsJwtError {
 /// client's token cache. (Each client builds its own runtime today, so
 /// a process runs one cache per client; Alpaca accepts concurrent
 /// tokens per `client_id`, observed live 2026-08-25.)
-pub struct KmsJwtAuth {
+pub(crate) struct KmsJwtAuth {
     client_id: String,
     signer: AssertionSigner,
     token_url: String,
@@ -280,20 +285,10 @@ struct SignResponse {
 }
 
 impl KmsJwtAuth {
-    #[must_use]
-    pub fn new(client_id: &str, kms_key_version: &str, http: reqwest::Client) -> Self {
-        Self::with_urls(
-            client_id,
-            kms_key_version,
-            http,
-            ALPACA_TOKEN_URL,
-            DEFAULT_KMS_BASE_URL,
-            METADATA_TOKEN_URL,
-        )
-    }
-
-    #[must_use]
-    pub fn with_urls(
+    /// Private: every production construction goes through
+    /// [`AuthRuntime::build`], which validates the token URL and supplies a
+    /// no-redirect HTTP client; tests inject loopback mock URLs directly.
+    fn with_urls(
         client_id: &str,
         kms_key_version: &str,
         http: reqwest::Client,
@@ -393,7 +388,7 @@ impl KmsJwtAuth {
     ///
     /// Returns [`KmsJwtError`] when signing or exchanging an assertion fails
     /// and no still-valid cached token is available.
-    pub async fn access_token(&self) -> Result<String, KmsJwtError> {
+    pub(crate) async fn access_token(&self) -> Result<String, KmsJwtError> {
         if let Some(token) = self.cached_before(|tok| tok.refresh_after) {
             return Ok(token);
         }
@@ -417,6 +412,10 @@ impl KmsJwtAuth {
             Ok(token) => Ok(token),
             Err(error) => {
                 if let Some(token) = self.cached_before(|tok| tok.hard_expiry) {
+                    warn!(
+                        %error,
+                        "Alpaca token refresh failed; riding the still-valid cached token"
+                    );
                     self.defer_next_refresh();
                     return Ok(token);
                 }
@@ -481,6 +480,14 @@ impl KmsJwtAuth {
                 .saturating_sub(TOKEN_REFRESH_MARGIN)
                 .max(lifetime / 2))
         .min(hard_expiry);
+        info!(
+            expires_in = token.expires_in,
+            signer = match &self.signer {
+                AssertionSigner::Kms { .. } => "kms",
+                AssertionSigner::LocalPem(_) => "local-pem",
+            },
+            "Minted Alpaca access token via client assertion"
+        );
         let access = token.access_token.clone();
         *self
             .cached
@@ -651,7 +658,7 @@ fn rewrapped_block_body(pem: &str, begin_marker: &str, end_marker: &str) -> Opti
 /// Runtime side of [`AlpacaAuth`]: precomputed header values for
 /// the Basic pair, a shared token cache for keyless.
 #[derive(Clone)]
-pub enum AuthRuntime {
+pub(crate) enum AuthRuntime {
     Basic {
         /// `Basic <base64(key:secret)>` for the Broker API.
         authorization: HeaderValue,
@@ -671,7 +678,7 @@ impl AuthRuntime {
     ///
     /// Returns [`KmsJwtError`] when credentials or the mint HTTP client are
     /// invalid.
-    pub fn build(auth: AlpacaAuth, token_url: &str) -> Result<Self, KmsJwtError> {
+    pub(crate) fn build(auth: AlpacaAuth, token_url: &str) -> Result<Self, KmsJwtError> {
         match auth {
             AlpacaAuth::Basic {
                 api_key,
@@ -695,6 +702,7 @@ impl AuthRuntime {
                 client_id,
                 kms_key_version,
             } => {
+                validate_origin(token_url, EndpointRole::TokenUrl)?;
                 let http = Self::mint_http_client()?;
                 Ok(Self::KmsJwt(std::sync::Arc::new(KmsJwtAuth::with_urls(
                     &client_id,
@@ -709,6 +717,7 @@ impl AuthRuntime {
                 client_id,
                 private_key_pem,
             } => {
+                validate_origin(token_url, EndpointRole::TokenUrl)?;
                 let http = Self::mint_http_client()?;
                 Ok(Self::KmsJwt(std::sync::Arc::new(KmsJwtAuth::local_pem(
                     &client_id,
@@ -736,7 +745,7 @@ impl AuthRuntime {
     ///
     /// Returns [`KmsJwtError`] when a bearer token cannot be minted or the
     /// resulting header is invalid.
-    pub async fn broker_authorization(&self) -> Result<HeaderValue, KmsJwtError> {
+    pub(crate) async fn broker_authorization(&self) -> Result<HeaderValue, KmsJwtError> {
         match self {
             Self::Basic { authorization, .. } => Ok(authorization.clone()),
             Self::KmsJwt(auth) => {
@@ -757,7 +766,7 @@ impl AuthRuntime {
     /// # Errors
     ///
     /// Returns [`KmsJwtError`] when JWT authentication cannot be prepared.
-    pub async fn apply_apca(
+    pub(crate) async fn apply_apca(
         &self,
         request: reqwest::RequestBuilder,
     ) -> Result<reqwest::RequestBuilder, KmsJwtError> {
@@ -785,7 +794,8 @@ impl AuthRuntime {
     /// # Errors
     ///
     /// Returns [`KmsJwtError`] when authentication cannot be prepared.
-    pub async fn apply_wallet(
+    #[cfg(any(test, feature = "issuer", feature = "wallet"))]
+    pub(crate) async fn apply_wallet(
         &self,
         request: reqwest::RequestBuilder,
     ) -> Result<reqwest::RequestBuilder, KmsJwtError> {
@@ -980,6 +990,49 @@ mod tests {
         // Cached inside the refresh window: still exactly one exchange.
         assert_eq!(auth.access_token().await.unwrap(), "tok-local");
         token_mock.assert_calls(1);
+    }
+
+    #[test]
+    fn jwt_runtimes_reject_insecure_token_urls() {
+        let (_, pem) = test_key_pem();
+        for auth in [
+            AlpacaAuth::KmsJwt {
+                client_id: "CK".to_string(),
+                kms_key_version:
+                    "projects/p/locations/l/keyRings/r/cryptoKeys/k/cryptoKeyVersions/1".to_string(),
+            },
+            AlpacaAuth::PrivateKeyJwt {
+                client_id: "CK".to_string(),
+                private_key_pem: pem.clone(),
+            },
+        ] {
+            for token_url in [
+                "http://authx.alpaca.markets/v1/oauth2/token",
+                "https://user:pass@authx.alpaca.markets/v1/oauth2/token",
+                "",
+            ] {
+                let Err(error) = AuthRuntime::build(auth.clone(), token_url) else {
+                    panic!("token URL {token_url:?} must be rejected");
+                };
+                assert!(
+                    matches!(error, KmsJwtError::InvalidTokenUrl(_)),
+                    "{token_url:?}: {error:?}"
+                );
+                assert!(error.is_deterministic());
+            }
+        }
+    }
+
+    #[test]
+    fn basic_runtime_ignores_the_token_url() {
+        AuthRuntime::build(
+            AlpacaAuth::Basic {
+                api_key: "key".to_string(),
+                api_secret: "secret".to_string(),
+            },
+            "",
+        )
+        .unwrap();
     }
 
     #[tokio::test]

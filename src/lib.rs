@@ -1,28 +1,51 @@
 //! Shared Alpaca client library for st0x services.
 //!
-//! Shared Alpaca transport and the validated ITN issuer-callback surface.
-//! The liquidity broker, wallet, and market-data surfaces are not part of
-//! this release; they require a separate parity review before extraction.
+//! Each surface is an additive Cargo feature:
 //!
-//! - `issuer` — the ITN issuer-callback surface (st0x.issuance): mint
-//!   callback, redeem initiation, tokenization-request polling.
+//! - `issuer`: the ITN issuer-callback surface used by st0x.issuance (mint
+//!   callback, redeem initiation with the ITN network preflight, keyed
+//!   tokenization-request polling).
+//! - `broker`: the Broker API and Market Data API surface used by
+//!   st0x.liquidity (account, assets, equity orders, USD/USDC conversion,
+//!   positions, journals, account activities, market hours, quotes).
+//! - `wallet`: crypto wallet deposits, withdrawals, transfers, and
+//!   whitelists.
+//! - `tokenization`: the liquidity-side tokenization client (mint requests,
+//!   request history, redemption detection, polling).
+//! - `mock`: stateful httpmock broker, wallet, and tokenization servers for
+//!   consumer end-to-end suites.
 //!
-//! The always-on [`core`] module holds the shared transport: the HTTP client
-//! builder, Alpaca's dual authentication (HTTP Basic + `APCA-API-KEY`
-//! headers), base-URL/account configuration, retry classification, and the
-//! error taxonomy.
-//!
-//! The crate is telemetry-free by design: consumers wrap calls with their own
-//! instrumentation. Wire types are neutral (strings, decimals, addresses);
-//! consumers convert to their domain newtypes at the boundary.
+//! The always-on [`core`] module holds the authentication modes and the
+//! backpressure/permanence classification shared by every error type. Every
+//! credential-bearing URL is validated (HTTPS, or HTTP on loopback only) and
+//! every client refuses redirects. See `docs/parity.md` for the parity matrix
+//! against the consumer implementations this crate replaces.
 
+#[cfg(any(feature = "issuer", feature = "broker"))]
 mod auth;
 pub mod core;
+#[cfg(any(feature = "issuer", feature = "broker"))]
+mod endpoint;
+#[cfg(any(feature = "issuer", feature = "broker"))]
 mod rate_limit;
 
+#[cfg(feature = "broker")]
+pub mod broker;
 #[cfg(feature = "issuer")]
 pub mod issuer;
+#[cfg(feature = "tokenization")]
+pub mod tokenization;
+#[cfg(feature = "mock")]
+pub mod tokenization_mock;
+#[cfg(feature = "wallet")]
+pub mod wallet;
 
-pub use auth::{ALPACA_SANDBOX_TOKEN_URL, ALPACA_TOKEN_URL, AuthRuntime, KmsJwtAuth, KmsJwtError};
-pub use core::{AlpacaAuth, AlpacaClient, AlpacaError, Backpressure, Permanence};
+#[cfg(any(feature = "issuer", feature = "broker"))]
+pub use auth::{ALPACA_SANDBOX_TOKEN_URL, ALPACA_TOKEN_URL, KmsJwtError};
+pub use core::{AlpacaAuth, Backpressure, Permanence};
+#[cfg(feature = "issuer")]
+pub use core::{AlpacaClient, AlpacaError};
+#[cfg(any(feature = "issuer", feature = "broker"))]
+pub use endpoint::{EndpointError, EndpointRole};
+#[cfg(any(feature = "issuer", feature = "broker"))]
 pub use rate_limit::retry_after_from_response_headers;
