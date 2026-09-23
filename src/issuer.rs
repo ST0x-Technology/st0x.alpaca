@@ -206,17 +206,16 @@ impl UnderlyingSymbol {
     }
 }
 
-/// Ticker of the tokenized representation (e.g. `tAAPL`).
+/// Ticker of the tokenized representation (e.g. `tAAPL`). The issuer wire
+/// contract keeps the exact string rather than trimming or canonicalizing it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct TokenSymbol(pub Symbol);
+pub struct TokenSymbol(pub String);
 
 impl TokenSymbol {
-    /// # Errors
-    ///
-    /// Returns [`EmptySymbolError`] when the symbol is empty or whitespace-only.
-    pub fn new(value: impl Into<String>) -> Result<Self, EmptySymbolError> {
-        Symbol::new(value).map(Self)
+    #[must_use]
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
     }
 }
 
@@ -448,7 +447,7 @@ pub mod mock {
     }
 
     fn token_symbol(value: &str) -> TokenSymbol {
-        TokenSymbol::new(value).unwrap_or_else(|error| panic!("invalid mock token symbol: {error}"))
+        TokenSymbol::new(value)
     }
 
     fn quantity(value: &str) -> Qty {
@@ -845,7 +844,7 @@ mod tests {
     }
 
     fn token_symbol(value: &str) -> TokenSymbol {
-        TokenSymbol::new(value).unwrap_or_else(|error| panic!("invalid test token symbol: {error}"))
+        TokenSymbol::new(value)
     }
 
     fn make_client(
@@ -969,6 +968,12 @@ mod tests {
             serialized["tx_hash"],
             json!("0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef")
         );
+    }
+
+    #[test]
+    fn token_symbol_keeps_issuance_wire_spelling() {
+        let token = TokenSymbol::new(" tAAPL ");
+        assert_eq!(serde_json::to_string(&token).unwrap(), "\" tAAPL \"");
     }
 
     #[test]
