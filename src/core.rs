@@ -276,11 +276,10 @@ pub enum AlpacaError {
         requested: TokenizationRequestId,
         returned: TokenizationRequestId,
     },
-    /// Local preflight: the network is not a published Alpaca ITN
-    /// `TokenizationNetwork` value, so the request is refused before any
-    /// HTTP call.
+    /// Local preflight: the network is not on the ITN network list
+    /// (`issuer::itn`), so the request is refused before any HTTP call.
     #[error(
-        "Network {network} is not a published Alpaca TokenizationNetwork value -- see {reference}"
+        "Network {network} is not on the Alpaca ITN TokenizationNetwork list -- see {reference}"
     )]
     UnsupportedTokenizationNetwork {
         network: Network,

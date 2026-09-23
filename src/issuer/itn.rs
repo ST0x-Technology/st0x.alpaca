@@ -63,7 +63,7 @@ mod tests {
     }
 
     #[test]
-    fn unpublished_network_wire_strings_are_rejected() {
+    fn unlisted_network_wire_strings_are_rejected() {
         for wire in ["polygon", "bsc", "Base", "", "hyper-evm"] {
             assert!(!accepts_network_wire_string(wire), "{wire}");
         }

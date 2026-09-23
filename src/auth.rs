@@ -88,8 +88,8 @@ const TOKEN_MAX_LIFETIME: Duration = Duration::from_hours(1);
 static ASSERTION_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Errors from minting an Alpaca access token via Cloud KMS. HTTP error
-/// bodies are Google/Alpaca error JSON; no tokens or signatures are ever
-/// embedded.
+/// bodies are Google/Alpaca error JSON truncated to 512 bytes; this code
+/// never puts a minted token or a signature into an error.
 #[derive(Debug, thiserror::Error)]
 pub enum KmsJwtError {
     #[error("KMS JWT HTTP request failed: {0}")]
@@ -135,7 +135,8 @@ pub enum KmsJwtError {
 
 impl KmsJwtError {
     /// True when retrying the same mint deterministically fails again:
-    /// a non-429/408 HTTP 4xx from KMS or the token endpoint (revoked
+    /// an HTTP 3xx (redirects are never followed) or a non-429/408 HTTP 4xx
+    /// from KMS or the token endpoint (revoked
     /// IAM grant, disabled or mis-registered `BrokerDash` credential),
     /// or a local encoding failure. Under Basic auth the equivalent
     /// 401/403 classifies Permanent via `status_permanence`; this keeps

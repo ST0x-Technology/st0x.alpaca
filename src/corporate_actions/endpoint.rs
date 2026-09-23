@@ -85,7 +85,7 @@ impl CorporateActionStreamEndpoint {
         development_loopback: DevelopmentLoopback,
     ) -> Result<Self, CorporateActionEndpointError> {
         let url = Url::parse(endpoint)?;
-        reject_reserved_replay_parameters(&url)?;
+        reject_forbidden_url_parts(&url)?;
         if is_development_loopback_endpoint(&url, development_loopback) {
             return Ok(Self {
                 url,
@@ -112,13 +112,13 @@ impl CorporateActionStreamEndpoint {
     ///
     /// # Errors
     ///
-    /// Returns [`CorporateActionEndpointError`] for an unparseable URL, a
-    /// reserved replay query parameter, or a URL that is not plain HTTP on a
-    /// loopback IP.
+    /// Returns [`CorporateActionEndpointError`] for an unparseable URL,
+    /// embedded credentials, a fragment, a reserved replay query parameter,
+    /// or a URL that is not plain HTTP on a loopback IP.
     #[cfg(any(test, feature = "test-support"))]
     pub fn authenticated_loopback(endpoint: &str) -> Result<Self, CorporateActionEndpointError> {
         let url = Url::parse(endpoint)?;
-        reject_reserved_replay_parameters(&url)?;
+        reject_forbidden_url_parts(&url)?;
         if !is_development_loopback_endpoint(&url, DevelopmentLoopback::Allow) {
             return Err(CorporateActionEndpointError::UnexpectedEndpointHost);
         }
@@ -143,7 +143,7 @@ impl CorporateActionStreamEndpoint {
     }
 }
 
-fn reject_reserved_replay_parameters(url: &Url) -> Result<(), CorporateActionEndpointError> {
+fn reject_forbidden_url_parts(url: &Url) -> Result<(), CorporateActionEndpointError> {
     if !url.username().is_empty() || url.password().is_some() {
         return Err(CorporateActionEndpointError::EmbeddedCredentials);
     }

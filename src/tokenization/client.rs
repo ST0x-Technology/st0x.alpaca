@@ -309,8 +309,9 @@ pub struct TokenizationRequest {
     pub client_request_id: Option<ClientRequestId>,
     /// The chain the request settles on, as the issuer names it. `None` when
     /// the issuer omitted it: the read-only list keeps such an entry so
-    /// inflight equity is never understated, while every path that acts on a
-    /// single request refuses it (`confirm_network`).
+    /// inflight equity is never understated, while the mint response,
+    /// `get_request`, and redemption lookups refuse it (`confirm_network`).
+    /// Mint recovery by issuer request id does not check it.
     #[serde(default)]
     pub network: Option<Network>,
     pub issuer_request_id: Option<IssuerRequestId>,

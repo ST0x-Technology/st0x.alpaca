@@ -975,7 +975,7 @@ mod tests {
 
         assert!(
             accepts_network_wire_string(wire),
-            "redeem callback network must be a published Alpaca TokenizationNetwork \
+            "redeem callback network must be on the Alpaca TokenizationNetwork list \
              value -- see {REDEEM_CALLBACK_OPENAPI_REFERENCE}"
         );
         assert_eq!(wire, "ethereum");
@@ -1557,7 +1557,7 @@ mod tests {
         let wire = response.network.as_str();
         assert!(
             accepts_network_wire_string(wire),
-            "redeem callback network must be a published Alpaca TokenizationNetwork \
+            "redeem callback network must be on the Alpaca TokenizationNetwork list \
              value -- see {REDEEM_CALLBACK_OPENAPI_REFERENCE}"
         );
         assert_eq!(response.network, Network::Ethereum);
@@ -2214,7 +2214,7 @@ mod tests {
         let wire = network.as_str();
         assert!(
             accepts_network_wire_string(wire),
-            "poll response network must be a published Alpaca TokenizationNetwork \
+            "poll response network must be on the Alpaca TokenizationNetwork list \
              value -- see {REDEEM_CALLBACK_OPENAPI_REFERENCE}"
         );
         assert_eq!(network, Network::Ethereum);
