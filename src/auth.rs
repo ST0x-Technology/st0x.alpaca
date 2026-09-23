@@ -143,8 +143,11 @@ impl KmsJwtError {
     #[must_use]
     pub fn is_deterministic(&self) -> bool {
         match self {
+            // A 3xx is deterministic too: the mint client never follows
+            // redirects, so the same request is redirected again.
             Self::KmsStatus { status, .. } | Self::TokenStatus { status, .. } => {
-                (400..500).contains(status) && *status != 429 && *status != 408
+                (300..400).contains(status)
+                    || ((400..500).contains(status) && *status != 429 && *status != 408)
             }
             Self::Base64(_)
             | Self::MalformedSignature(_)
@@ -1059,6 +1062,7 @@ mod tests {
             matches!(error, KmsJwtError::TokenStatus { status: 307, .. }),
             "{error:?}"
         );
+        assert!(error.is_deterministic());
         redirect.assert();
         collected.assert_calls(0);
     }

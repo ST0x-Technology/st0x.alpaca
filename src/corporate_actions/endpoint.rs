@@ -15,7 +15,7 @@ use url::{Host, Url};
 pub const DEFAULT_CORPORATE_ACTIONS_STREAM_URL: &str = "https://stream.data.alpaca.markets/v1beta1/events/corporate-actions?type=cash_dividend_corporateaction_event,stock_dividend_corporateaction_event&region=us";
 
 const ALPACA_STREAM_HOST: &str = "stream.data.alpaca.markets";
-const RESERVED_REPLAY_QUERY_PARAMETERS: [&str; 3] = ["since", "since_id", "until"];
+const RESERVED_REPLAY_QUERY_PARAMETERS: [&str; 4] = ["since", "since_id", "until", "until_id"];
 
 /// Whether a plain-HTTP loopback endpoint may be used credential-free.
 /// Consumers pass [`Self::Allow`] only in their development environment.
@@ -62,6 +62,12 @@ pub enum CorporateActionEndpointError {
     UnexpectedEndpointHost,
     #[error("corporate-action stream URL contains reserved replay query parameter {0}")]
     ReservedReplayQueryParameter(String),
+    /// reqwest turns URL userinfo into an `Authorization` header, so it would
+    /// send credentials even to a credential-free endpoint.
+    #[error("corporate-action stream URL must not embed credentials")]
+    EmbeddedCredentials,
+    #[error("corporate-action stream URL must not carry a fragment")]
+    Fragment,
 }
 
 impl CorporateActionStreamEndpoint {
@@ -69,10 +75,11 @@ impl CorporateActionStreamEndpoint {
     ///
     /// # Errors
     ///
-    /// Returns [`CorporateActionEndpointError`] for an unparseable URL, a
-    /// reserved replay query parameter (`since`, `since_id`, `until`), a
-    /// non-HTTPS scheme (outside the allowed development loopback), or a host
-    /// other than `stream.data.alpaca.markets`.
+    /// Returns [`CorporateActionEndpointError`] for an unparseable URL,
+    /// embedded credentials, a fragment, a reserved replay query parameter
+    /// (`since`, `since_id`, `until`, `until_id`), a non-HTTPS scheme
+    /// (outside the allowed development loopback), or a host other than
+    /// `stream.data.alpaca.markets`.
     pub fn parse(
         endpoint: &str,
         development_loopback: DevelopmentLoopback,
@@ -137,6 +144,12 @@ impl CorporateActionStreamEndpoint {
 }
 
 fn reject_reserved_replay_parameters(url: &Url) -> Result<(), CorporateActionEndpointError> {
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(CorporateActionEndpointError::EmbeddedCredentials);
+    }
+    if url.fragment().is_some() {
+        return Err(CorporateActionEndpointError::Fragment);
+    }
     if let Some((parameter, _)) = url
         .query_pairs()
         .find(|(parameter, _)| RESERVED_REPLAY_QUERY_PARAMETERS.contains(&parameter.as_ref()))
@@ -218,7 +231,7 @@ mod tests {
             ),
             Err(CorporateActionEndpointError::InsecureEndpointScheme(_))
         ));
-        for parameter in ["since", "since_id", "until"] {
+        for parameter in ["since", "since_id", "until", "until_id"] {
             let endpoint = format!(
                 "https://stream.data.alpaca.markets/v1beta1/events/corporate-actions?{parameter}=reserved"
             );
@@ -228,6 +241,46 @@ mod tests {
                     if value == parameter
             ));
         }
+    }
+
+    #[test]
+    fn userinfo_and_fragments_are_rejected_on_every_transport() {
+        for (endpoint, development_loopback) in [
+            (
+                "https://user:pass@stream.data.alpaca.markets/v1beta1/events/corporate-actions",
+                DevelopmentLoopback::Deny,
+            ),
+            (
+                "https://user@stream.data.alpaca.markets/v1beta1/events/corporate-actions",
+                DevelopmentLoopback::Deny,
+            ),
+            (
+                "http://user:pass@127.0.0.1:9000/stream",
+                DevelopmentLoopback::Allow,
+            ),
+        ] {
+            assert!(
+                matches!(
+                    CorporateActionStreamEndpoint::parse(endpoint, development_loopback),
+                    Err(CorporateActionEndpointError::EmbeddedCredentials)
+                ),
+                "{endpoint}"
+            );
+        }
+
+        assert!(matches!(
+            CorporateActionStreamEndpoint::parse(
+                "https://stream.data.alpaca.markets/v1beta1/events/corporate-actions#frag",
+                DevelopmentLoopback::Deny,
+            ),
+            Err(CorporateActionEndpointError::Fragment)
+        ));
+        assert!(matches!(
+            CorporateActionStreamEndpoint::authenticated_loopback(
+                "http://user:pass@127.0.0.1:9000/stream"
+            ),
+            Err(CorporateActionEndpointError::EmbeddedCredentials)
+        ));
     }
 
     #[test]

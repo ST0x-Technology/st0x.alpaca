@@ -16,9 +16,10 @@ use reqwest::header::{HeaderMap, RETRY_AFTER};
 /// HTTP-date form (RFC 7231's preferred IMF-fixdate, e.g.
 /// `"Sun, 06 Nov 1994 08:49:37 GMT"`).
 ///
-/// **Not pinned to a confirmed real Alpaca 429 response**: every 429 test in this codebase synthesizes the header via
-/// `httpmock` rather than replaying a captured live response, and Alpaca's
-/// own official SDKs are, if anything, evidence AGAINST relying on it --
+/// **Not pinned to a confirmed real Alpaca 429 response**: every 429 test in
+/// this codebase synthesizes the header via `httpmock` rather than
+/// replaying a captured live response, and Alpaca's own official SDKs
+/// are, if anything, evidence AGAINST relying on it --
 /// neither `alpacahq/alpaca-py`'s `RetryHTTPAdapter`
 /// (`alpaca/common/rest.py`, `DEFAULT_RETRY_WAIT_SECONDS`) nor
 /// `alpacahq/alpaca-trade-api-go`'s `ClientOpts.RetryDelay`

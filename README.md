@@ -27,7 +27,9 @@ st0x-alpaca = { git = "ssh://git@github.com/ST0x-Technology/st0x.alpaca", featur
   KMS-backed `private_key_jwt`, or a local P-256 private-key JWT. The token
   cache refreshes early and rides a still-valid token when a refresh fails.
 - **Credential-bearing URLs**: base and token URLs must be HTTPS (plain HTTP
-  only on loopback) without embedded credentials, query, or fragment. Issuer
+  only on loopback) without embedded credentials, query, or fragment. The
+  corporate-action stream accepts only `stream.data.alpaca.markets` (its
+  query carries the stream filter). Issuer
   request URLs are built from percent-encoded path segments on the
   configured origin.
   No client follows redirects.

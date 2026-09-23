@@ -35,7 +35,7 @@ Status values:
 | Mocks (st0x.liquidity e2e) | 2 servers | 2 | Inline ERC-20 interface instead of ABI environment variables. |
 | Shared auth and transport | - | - | Public auth internals made private; request paths confined to the configured origin; token URLs validated. |
 
-Tests: 645 pass with `--all-features` (plus 1 live-sandbox test ignored, as
+Tests: 646 pass with `--all-features` (plus 1 live-sandbox test ignored, as
 in the source). Every source test is ported except the consumer-side tests
 listed under Test parity.
 
@@ -49,7 +49,7 @@ listed under Test parity.
 | `AuthRuntime` (pub), `KmsJwtAuth::new` / `with_urls` (pub, arbitrary token/KMS/metadata URLs and HTTP client) | crate-private `AuthRuntime`; private `KmsJwtAuth::with_urls` | Changed: every credential-bearing construction goes through `AuthRuntime::build`, which validates the token URL and uses a no-redirect client. No consumer uses these items outside the Alpaca crates. |
 | `AuthRuntime::build(auth, token_url)` | same (crate-private) | Changed: JWT token URLs must be HTTPS (HTTP only on loopback) without embedded credentials, query, or fragment. New `KmsJwtError::InvalidTokenUrl`, classified deterministic. |
 | `apply_apca` / `apply_wallet` / `broker_authorization`, sensitive header values | same (crate-private) | Same. |
-| `KmsJwtError` and `is_deterministic` / `is_rate_limited` / `retry_after` | same | Same, plus `InvalidTokenUrl`. |
+| `KmsJwtError` and `is_deterministic` / `is_rate_limited` / `retry_after` | same | Same, plus `InvalidTokenUrl`. Changed: a 3xx from KMS or the token endpoint is deterministic, because the mint client does not follow redirects. |
 | `rate_limit::parse_retry_after`, `retry_after_from_response_headers` | same | Same (the liquidity file and its 10 tests replace the shorter issuer copy). |
 | `Backpressure`, `Permanence` | `core::{Backpressure, Permanence}` | Same. |
 | liquidity `status_permanence(StatusCode)` | `core::response_status_permanence` | Changed: a 3xx is now Permanent. The source clients followed redirects, so a 3xx never surfaced; with redirects disabled the same request would be redirected again. Otherwise the same policy and test. The issuer keeps its existing `u16` classifier (3xx is already Permanent there). |
@@ -66,7 +66,7 @@ listed under Test parity.
 | --- | --- | --- |
 | `POST /v1/accounts/{account_id}/tokenization/callback/mint` (`send_mint_callback`) | `IssuerApi::send_mint_callback` | Same, under the shared retry policy. A 429 is `RateLimited` with its `Retry-After` hint; issuance returned `Api { 429 }`. Both retry. |
 | `POST /v1/accounts/{account_id}/tokenization/callback/redeem` (`call_redeem_endpoint`) | `IssuerApi::call_redeem_endpoint` | Same, with the retry inside the method. |
-| ITN preflight `itn::accepts_network_wire_string` before the redeem call; `UnsupportedTokenizationNetwork { network, reference }` | `issuer::itn::{TOKENIZATION_NETWORK_WIRE_STRINGS, REDEEM_CALLBACK_OPENAPI_REFERENCE, accepts_network_wire_string}`; `AlpacaError::UnsupportedTokenizationNetwork` | Same. The check runs before the retry and before any HTTP call, and the error is not retryable. |
+| ITN preflight `itn::accepts_network_wire_string` before the redeem call; `UnsupportedTokenizationNetwork { network, reference }` | `issuer::itn::{TOKENIZATION_NETWORK_WIRE_STRINGS, REDEEM_CALLBACK_OPENAPI_REFERENCE, accepts_network_wire_string}`; `AlpacaError::UnsupportedTokenizationNetwork` | Same. The check runs before the retry and before any HTTP call, and the error is not retryable. As in issuance, every `Network` value is on the list, so the check cannot fail today; it guards a future variant. |
 | `GET /v1/accounts/{account_id}/tokenization/requests/{id}` (`poll_request_status`), 404 as `RequestNotFound`, id mismatch as `ResponseIdMismatch` | `IssuerApi::poll_request_status` | Same. |
 | Request qty from `Decimal` keeping lexical scale (`100.50`) | `RedeemQty` (validated through `FractionalShares`, serializes the caller's exact string) | Moved: wire spelling is preserved without `rust_decimal`. |
 | Response qty `Decimal` | `Qty(FractionalShares)` | Changed: Rain Float for arithmetic. Response quantities are not sent back. |
@@ -87,7 +87,7 @@ compiled at that commit (the module is not declared) and is not ported.
 
 | Source item | st0x.alpaca item | Status |
 | --- | --- | --- |
-| `validate_corporate_action_endpoint(endpoint, Environment)` -> `CorporateActionStreamTransport` | `CorporateActionStreamEndpoint::parse(endpoint, DevelopmentLoopback)`, `.transport()` | Moved: `Environment::Development` becomes `DevelopmentLoopback::Allow`. Credentials go only to `stream.data.alpaca.markets` over HTTPS; a plain-HTTP loopback IP is credential-free and allowed in development only; `since`, `since_id`, and `until` are reserved. |
+| `validate_corporate_action_endpoint(endpoint, Environment)` -> `CorporateActionStreamTransport` | `CorporateActionStreamEndpoint::parse(endpoint, DevelopmentLoopback)`, `.transport()` | Moved: `Environment::Development` becomes `DevelopmentLoopback::Allow`. Credentials go only to `stream.data.alpaca.markets` over HTTPS; a plain-HTTP loopback IP is credential-free and allowed in development only. Changed: URL userinfo (which reqwest would send as an `Authorization` header) and fragments are rejected (`EmbeddedCredentials`, `Fragment`), and `until_id` is reserved with `since`, `since_id`, and `until`. |
 | `CorporateActionStreamTransport {AuthenticatedAlpaca, CredentialFreeDevelopment}` | same | Same. |
 | `CorporateActionFeedBuildError {InvalidEndpoint, InsecureEndpointScheme, UnexpectedEndpointHost, ReservedReplayQueryParameter, Client}` | `CorporateActionEndpointError` (first four) and `CorporateActionStreamBuildError {Client, Auth}` | Changed: split into endpoint and client errors with the same messages. `Auth` is new (credential or token-URL failure). |
 | Struct-literal `AuthenticatedAlpaca` endpoint on a loopback URL (issuance tests) | `CorporateActionStreamEndpoint::authenticated_loopback` (`test-support`) | Moved: consumer tests get an authenticated loopback endpoint without bypassing validation. |
@@ -218,6 +218,7 @@ They are not interchangeable:
 | `Network` | `wallet` | Lowercased string newtype for wallet endpoints. |
 | `TokenSymbol` | `issuer` / `wallet` | Issuer token ticker / wallet asset symbol. |
 | `OrderStatus`, `TransferStatus`, `WhitelistStatus` | `broker` and `wallet` / `broker::mock` | Domain status / mock wire status. |
+| `TokenizationRequestType` | `issuer` / `tokenization` / `tokenization_mock` | Issuer response type / liquidity request type / mock wire type. |
 
 ## Telemetry
 
@@ -275,7 +276,12 @@ frame, truncated body, wrong content type). Not ported: 29 projection,
 database, reconnect, notification, and shutdown tests, which stay in
 issuance.
 
-New tests (not in either source): origin/path validation and redirect
-refusal for the issuer, broker, and wallet clients; token-URL validation for
-both JWT modes; fees encodings; unpublished ITN network strings;
-`fetch_latest_trade_price`; `Direction` serde.
+New tests (not in either source): origin validation, path-segment encoding,
+and redirect refusal for the issuer, broker, wallet, and tokenization clients
+and the token mint; token-URL validation for both JWT modes; fees encodings;
+unpublished ITN network strings; ITN error classification;
+`fetch_latest_trade_price`; `Direction` serde. Corporate-action stream:
+symbol rule, replay query map, default URL, the test-support loopback
+constructor, non-US and blank symbols, credential-free live request, status
+and refused redirect, keyless bearer token, credentials built only for
+authenticated endpoints, and userinfo/fragment rejection.

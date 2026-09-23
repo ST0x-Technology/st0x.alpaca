@@ -32,7 +32,8 @@ pub const TOKENIZATION_NETWORK_WIRE_STRINGS: &[&str] = &[
     "robinhood",
 ];
 
-/// Returns whether `wire` is a published Alpaca ITN `TokenizationNetwork` value.
+/// Returns whether `wire` is on the ITN network list above: the published
+/// `TokenizationNetwork` values plus the issued networks pending publication.
 #[must_use]
 pub fn accepts_network_wire_string(wire: &str) -> bool {
     TOKENIZATION_NETWORK_WIRE_STRINGS.contains(&wire)

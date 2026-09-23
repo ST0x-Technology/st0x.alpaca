@@ -20,8 +20,9 @@
 //!
 //! The always-on [`core`] module holds the authentication modes and the
 //! backpressure/permanence classification shared by every error type. Every
-//! credential-bearing URL is validated (HTTPS, or HTTP on loopback only) and
-//! every client refuses redirects. See `docs/parity.md` for the parity matrix
+//! credential-bearing URL is validated before use (HTTPS, with plain HTTP only
+//! on loopback, and no embedded credentials) and every client refuses
+//! redirects. See `docs/parity.md` for the parity matrix
 //! against the consumer implementations this crate replaces.
 
 #[cfg(any(feature = "issuer", feature = "broker", feature = "corporate-actions"))]
