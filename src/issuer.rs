@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use reqwest::StatusCode;
 use rust_decimal::Decimal;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer};
 use st0x_finance::{EmptySymbolError, FractionalShares, Symbol};
 use uuid::Uuid;
 
@@ -93,7 +93,7 @@ pub struct RedeemRequest {
     pub token: TokenSymbol,
     pub client_id: ClientId,
     #[serde(rename = "qty")]
-    pub quantity: Qty,
+    pub quantity: RedeemQty,
     pub network: Network,
     #[serde(rename = "wallet_address")]
     pub wallet: Address,
@@ -225,6 +225,42 @@ impl TokenSymbol {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Qty(pub FractionalShares);
+
+/// Validated redeem quantity retaining the caller's exact decimal spelling.
+/// `FractionalShares` is used for validation and arithmetic, but its display
+/// form canonicalizes trailing zeros; that must not change issuance's wire body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RedeemQty {
+    wire: String,
+    shares: FractionalShares,
+}
+
+impl RedeemQty {
+    /// # Errors
+    ///
+    /// Returns [`st0x_finance::FloatError`] for an invalid share quantity.
+    pub fn new(wire: impl Into<String>) -> Result<Self, st0x_finance::FloatError> {
+        let wire = wire.into();
+        let shares = wire.parse()?;
+        Ok(Self { wire, shares })
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.wire
+    }
+
+    #[must_use]
+    pub const fn shares(&self) -> Qty {
+        Qty(self.shares)
+    }
+}
+
+impl Serialize for RedeemQty {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.wire)
+    }
+}
 
 #[async_trait]
 impl IssuerApi for AlpacaClient {
@@ -494,7 +530,7 @@ pub mod mock {
                     status: RedeemRequestStatus::Pending,
                     underlying: request.underlying,
                     token: request.token,
-                    quantity: request.quantity,
+                    quantity: request.quantity.shares(),
                     issuer: "mock-issuer".to_string(),
                     network: request.network,
                     wallet: request.wallet,
@@ -550,10 +586,10 @@ pub mod mock {
         use alloy_primitives::{address, b256};
         use uuid::Uuid;
 
-        use super::{MockIssuerApi, quantity, token_symbol, underlying_symbol};
+        use super::{MockIssuerApi, token_symbol, underlying_symbol};
         use crate::core::{Network, TokenizationRequestId};
         use crate::issuer::{
-            ClientId, IssuerApi, IssuerRequestId, MintCallbackRequest, RedeemRequest,
+            ClientId, IssuerApi, IssuerRequestId, MintCallbackRequest, RedeemQty, RedeemRequest,
             RedeemRequestStatus, TokenizationRequest,
         };
 
@@ -635,7 +671,7 @@ pub mod mock {
                 underlying: underlying_symbol("AAPL"),
                 token: token_symbol("tAAPL"),
                 client_id: ClientId(Uuid::new_v4()),
-                quantity: quantity("100"),
+                quantity: RedeemQty::new("100").unwrap(),
                 network: Network::Base,
                 wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
                 tx_hash,
@@ -793,12 +829,11 @@ mod tests {
     use alloy_primitives::{address, b256};
     use httpmock::prelude::*;
     use serde_json::{Value, json};
-    use st0x_finance::FractionalShares;
     use std::time::Duration;
     use uuid::Uuid;
 
     use super::{
-        ClientId, IssuerApi, IssuerRequestId, MintCallbackRequest, Qty, RedeemRequest,
+        ClientId, IssuerApi, IssuerRequestId, MintCallbackRequest, RedeemQty, RedeemRequest,
         RedeemRequestStatus, TokenSymbol, TokenizationRequest, TokenizationRequestType,
         UnderlyingSymbol,
     };
@@ -811,12 +846,6 @@ mod tests {
 
     fn token_symbol(value: &str) -> TokenSymbol {
         TokenSymbol::new(value).unwrap_or_else(|error| panic!("invalid test token symbol: {error}"))
-    }
-
-    fn quantity(value: &str) -> Qty {
-        Qty(value
-            .parse::<FractionalShares>()
-            .unwrap_or_else(|error| panic!("invalid test share quantity: {error}")))
     }
 
     fn make_client(
@@ -912,7 +941,7 @@ mod tests {
             underlying: underlying_symbol("AAPL"),
             token: token_symbol("tAAPL"),
             client_id,
-            quantity: quantity("100.50"),
+            quantity: RedeemQty::new("100.50").unwrap(),
             network: Network::Base,
             wallet: address!("0x9999999999999999999999999999999999999999"),
             tx_hash,
@@ -930,7 +959,7 @@ mod tests {
             serialized["client_id"],
             json!("55051234-0000-4abc-9000-4aabcdef0045")
         );
-        assert_eq!(serialized["qty"], json!("100.5"));
+        assert_eq!(serialized["qty"], json!("100.50"));
         assert_eq!(serialized["network"], json!("base"));
         assert_eq!(
             serialized["wallet_address"],
@@ -1234,7 +1263,7 @@ mod tests {
             underlying: underlying_symbol("AAPL"),
             token: token_symbol("tAAPL"),
             client_id,
-            quantity: quantity("100"),
+            quantity: RedeemQty::new("100").unwrap(),
             network: Network::Base,
             wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
             tx_hash,
@@ -1502,7 +1531,7 @@ mod tests {
                     "underlying_symbol": "AAPL",
                     "token_symbol": "tAAPL",
                     "client_id": "00000000-0000-0000-0000-000000000456",
-                    "qty": "100",
+                    "qty": "100.50",
                     "network": "base",
                     "wallet_address": "0x1234567890abcdef1234567890abcdef12345678",
                     "tx_hash": "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
@@ -1526,7 +1555,8 @@ mod tests {
 
         let client = make_client(&server, "test-account", "test-key", "test-secret");
 
-        let request = create_redeem_request();
+        let mut request = create_redeem_request();
+        request.quantity = RedeemQty::new("100.50").unwrap();
         let result = client.call_redeem_endpoint(request).await;
 
         assert!(result.is_ok());

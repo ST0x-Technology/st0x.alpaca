@@ -17,20 +17,6 @@ issuer = [
   "dep:st0x-finance",
   "dep:uuid",
 ]
-# Broker API trading surface: orders, positions, journals, account, clock
-# (st0x.liquidity).
-broker = [
-  "dep:chrono-tz",
-  "dep:rust_decimal",
-  "dep:st0x-finance",
-  "dep:url",
-  "dep:uuid",
-]
-# Crypto wallet surface: funding wallets, transfers, whitelists
-# (st0x.liquidity).
-wallet = ["dep:alloy-primitives", "dep:st0x-finance", "dep:uuid"]
-# Market data surface: quotes/snapshots (st0x.liquidity).
-market-data = ["dep:st0x-finance"]
 
 [dependencies]
 alloy-primitives = { version = "1", features = ["serde"], optional = true }
@@ -38,7 +24,6 @@ async-trait = { version = "0.1", optional = true }
 backon = "1"
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
-chrono-tz = { version = "0.10", optional = true }
 p256 = { version = "0.13", default-features = false, features = [
   "ecdsa",
   "pem",
@@ -58,7 +43,6 @@ sha2 = "0.10"
 st0x-finance = { git = "https://github.com/ST0x-Technology/st0x.finance", version = "0.2.0", optional = true, tag = "v0.2.0" }
 thiserror = "2"
 tokio = { version = "1", features = ["time", "sync"] }
-url = { version = "2", features = ["serde"], optional = true }
 uuid = { version = "1", features = ["serde", "v4"], optional = true }
 
 [dev-dependencies]

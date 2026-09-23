@@ -726,6 +726,7 @@ impl AuthRuntime {
         Ok(reqwest::Client::builder()
             .connect_timeout(MINT_HTTP_TIMEOUT)
             .timeout(MINT_HTTP_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none())
             .build()?)
     }
 

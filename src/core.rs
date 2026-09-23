@@ -5,6 +5,7 @@
 
 use backon::{ExponentialBuilder, Retryable};
 use serde::{Deserialize, Serialize};
+use std::net::IpAddr;
 use std::time::Duration;
 
 use crate::auth::{AuthRuntime, KmsJwtError};
@@ -123,9 +124,14 @@ impl AlpacaClient {
         connect_timeout: Duration,
         request_timeout: Duration,
     ) -> Result<Self, AlpacaError> {
+        validate_credential_url(&base_url, "base URL")?;
+        if !matches!(auth, AlpacaAuth::Basic { .. }) {
+            validate_credential_url(token_url, "token URL")?;
+        }
         let http = reqwest::Client::builder()
             .connect_timeout(connect_timeout)
             .timeout(request_timeout)
+            .redirect(reqwest::redirect::Policy::none())
             .build()?;
         Ok(Self {
             http,
@@ -162,6 +168,7 @@ impl AlpacaClient {
     ///
     /// Returns [`AlpacaError`] when authentication cannot be prepared.
     pub async fn get(&self, url: &str) -> Result<reqwest::RequestBuilder, AlpacaError> {
+        validate_credential_url(url, "request URL")?;
         self.authenticate(self.http.get(url)).await
     }
 
@@ -171,6 +178,7 @@ impl AlpacaClient {
     ///
     /// Returns [`AlpacaError`] when authentication cannot be prepared.
     pub async fn post(&self, url: &str) -> Result<reqwest::RequestBuilder, AlpacaError> {
+        validate_credential_url(url, "request URL")?;
         self.authenticate(self.http.post(url)).await
     }
 
@@ -180,6 +188,7 @@ impl AlpacaClient {
     ///
     /// Returns [`AlpacaError`] when authentication cannot be prepared.
     pub async fn delete(&self, url: &str) -> Result<reqwest::RequestBuilder, AlpacaError> {
+        validate_credential_url(url, "request URL")?;
         self.authenticate(self.http.delete(url)).await
     }
 
@@ -189,6 +198,7 @@ impl AlpacaClient {
     ///
     /// Returns [`AlpacaError`] when authentication cannot be prepared.
     pub async fn patch(&self, url: &str) -> Result<reqwest::RequestBuilder, AlpacaError> {
+        validate_credential_url(url, "request URL")?;
         self.authenticate(self.http.patch(url)).await
     }
 
@@ -199,7 +209,7 @@ impl AlpacaClient {
     /// # Errors
     ///
     /// Returns [`AlpacaError`] when authentication cannot be prepared.
-    pub async fn authenticate(
+    pub(crate) async fn authenticate(
         &self,
         builder: reqwest::RequestBuilder,
     ) -> Result<reqwest::RequestBuilder, AlpacaError> {
@@ -212,6 +222,7 @@ impl AlpacaClient {
     ///
     /// Returns [`AlpacaError`] when authentication cannot be prepared.
     pub async fn market_data_get(&self, url: &str) -> Result<reqwest::RequestBuilder, AlpacaError> {
+        validate_credential_url(url, "request URL")?;
         self.auth
             .apply_apca(self.http.get(url))
             .await
@@ -245,9 +256,38 @@ impl AlpacaClient {
     }
 }
 
+fn validate_credential_url(value: &str, label: &str) -> Result<(), AlpacaError> {
+    let url = reqwest::Url::parse(value).map_err(|_| {
+        AlpacaError::InvalidUrl(format!(
+            "{label} must be a valid HTTPS URL or HTTP loopback URL"
+        ))
+    })?;
+    let loopback = url.host_str().is_some_and(|host| {
+        host.eq_ignore_ascii_case("localhost")
+            || host
+                .trim_matches(['[', ']'])
+                .parse::<IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback())
+    });
+    if (url.scheme() != "https" && !(url.scheme() == "http" && loopback))
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(AlpacaError::InvalidUrl(format!(
+            "{label} must be a valid HTTPS URL or HTTP loopback URL without embedded credentials, query, or fragment"
+        )));
+    }
+    Ok(())
+}
+
 /// Errors that can occur during Alpaca API operations.
 #[derive(Debug, thiserror::Error)]
 pub enum AlpacaError {
+    #[error("Invalid Alpaca endpoint: {0}")]
+    InvalidUrl(String),
     #[error("Reqwest error")]
     Reqwest(#[from] reqwest::Error),
     #[error(transparent)]
@@ -298,7 +338,8 @@ impl AlpacaError {
             }
             Self::RateLimited { .. } => true,
             Self::Jwt(error) => !error.is_deterministic(),
-            Self::Parse { .. }
+            Self::InvalidUrl(_)
+            | Self::Parse { .. }
             | Self::Auth(_)
             | Self::RequestNotFound { .. }
             | Self::ResponseIdMismatch { .. } => false,
@@ -327,7 +368,8 @@ impl AlpacaError {
             Self::Jwt(error) if error.is_deterministic() => Permanence::Permanent,
             Self::Reqwest(_) | Self::Jwt(_) | Self::RateLimited { .. } => Permanence::Transient,
             Self::Api { status_code, .. } => status_permanence(*status_code),
-            Self::Parse { .. }
+            Self::InvalidUrl(_)
+            | Self::Parse { .. }
             | Self::Auth(_)
             | Self::RequestNotFound { .. }
             | Self::ResponseIdMismatch { .. } => Permanence::Permanent,
@@ -354,12 +396,7 @@ const fn status_permanence(status_code: u16) -> Permanence {
     }
 }
 
-#[cfg(any(
-    feature = "broker",
-    feature = "issuer",
-    feature = "market-data",
-    feature = "wallet"
-))]
+#[cfg(feature = "issuer")]
 pub use st0x_finance::Symbol;
 
 /// Alpaca-assigned identifier for a tokenization request. Server-generated
@@ -423,6 +460,7 @@ impl std::fmt::Display for Network {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use httpmock::prelude::*;
 
     #[test]
     fn issued_networks_use_alpaca_wire_names() {
@@ -470,5 +508,65 @@ mod tests {
             .unwrap(),
             AlpacaAuth::PrivateKeyJwt { .. }
         ));
+    }
+
+    #[test]
+    fn credential_endpoints_require_https_or_http_loopback() {
+        for accepted in [
+            "https://broker-api.alpaca.markets",
+            "http://localhost:1234",
+            "http://127.0.0.1:1234",
+            "http://[::1]:1234",
+        ] {
+            assert!(
+                validate_credential_url(accepted, "base URL").is_ok(),
+                "{accepted}"
+            );
+        }
+        for rejected in [
+            "http://broker-api.alpaca.markets",
+            "http://192.0.2.1:1234",
+            "https://user:pass@broker-api.alpaca.markets",
+            "https://broker-api.alpaca.markets?token=secret",
+            "javascript:alert(1)",
+        ] {
+            assert!(
+                validate_credential_url(rejected, "base URL").is_err(),
+                "{rejected}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn credentialed_requests_reject_insecure_targets_and_do_not_follow_redirects() {
+        let server = MockServer::start();
+        let redirect = server.mock(|when, then| {
+            when.method(GET).path("/redirect");
+            then.status(302)
+                .header("location", "http://example.invalid/collect");
+        });
+        let client = AlpacaClient::new(
+            server.base_url(),
+            "account".into(),
+            "key".into(),
+            "secret".into(),
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            client.get("http://example.invalid/collect").await,
+            Err(AlpacaError::InvalidUrl(_))
+        ));
+        let response = client
+            .get(&server.url("/redirect"))
+            .await
+            .unwrap()
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::FOUND);
+        redirect.assert();
     }
 }
