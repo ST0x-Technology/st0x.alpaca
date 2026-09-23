@@ -288,7 +288,7 @@ fn validate_credential_url(value: &str, label: &str) -> Result<(), AlpacaError> 
 pub enum AlpacaError {
     #[error("Invalid Alpaca endpoint: {0}")]
     InvalidUrl(String),
-    #[error("Reqwest error")]
+    #[error("Reqwest error: {0}")]
     Reqwest(#[from] reqwest::Error),
     #[error(transparent)]
     Jwt(#[from] KmsJwtError),
