@@ -35,7 +35,7 @@ Status values:
 | Mocks (st0x.liquidity e2e) | 2 servers | 2 | Inline ERC-20 interface instead of ABI environment variables. |
 | Shared auth and transport | - | - | Public auth internals made private; request paths confined to the configured origin; token URLs validated. |
 
-Tests: 646 pass with `--all-features` (plus 1 live-sandbox test ignored, as
+Tests: 647 pass with `--all-features` (plus 1 live-sandbox test ignored, as
 in the source). Every source test is ported except the consumer-side tests
 listed under Test parity.
 
@@ -97,7 +97,7 @@ compiled at that commit (the module is not declared) and is not ported.
 | Replay query: `since_id`, `since` + `until`, `since`, or none | `CorporateActionReplay {SinceId, Window, Since, Live}` | Moved: same parameters and order. The rule that a live `since` applies only to the authenticated transport stays in the consumer. |
 | Status and content-type checks; `CorporateActionFeedError::{Http, HttpStatus, InvalidContentType}` | `CorporateActionStreamClient::connect`; `CorporateActionStreamError {Http, HttpStatus, InvalidContentType, Auth}` | Same messages; `Auth` is new. |
 | `response.bytes_stream()` feeding `CorporateActionSseDecoder::push` | `CorporateActionStream::next_batch`, `has_pending_frame` | Changed shape: `Response::chunk()` instead of `bytes_stream()` (no `futures` dependency); the same chunks, errors, and decoding. |
-| `CorporateActionSseDecoder` (64 KiB frame cap, 4-byte separator allowance, CR/LF/CRLF, poison releases the buffer) | same | Same. `has_pending_frame` is public. |
+| `CorporateActionSseDecoder` (64 KiB frame cap, 4-byte separator allowance, CR/LF/CRLF, poison releases the buffer) | same | Same, with one fix: when a chunk ends between the CR and LF of a frame's final CRLF, the source left the LF in the buffer, so `has_pending_frame` reported a partial frame at a clean end of stream. The decoder now consumes that LF (`crlf_separator_split_across_chunks_leaves_no_pending_byte`). `has_pending_frame` is public. |
 | `CorporateActionDecodeBatch`, `CorporateActionStreamDecodeError` (with `event_id`), `CorporateActionDecodeError` | same | Same variants and messages. `event_id()` is public (issuance reached it through `CorporateActionFeedError::event_id`). |
 | `decode_sse_frame`, envelope and payload types, SSE line/field/frame helpers | private in `corporate_actions::sse` | Same. |
 | `CorporateActionMutationKind`, `CorporateActionMutation`, `DividendCorporateAction` | same | Changed: `underlying` is `CorporateActionSymbol` instead of issuance's `UnderlyingSymbol` (the same trim and non-empty rule). |
@@ -173,9 +173,9 @@ compiled at that commit (the module is not declared) and is not ported.
 | `GET .../wallets/transfers/{id}` (404 as `TransferNotFound`) and `GET .../wallets/transfers` (chain-neutral filter before strict parse) | `transfer.rs` | `AlpacaWalletService::{poll_transfer_until_complete, find_deposit_by_tx_hash, poll_deposit_by_tx_hash, list_all_transfers}` | Same. |
 | Polling: 10 s interval, 30 min deadline, 5xx exponential retry (10 attempts, 1-60 s), backwards-status detection | `status.rs`, `PollingConfig` | same | Same. |
 | Beneficiary redaction in logs and `ApiError` messages, fail-closed | `client.rs` | same | Same. |
-| `AlpacaWalletClient` (public under `test-support`), `AlpacaWalletService::new_with_client` | same | Same (`test-support` feature). |
-| `TransferDirection` (type of the public `Transfer.direction`, not re-exported) | `wallet::TransferDirection` | Changed: re-exported so consumers can name it. |
-| `alpaca_wallet/serde.rs` | none | Not ported: the module was never declared in the source, so its code and 2 tests never compiled. |
+| `AlpacaWalletClient` (public under `test-support`), `AlpacaWalletService::new_with_client` | `client.rs`, `mod.rs` | same | Same (`test-support` feature). |
+| `TransferDirection` (type of the public `Transfer.direction`, not re-exported) | `transfer.rs` | `wallet::TransferDirection` | Changed: re-exported so consumers can name it. |
+| `alpaca_wallet/serde.rs` | `serde.rs` | none | Not ported: the module was never declared in the source, so its code and 2 tests never compiled. |
 
 ## Tokenization surface (`tokenization`, st0x.liquidity)
 

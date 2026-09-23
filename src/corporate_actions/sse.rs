@@ -21,6 +21,10 @@ const MAX_SSE_SEPARATOR_BYTES: usize = 4;
 #[derive(Debug, Default)]
 pub struct CorporateActionSseDecoder {
     buffer: Vec<u8>,
+    /// The last dispatched separator ended with a CR at the end of the
+    /// buffered input, so a leading LF in the next input completes that CRLF
+    /// line ending instead of starting a new line.
+    skip_leading_lf: bool,
 }
 
 /// The mutations decoded from one pushed chunk.
@@ -122,6 +126,12 @@ impl CorporateActionSseDecoder {
         !self.buffer.is_empty()
     }
 
+    /// Drops buffered input after a poison frame.
+    fn release(&mut self) {
+        self.buffer = Vec::new();
+        self.skip_leading_lf = false;
+    }
+
     /// Incrementally decodes bounded SSE frames without retaining poisoned
     /// input. Complete frames preceding a poison boundary are returned so the
     /// caller can commit them before stopping at the rejected event.
@@ -130,10 +140,16 @@ impl CorporateActionSseDecoder {
         let mut mutations = Vec::new();
 
         while !remaining.is_empty() {
+            if std::mem::take(&mut self.skip_leading_lf)
+                && let Some(rest) = remaining.strip_prefix(b"\n")
+            {
+                remaining = rest;
+                continue;
+            }
             let buffer_limit = MAX_SSE_FRAME_BYTES + MAX_SSE_SEPARATOR_BYTES;
             let available = buffer_limit.saturating_sub(self.buffer.len());
             if available == 0 {
-                self.buffer = Vec::new();
+                self.release();
                 return CorporateActionDecodeBatch::Poison {
                     completed: mutations,
                     error: CorporateActionStreamDecodeError::FrameTooLarge,
@@ -145,19 +161,22 @@ impl CorporateActionSseDecoder {
 
             while let Some((frame_end, separator_len)) = frame_boundary(&self.buffer) {
                 if frame_end > MAX_SSE_FRAME_BYTES {
-                    self.buffer = Vec::new();
+                    self.release();
                     return CorporateActionDecodeBatch::Poison {
                         completed: mutations,
                         error: CorporateActionStreamDecodeError::FrameTooLarge,
                     };
                 }
                 let frame = self.buffer[..frame_end].to_vec();
-                self.buffer.drain(..frame_end + separator_len);
+                let consumed = frame_end + separator_len;
+                self.skip_leading_lf =
+                    consumed == self.buffer.len() && self.buffer[consumed - 1] == b'\r';
+                self.buffer.drain(..consumed);
                 let event_identity = sse_event_identity(&frame);
                 let frame = match std::str::from_utf8(&frame) {
                     Ok(frame) => frame,
                     Err(source) => {
-                        self.buffer = Vec::new();
+                        self.release();
                         let event_id = match event_identity {
                             SseEventIdentity::Valid(event_id) => Some(event_id),
                             SseEventIdentity::Absent | SseEventIdentity::Invalid => None,
@@ -183,7 +202,7 @@ impl CorporateActionSseDecoder {
                 let mutation = match decode_sse_frame(frame) {
                     Ok(mutation) => mutation,
                     Err(source) => {
-                        self.buffer = Vec::new();
+                        self.release();
                         return CorporateActionDecodeBatch::Poison {
                             completed: mutations,
                             error: CorporateActionStreamDecodeError::Event { event_id, source },
@@ -194,7 +213,7 @@ impl CorporateActionSseDecoder {
             }
 
             if !can_still_terminate_within_limit(&self.buffer) {
-                self.buffer = Vec::new();
+                self.release();
                 return CorporateActionDecodeBatch::Poison {
                     completed: mutations,
                     error: CorporateActionStreamDecodeError::FrameTooLarge,
@@ -553,6 +572,25 @@ mod tests {
 
         assert_eq!(mutations.len(), 1);
         assert_eq!(mutations[0].action.id.as_str(), "ca-1");
+    }
+
+    #[test]
+    fn crlf_separator_split_across_chunks_leaves_no_pending_byte() {
+        let mut decoder = CorporateActionSseDecoder::default();
+        let mutations = complete(decoder.push(
+            b"id: 01J9RPMV5TKB8WX3M4F1KZ7QH2\r\nevent: insert\r\ndata: {\"event_type\":\"cash_dividend_corporateaction_event\",\"region\":\"us\",\"ca\":{\"id\":\"ca-1\",\"symbol\":\"AAPL\",\"ex_date\":\"2026-08-14\"}}\r\n\r",
+        ));
+        assert_eq!(mutations.len(), 1);
+
+        assert!(complete(decoder.push(b"\n")).is_empty());
+        assert!(!decoder.has_pending_frame());
+
+        let mutations = complete(decoder.push(
+            b"id: 01J9RPMV5TKB8WX3M4F1KZ7QH3\r\nevent: insert\r\ndata: {\"event_type\":\"cash_dividend_corporateaction_event\",\"region\":\"us\",\"ca\":{\"id\":\"ca-2\",\"symbol\":\"AAPL\",\"ex_date\":\"2026-08-14\"}}\r\n\r\n",
+        ));
+        assert_eq!(mutations.len(), 1);
+        assert_eq!(mutations[0].action.id.as_str(), "ca-2");
+        assert!(!decoder.has_pending_frame());
     }
 
     #[test]
