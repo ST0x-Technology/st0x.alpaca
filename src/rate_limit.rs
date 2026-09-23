@@ -1,5 +1,5 @@
 //! Shared `Retry-After` header parsing for Alpaca's broker, wallet, and
-//! market-data HTTP clients (RAI-1494). A single parser so every client
+//! market-data HTTP clients. A single parser so every client
 //! captures the header the same way instead of duplicating the delay-seconds
 //! vs. HTTP-date branching per call site.
 
@@ -16,8 +16,7 @@ use reqwest::header::{HeaderMap, RETRY_AFTER};
 /// HTTP-date form (RFC 7231's preferred IMF-fixdate, e.g.
 /// `"Sun, 06 Nov 1994 08:49:37 GMT"`).
 ///
-/// **Not pinned to a confirmed real Alpaca 429 response** (RAI-1494 review
-/// finding): every 429 test in this codebase synthesizes the header via
+/// **Not pinned to a confirmed real Alpaca 429 response**: every 429 test in this codebase synthesizes the header via
 /// `httpmock` rather than replaying a captured live response, and Alpaca's
 /// own official SDKs are, if anything, evidence AGAINST relying on it --
 /// neither `alpacahq/alpaca-py`'s `RetryHTTPAdapter`

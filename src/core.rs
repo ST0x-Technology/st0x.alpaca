@@ -15,7 +15,7 @@ use crate::auth::AuthRuntime;
 #[cfg(feature = "issuer")]
 use crate::auth::KmsJwtError;
 #[cfg(feature = "issuer")]
-use crate::endpoint::{EndpointError, EndpointRole, resolve_path, validate_origin};
+use crate::endpoint::{EndpointError, EndpointRole, resolve_segments, validate_origin};
 
 /// Alpaca API credentials applied to every request.
 #[derive(Clone, Deserialize)]
@@ -64,8 +64,8 @@ impl std::fmt::Debug for AlpacaAuth {
 ///
 /// Carries the configured base URL, account id, credentials, and retry
 /// policy. Surface modules send requests through the crate-private
-/// authenticated builders, which resolve an absolute request path against
-/// the configured origin and refuse anything else, and wrap idempotent calls
+/// authenticated builders, which build the URL from percent-encoded path
+/// segments on the configured origin, and wrap idempotent calls
 /// in [`Self::with_retry`].
 #[cfg(feature = "issuer")]
 #[derive(Clone)]
@@ -174,15 +174,23 @@ impl AlpacaClient {
         &self.account_id
     }
 
-    /// Authenticated GET for an absolute `path` on the configured origin.
-    pub(crate) async fn get(&self, path: &str) -> Result<reqwest::RequestBuilder, AlpacaError> {
-        let url = resolve_path(&self.base_url, path)?;
+    /// Authenticated GET for literal path `segments` on the configured
+    /// origin; each segment is percent-encoded.
+    pub(crate) async fn get(
+        &self,
+        segments: &[&str],
+    ) -> Result<reqwest::RequestBuilder, AlpacaError> {
+        let url = resolve_segments(&self.base_url, segments)?;
         self.authenticate(self.http.get(url)).await
     }
 
-    /// Authenticated POST for an absolute `path` on the configured origin.
-    pub(crate) async fn post(&self, path: &str) -> Result<reqwest::RequestBuilder, AlpacaError> {
-        let url = resolve_path(&self.base_url, path)?;
+    /// Authenticated POST for literal path `segments` on the configured
+    /// origin; each segment is percent-encoded.
+    pub(crate) async fn post(
+        &self,
+        segments: &[&str],
+    ) -> Result<reqwest::RequestBuilder, AlpacaError> {
+        let url = resolve_segments(&self.base_url, segments)?;
         self.authenticate(self.http.post(url)).await
     }
 
@@ -347,15 +355,16 @@ pub enum Permanence {
 /// broker, market-data, wallet, and tokenization clients: 5xx is server-side,
 /// 408 is a request timeout, and 429 is rate limiting, all of which can pass on
 /// a later attempt. Every other 4xx is the account or request itself being
-/// rejected. Shared by every such error type's `permanence()` so the policy
-/// cannot drift between them.
+/// rejected. A 3xx is permanent too: the clients never follow redirects, so
+/// the same request is redirected again. Shared by every such error type's
+/// `permanence()` so the policy cannot drift between them.
 #[cfg(feature = "broker")]
 pub(crate) fn response_status_permanence(status: reqwest::StatusCode) -> Permanence {
     match status {
         reqwest::StatusCode::REQUEST_TIMEOUT | reqwest::StatusCode::TOO_MANY_REQUESTS => {
             Permanence::Transient
         }
-        status if status.is_client_error() => Permanence::Permanent,
+        status if status.is_client_error() || status.is_redirection() => Permanence::Permanent,
         _ => Permanence::Transient,
     }
 }
@@ -368,9 +377,6 @@ const fn status_permanence(status_code: u16) -> Permanence {
         Permanence::Permanent
     }
 }
-
-#[cfg(feature = "issuer")]
-pub use st0x_finance::Symbol;
 
 /// Alpaca-assigned identifier for a tokenization request. Server-generated
 /// (a UUID in practice), opaque to consumers, and a plain string on the wire.
@@ -459,6 +465,10 @@ mod tests {
             response_status_permanence(reqwest::StatusCode::FORBIDDEN),
             Permanence::Permanent
         );
+        assert_eq!(
+            response_status_permanence(reqwest::StatusCode::FOUND),
+            Permanence::Permanent
+        );
     }
 
     #[test]
@@ -536,7 +546,7 @@ mod tests {
 
     #[cfg(feature = "issuer")]
     #[tokio::test]
-    async fn credentialed_requests_reject_insecure_targets_and_do_not_follow_redirects() {
+    async fn credentialed_requests_stay_on_the_origin_and_do_not_follow_redirects() {
         let server = MockServer::start();
         let redirect = server.mock(|when, then| {
             when.method(GET).path("/redirect");
@@ -553,27 +563,18 @@ mod tests {
         )
         .unwrap();
 
-        for foreign in [
-            "http://example.invalid/collect",
-            "https://example.invalid/collect",
-            "//example.invalid/collect",
-        ] {
-            assert!(
-                matches!(
-                    client.get(foreign).await,
-                    Err(AlpacaError::InvalidUrl(EndpointError::ForeignPath { .. }))
-                ),
-                "{foreign}"
-            );
-            assert!(
-                matches!(
-                    client.post(foreign).await,
-                    Err(AlpacaError::InvalidUrl(EndpointError::ForeignPath { .. }))
-                ),
-                "{foreign}"
-            );
-        }
-        let response = client.get("/redirect").await.unwrap().send().await.unwrap();
+        let url =
+            resolve_segments(&client.base_url, &["http://example.invalid", "collect"]).unwrap();
+        assert_eq!(url.host_str(), Some("127.0.0.1"));
+        assert_eq!(url.path(), "/http:%2F%2Fexample.invalid/collect");
+
+        let response = client
+            .get(&["redirect"])
+            .await
+            .unwrap()
+            .send()
+            .await
+            .unwrap();
         assert_eq!(response.status(), reqwest::StatusCode::FOUND);
         redirect.assert();
     }

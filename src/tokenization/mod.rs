@@ -14,8 +14,9 @@ use std::str::FromStr;
 use uuid::Uuid;
 
 pub use client::{
-    AlpacaApiErrorMessage, AlpacaTokenizationError, AlpacaTokenizationService, TokenizationRequest,
-    TokenizationRequestStatus, TokenizationRequestType,
+    AlpacaApiErrorMessage, AlpacaTokenizationError, AlpacaTokenizationService,
+    InvalidTokenizationParameters, TokenizationRequest, TokenizationRequestStatus,
+    TokenizationRequestType,
 };
 
 /// Our internal tracking id for a tokenized equity mint, chosen at enqueue time.

@@ -223,15 +223,18 @@ enum AssertionSigner {
 
 // The signing key must never reach logs.
 impl std::fmt::Debug for AssertionSigner {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Kms {
                 kms_key_version, ..
-            } => f
+            } => formatter
                 .debug_struct("Kms")
                 .field("kms_key_version", kms_key_version)
                 .finish_non_exhaustive(),
-            Self::LocalPem(_) => f.debug_tuple("LocalPem").field(&"[REDACTED]").finish(),
+            Self::LocalPem(_) => formatter
+                .debug_tuple("LocalPem")
+                .field(&"[REDACTED]")
+                .finish(),
         }
     }
 }
@@ -249,8 +252,9 @@ struct CachedToken {
 // never reach logs (the same reason the ctx and client Debug impls
 // redact credentials).
 impl std::fmt::Debug for KmsJwtAuth {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("KmsJwtAuth")
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("KmsJwtAuth")
             .field("client_id", &self.client_id)
             .field("signer", &self.signer)
             .field("token_url", &self.token_url)
@@ -259,8 +263,9 @@ impl std::fmt::Debug for KmsJwtAuth {
 }
 
 impl std::fmt::Debug for CachedToken {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CachedToken")
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CachedToken")
             .field("access_token", &"[REDACTED]")
             .field("refresh_after", &self.refresh_after)
             .field("hard_expiry", &self.hard_expiry)
@@ -1021,6 +1026,41 @@ mod tests {
                 assert!(error.is_deterministic());
             }
         }
+    }
+
+    #[tokio::test]
+    async fn token_mint_does_not_follow_redirects() {
+        let destination = MockServer::start_async().await;
+        let collected = destination.mock(|when, then| {
+            when.any_request();
+            then.status(200)
+                .json_body(serde_json::json!({ "access_token": "stolen", "expires_in": 900 }));
+        });
+        let server = MockServer::start_async().await;
+        let redirect = server.mock(|when, then| {
+            when.method(httpmock::Method::POST).path("/token");
+            then.status(307)
+                .header("location", destination.url("/collect"));
+        });
+
+        let (_, pem) = test_key_pem();
+        let runtime = AuthRuntime::build(
+            AlpacaAuth::PrivateKeyJwt {
+                client_id: "CKREDIRECT".to_string(),
+                private_key_pem: pem,
+            },
+            &server.url("/token"),
+        )
+        .unwrap();
+
+        let error = runtime.broker_authorization().await.unwrap_err();
+
+        assert!(
+            matches!(error, KmsJwtError::TokenStatus { status: 307, .. }),
+            "{error:?}"
+        );
+        redirect.assert();
+        collected.assert_calls(0);
     }
 
     #[test]

@@ -251,7 +251,8 @@ impl AlpacaWalletClient {
 
         // NOTE: Chain comparison disabled due to Alpaca API inconsistency.
         // Request uses "ethereum" but response returns "ETH".
-        // TODO: Re-enable once Alpaca fixes the chain field or we normalize values.
+        // Re-enable once Alpaca fixes the chain field or the values are
+        // normalized.
         Ok(entries.iter().any(|entry| {
             entry.address == *address
                 && entry.asset == *asset

@@ -48,8 +48,10 @@ pub enum EndpointError {
     EmbeddedCredentials { role: EndpointRole },
     #[error("Alpaca {role} must not carry a query or fragment")]
     QueryOrFragment { role: EndpointRole },
-    #[error("request path {path:?} must be an absolute path on the configured Alpaca origin")]
-    ForeignPath { path: String },
+    /// URL parsers resolve `.` and `..` (even percent-encoded) and collapse
+    /// empty segments, so such a value could address another endpoint.
+    #[error("request path segment {segment:?} is empty or a dot segment")]
+    InvalidPathSegment { segment: String },
 }
 
 /// Parses and validates a configured credential-bearing origin.
@@ -83,30 +85,29 @@ pub(crate) fn validate_origin(value: &str, role: EndpointRole) -> Result<Url, En
     Ok(url)
 }
 
-/// Resolves `path` (for example `/v1/accounts/{id}/...`, optionally with a
-/// query string) against the configured `base` origin, keeping any path
-/// prefix on `base`.
+/// Builds a URL on the configured `base` origin from literal path
+/// `segments`, keeping any path prefix on `base`.
 ///
-/// Rejects anything that is not an absolute path, including scheme-relative
-/// (`//host`) and absolute URLs, and re-checks that the resolved URL kept the
-/// base origin.
+/// Every segment is percent-encoded as one path segment, so a value that
+/// contains `/`, `?`, `#`, `%`, or `\\` cannot change the endpoint or leave
+/// the origin. Empty and dot segments are rejected.
 #[cfg(feature = "issuer")]
-pub(crate) fn resolve_path(base: &Url, path: &str) -> Result<Url, EndpointError> {
-    let foreign = || EndpointError::ForeignPath {
-        path: path.to_string(),
-    };
-
-    if !path.starts_with('/') || path.starts_with("//") || path.contains('\\') {
-        return Err(foreign());
+pub(crate) fn resolve_segments(base: &Url, segments: &[&str]) -> Result<Url, EndpointError> {
+    if let Some(segment) = segments.iter().find(|segment| {
+        let decoded = segment.to_ascii_lowercase().replace("%2e", ".");
+        segment.is_empty() || decoded == "." || decoded == ".."
+    }) {
+        return Err(EndpointError::InvalidPathSegment {
+            segment: (*segment).to_string(),
+        });
     }
 
-    let joined = format!("{}{path}", base.as_str().trim_end_matches('/'));
-    let url = Url::parse(&joined).map_err(|_| foreign())?;
-
-    if url.origin() != base.origin() {
-        return Err(foreign());
+    let mut url = base.clone();
+    // `validate_origin` guarantees a host, so the URL can always be a base
+    // and `path_segments_mut` cannot fail.
+    if let Ok(mut path) = url.path_segments_mut() {
+        path.pop_if_empty().extend(segments);
     }
-
     Ok(url)
 }
 
@@ -163,57 +164,69 @@ mod tests {
 
     #[cfg(feature = "issuer")]
     #[test]
-    fn paths_resolve_on_the_configured_origin_keeping_its_prefix() {
+    fn segments_resolve_on_the_configured_origin_keeping_its_prefix() {
         let base =
             validate_origin("https://broker-api.alpaca.markets/", EndpointRole::BaseUrl).unwrap();
         assert_eq!(
-            resolve_path(&base, "/v1/accounts/abc/tokenization/requests/xyz")
-                .unwrap()
-                .as_str(),
+            resolve_segments(
+                &base,
+                &["v1", "accounts", "abc", "tokenization", "requests", "xyz"]
+            )
+            .unwrap()
+            .as_str(),
             "https://broker-api.alpaca.markets/v1/accounts/abc/tokenization/requests/xyz"
         );
 
         let prefixed =
             validate_origin("http://127.0.0.1:9000/proxy", EndpointRole::BaseUrl).unwrap();
         assert_eq!(
-            resolve_path(&prefixed, "/v1/orders?status=open")
+            resolve_segments(&prefixed, &["v1", "orders"])
                 .unwrap()
                 .as_str(),
-            "http://127.0.0.1:9000/proxy/v1/orders?status=open"
+            "http://127.0.0.1:9000/proxy/v1/orders"
         );
     }
 
     #[cfg(feature = "issuer")]
     #[test]
-    fn foreign_targets_are_rejected_before_credentials_attach() {
+    fn url_syntax_in_a_segment_is_encoded_and_stays_on_the_endpoint() {
         let base =
             validate_origin("https://broker-api.alpaca.markets", EndpointRole::BaseUrl).unwrap();
 
-        for foreign in [
-            "https://attacker.example/collect",
-            "//attacker.example/collect",
-            "attacker.example/collect",
-            "",
-            "/\\attacker.example",
+        for (segment, encoded) in [
+            ("a?b=c", "a%3Fb=c"),
+            ("a#frag", "a%23frag"),
+            ("a/b", "a%2Fb"),
+            ("a%2Fb", "a%252Fb"),
+            ("a\\b", "a%5Cb"),
+            ("//attacker.example", "%2F%2Fattacker.example"),
         ] {
+            let url = resolve_segments(&base, &["v1", "accounts", segment, "x"]).unwrap();
+            assert_eq!(
+                url.host_str(),
+                Some("broker-api.alpaca.markets"),
+                "{segment}"
+            );
+            assert_eq!(url.query(), None, "{segment}");
+            assert_eq!(url.fragment(), None, "{segment}");
+            assert_eq!(url.path(), format!("/v1/accounts/{encoded}/x"), "{segment}");
+        }
+    }
+
+    #[cfg(feature = "issuer")]
+    #[test]
+    fn empty_and_dot_segments_are_rejected() {
+        let base =
+            validate_origin("https://broker-api.alpaca.markets", EndpointRole::BaseUrl).unwrap();
+
+        for segment in ["", ".", "..", "%2e", "%2E%2e", ".%2E"] {
             assert!(
                 matches!(
-                    resolve_path(&base, foreign),
-                    Err(EndpointError::ForeignPath { .. })
+                    resolve_segments(&base, &["v1", "accounts", segment, "x"]),
+                    Err(EndpointError::InvalidPathSegment { .. })
                 ),
-                "{foreign}"
+                "{segment:?}"
             );
         }
-
-        assert!(matches!(
-            resolve_path(&base, "@attacker.example/collect"),
-            Err(EndpointError::ForeignPath { .. })
-        ));
-        assert_eq!(
-            resolve_path(&base, "/@attacker.example/collect")
-                .unwrap()
-                .host_str(),
-            Some("broker-api.alpaca.markets")
-        );
     }
 }

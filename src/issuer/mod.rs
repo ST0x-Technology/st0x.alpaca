@@ -10,8 +10,9 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize, Serializer};
-use st0x_finance::{EmptySymbolError, FractionalShares, Symbol, Usd};
 use uuid::Uuid;
+
+use st0x_finance::{EmptySymbolError, FractionalShares, Symbol, Usd};
 
 use crate::core::{AlpacaClient, AlpacaError, Network, TokenizationRequestId};
 use crate::rate_limit::retry_after_from_response_headers;
@@ -269,10 +270,14 @@ impl Serialize for RedeemQty {
 #[async_trait]
 impl IssuerApi for AlpacaClient {
     async fn send_mint_callback(&self, request: MintCallbackRequest) -> Result<(), AlpacaError> {
-        let path = format!(
-            "/v1/accounts/{}/tokenization/callback/mint",
-            self.account_id()
-        );
+        let path = [
+            "v1",
+            "accounts",
+            self.account_id(),
+            "tokenization",
+            "callback",
+            "mint",
+        ];
 
         self.with_retry(|| async {
             let response = self.post(&path).await?.json(&request).send().await?;
@@ -313,10 +318,14 @@ impl IssuerApi for AlpacaClient {
             });
         }
 
-        let path = format!(
-            "/v1/accounts/{}/tokenization/callback/redeem",
-            self.account_id()
-        );
+        let path = [
+            "v1",
+            "accounts",
+            self.account_id(),
+            "tokenization",
+            "callback",
+            "redeem",
+        ];
 
         self.with_retry(|| async {
             let response = self.post(&path).await?.json(&request).send().await?;
@@ -354,13 +363,14 @@ impl IssuerApi for AlpacaClient {
         &self,
         tokenization_request_id: &TokenizationRequestId,
     ) -> Result<TokenizationRequest, AlpacaError> {
-        // Alpaca tokenization_request_ids are server-generated UUIDs, so the
-        // path segment needs no percent-encoding.
-        let path = format!(
-            "/v1/accounts/{}/tokenization/requests/{}",
+        let path = [
+            "v1",
+            "accounts",
             self.account_id(),
-            tokenization_request_id
-        );
+            "tokenization",
+            "requests",
+            tokenization_request_id.0.as_str(),
+        ];
 
         self.with_retry(|| async {
             let response = self.get(&path).await?.send().await?;
@@ -428,19 +438,21 @@ where
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub mod mock {
     //! Configurable in-memory [`IssuerApi`] double.
     //!
-    //! Not gated behind `#[cfg(test)]` because consumers construct it in
-    //! their own test setups (e.g. spinning up a test service), which
-    //! compile this library without its test configuration.
+    //! Behind `test-support` rather than `#[cfg(test)]` because consumers
+    //! construct it in their own test setups (e.g. spinning up a test
+    //! service), which compile this library without its test configuration.
 
     use alloy_primitives::{address, b256};
     use async_trait::async_trait;
     use chrono::Utc;
-    use st0x_finance::{FractionalShares, HasZero, Usd};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use st0x_finance::{FractionalShares, HasZero, Usd};
 
     use super::{
         Fees, IssuerApi, IssuerRequestId, MintCallbackRequest, Qty, RedeemRequest,
@@ -967,6 +979,24 @@ mod tests {
              value -- see {REDEEM_CALLBACK_OPENAPI_REFERENCE}"
         );
         assert_eq!(wire, "ethereum");
+    }
+
+    #[test]
+    fn unsupported_tokenization_network_is_a_permanent_local_rejection() {
+        let error = AlpacaError::UnsupportedTokenizationNetwork {
+            network: Network::Base,
+            reference: REDEEM_CALLBACK_OPENAPI_REFERENCE,
+        };
+
+        assert!(!error.is_retryable());
+        assert_eq!(error.permanence(), crate::core::Permanence::Permanent);
+        assert_eq!(error.backpressure(), None);
+        assert!(
+            error
+                .to_string()
+                .contains("https://docs.alpaca.markets/reference/posttokenizationredeem"),
+            "{error}"
+        );
     }
 
     fn redeem_response_with_fees(fees: Option<Value>) -> RedeemResponse {

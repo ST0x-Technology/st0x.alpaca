@@ -54,9 +54,9 @@ fn deserialize_time<'de, D>(deserializer: D) -> Result<NaiveTime, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    let s = String::deserialize(deserializer)?;
-    NaiveTime::parse_from_str(&s, "%H:%M")
-        .or_else(|_| NaiveTime::parse_from_str(&s, "%H%M"))
+    let raw = String::deserialize(deserializer)?;
+    NaiveTime::parse_from_str(&raw, "%H:%M")
+        .or_else(|_| NaiveTime::parse_from_str(&raw, "%H%M"))
         .map_err(serde::de::Error::custom)
 }
 

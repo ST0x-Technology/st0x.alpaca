@@ -27,7 +27,8 @@ st0x-alpaca = { git = "ssh://git@github.com/ST0x-Technology/st0x.alpaca", featur
   cache refreshes early and rides a still-valid token when a refresh fails.
 - **Credential-bearing URLs**: base and token URLs must be HTTPS (plain HTTP
   only on loopback) without embedded credentials, query, or fragment. Issuer
-  request paths resolve against the configured origin and cannot leave it.
+  request URLs are built from percent-encoded path segments on the
+  configured origin.
   No client follows redirects.
 - **Consumer boundary**: Alpaca wire types, validation, retries, polling, and
   error classification live here. Consumer traits (liquidity's `Executor` and

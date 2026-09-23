@@ -13,9 +13,7 @@ default = []
 issuer = [
   "dep:alloy-primitives",
   "dep:async-trait",
-  "dep:rain-math-float",
   "dep:st0x-finance",
-  "dep:st0x-float-macro",
   "dep:uuid",
 ]
 # Stateful httpmock Alpaca Broker, wallet, and tokenization servers with
@@ -92,6 +90,8 @@ bon = { version = "3.9", optional = true }
 anyhow = { version = "1", optional = true }
 
 [dev-dependencies]
+rain-math-float = { git = "https://github.com/rainlanguage/rain.math.float", rev = "e226e5a27125e75208e3e709e1c5eee128bd8b3b" }
+st0x-float-macro = { git = "https://github.com/ST0x-Technology/st0x.finance", version = "0.2.0", tag = "v0.2.0" }
 alloy-primitives = { version = "1", features = ["rand"] }
 httpmock = "0.8"
 proptest = "1"

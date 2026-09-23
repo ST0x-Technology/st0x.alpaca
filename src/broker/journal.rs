@@ -89,8 +89,9 @@ pub struct JournalResponse {
 }
 
 impl std::fmt::Debug for JournalResponse {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("JournalResponse")
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("JournalResponse")
             .field("id", &self.id)
             .field("status", &self.status)
             .field("symbol", &self.symbol)
@@ -131,22 +132,22 @@ pub enum JournalStatus {
 }
 
 impl std::fmt::Display for JournalStatus {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         use JournalStatus::{
             Canceled, Correct, Deleted, Executed, Pending, Queued, Refused, Rejected,
             SentToClearing,
         };
 
         match self {
-            Queued => write!(f, "queued"),
-            SentToClearing => write!(f, "sent_to_clearing"),
-            Pending => write!(f, "pending"),
-            Executed => write!(f, "executed"),
-            Rejected => write!(f, "rejected"),
-            Canceled => write!(f, "canceled"),
-            Refused => write!(f, "refused"),
-            Deleted => write!(f, "deleted"),
-            Correct => write!(f, "correct"),
+            Queued => write!(formatter, "queued"),
+            SentToClearing => write!(formatter, "sent_to_clearing"),
+            Pending => write!(formatter, "pending"),
+            Executed => write!(formatter, "executed"),
+            Rejected => write!(formatter, "rejected"),
+            Canceled => write!(formatter, "canceled"),
+            Refused => write!(formatter, "refused"),
+            Deleted => write!(formatter, "deleted"),
+            Correct => write!(formatter, "correct"),
         }
     }
 }

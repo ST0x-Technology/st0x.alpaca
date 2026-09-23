@@ -25,8 +25,8 @@ impl OrderStatus {
 }
 
 impl std::fmt::Display for OrderStatus {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.as_str())
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}", self.as_str())
     }
 }
 
@@ -42,8 +42,8 @@ pub enum ParseOrderStatusError {
 impl std::str::FromStr for OrderStatus {
     type Err = ParseOrderStatusError;
 
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
             "PENDING" => Ok(Self::Pending),
             "SUBMITTED" => Ok(Self::Submitted),
             "PARTIALLY_FILLED" => Ok(Self::PartiallyFilled),
@@ -51,7 +51,7 @@ impl std::str::FromStr for OrderStatus {
             "CANCELLED" => Ok(Self::Cancelled),
             "FAILED" => Ok(Self::Failed),
             _ => Err(ParseOrderStatusError::InvalidStatus {
-                status_provided: s.to_string(),
+                status_provided: value.to_string(),
             }),
         }
     }

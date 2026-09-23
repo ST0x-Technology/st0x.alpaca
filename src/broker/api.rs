@@ -155,8 +155,9 @@ impl Clone for AlpacaBrokerApi {
 }
 
 impl std::fmt::Debug for AlpacaBrokerApi {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AlpacaBrokerApi")
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AlpacaBrokerApi")
             .field("client", &self.client)
             .field("asset_cache_ttl", &self.asset_cache_ttl)
             .field("time_in_force", &self.time_in_force)
@@ -668,8 +669,9 @@ impl AlpacaBrokerApi {
     /// Place a manual Alpaca-specific limit order for operator intervention.
     ///
     /// Accepts `AlpacaLimitOrder` directly (pre-validated Alpaca price type).
-    /// For automated counter-trading, use the `Executor::place_limit_order`
-    /// trait method which accepts the broker-agnostic `LimitOrder` type.
+    /// Unlike [`Self::place_limit_order`], which takes the broker-agnostic
+    /// `LimitOrder` for automated counter-trading, it skips the asset
+    /// fractionability truncation.
     ///
     /// # Errors
     ///
@@ -712,10 +714,8 @@ impl AlpacaBrokerApi {
     /// Fetches the latest indicative overnight quote (`feed=overnight`) with
     /// its broker timestamp.
     ///
-    /// Inherent rather than on the `Executor` trait: the automated overnight
-    /// pricing path is not built yet, and today's only consumer is the CLI's
-    /// overnight inspection surface, which addresses the Alpaca
-    /// implementation directly.
+    /// The automated overnight pricing path is not built yet; today's only
+    /// consumer is the CLI's overnight inspection surface.
     ///
     /// # Errors
     ///

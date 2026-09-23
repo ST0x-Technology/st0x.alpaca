@@ -14,10 +14,11 @@ pub const REDEEM_CALLBACK_OPENAPI_REFERENCE: &str =
 /// `TokenizationNetwork` enum values from Alpaca Broker API `OpenAPI`
 /// (`components.schemas.TokenizationNetwork.enum`).
 ///
-/// `"robinhood"` is the one entry not yet in that published enum: Robinhood
-/// Chain issuance is being onboarded and the wire name is pending Alpaca's
-/// confirmation. It is listed here so the issued-network check below stays a
-/// real assertion; drop it again if Alpaca publishes a different spelling.
+/// `"hyperevm"` and `"robinhood"` are not in that published enum yet: both
+/// networks are issued by st0x and their wire names are pending Alpaca's
+/// confirmation. They are listed here, as in st0x.issuance, so every issued
+/// network passes the preflight; drop them again if Alpaca publishes a
+/// different spelling.
 pub const TOKENIZATION_NETWORK_WIRE_STRINGS: &[&str] = &[
     "solana",
     "arbitrum",

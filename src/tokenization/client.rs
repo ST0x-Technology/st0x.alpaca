@@ -32,7 +32,6 @@ use std::time::Duration;
 use thiserror::Error;
 use tokio::time::{Instant, MissedTickBehavior};
 use tracing::{debug, error, info, trace, warn};
-use url::{Host, Url};
 
 use st0x_finance::{FractionalShares, Symbol};
 
@@ -40,6 +39,7 @@ use super::{ClientRequestId, IssuerRequestId, TokenizationRequestId};
 use crate::auth::{ALPACA_TOKEN_URL, AuthRuntime, KmsJwtError};
 use crate::broker::AlpacaAccountId;
 use crate::core::{AlpacaAuth, Backpressure, Network as Chain};
+use crate::endpoint::{EndpointError, EndpointRole, validate_origin};
 use crate::rate_limit::retry_after_from_response_headers;
 use crate::wallet::{Network, PollingConfig};
 
@@ -57,8 +57,7 @@ impl AlpacaTokenizationService {
     ///
     /// # Errors
     ///
-    /// - `InvalidBaseUrl` / `InsecureBaseUrl` if `base_url` cannot safely
-    ///   carry credentials
+    /// - `InvalidBaseUrl` if `base_url` cannot safely carry credentials
     /// - `PrivateKeyJwtUnsupported` for `private_key_jwt` credentials
     /// - `Auth` / `Reqwest` if the authentication runtime or HTTP client
     ///   cannot be built
@@ -255,10 +254,10 @@ pub enum TokenizationRequestType {
 }
 
 impl std::fmt::Display for TokenizationRequestType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Mint => write!(f, "mint"),
-            Self::Redeem => write!(f, "redeem"),
+            Self::Mint => write!(formatter, "mint"),
+            Self::Redeem => write!(formatter, "redeem"),
         }
     }
 }
@@ -273,11 +272,11 @@ pub enum TokenizationRequestStatus {
 }
 
 impl std::fmt::Display for TokenizationRequestStatus {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Pending => write!(f, "pending"),
-            Self::Completed => write!(f, "completed"),
-            Self::Rejected => write!(f, "rejected"),
+            Self::Pending => write!(formatter, "pending"),
+            Self::Completed => write!(formatter, "completed"),
+            Self::Rejected => write!(formatter, "rejected"),
         }
     }
 }
@@ -287,8 +286,8 @@ impl std::fmt::Display for TokenizationRequestStatus {
 struct Issuer(String);
 
 impl Issuer {
-    fn new(s: impl Into<String>) -> Self {
-        Self(s.into())
+    fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
     }
 }
 
@@ -464,11 +463,10 @@ pub enum AlpacaTokenizationError {
     #[error("multiple mint requests found for issuer request id {issuer_request_id}")]
     DuplicateMintIssuerRequestId { issuer_request_id: IssuerRequestId },
 
-    #[error("invalid Alpaca tokenization base URL: {0}")]
-    InvalidBaseUrl(#[from] url::ParseError),
-
-    #[error("refusing to send Alpaca credentials over an insecure base URL")]
-    InsecureBaseUrl,
+    /// The base URL is unparseable, or is not HTTPS (plain HTTP only on a
+    /// loopback host), or embeds credentials, a query, or a fragment.
+    #[error("refusing to send Alpaca credentials to this base URL: {0}")]
+    InvalidBaseUrl(#[from] EndpointError),
 
     #[error("Poll timeout after {elapsed:?}")]
     PollTimeout { elapsed: Duration },
@@ -507,7 +505,7 @@ impl AlpacaApiErrorMessage {
 #[cfg(any(test, feature = "test-support"))]
 impl AlpacaApiErrorMessage {
     /// Test-only constructor so downstream crates can build a classified
-    /// `AlpacaTokenizationError::ApiError` (e.g. RAI-1494's `find_backpressure`
+    /// `AlpacaTokenizationError::ApiError` (e.g. a consumer's `find_backpressure`
     /// tests) without depending on the production `from_response` path, which
     /// stays crate-private since it is only ever built from a real HTTP
     /// response body.
@@ -558,7 +556,6 @@ impl AlpacaTokenizationError {
             | Self::RequestNotFound { .. }
             | Self::DuplicateMintIssuerRequestId { .. }
             | Self::InvalidBaseUrl(_)
-            | Self::InsecureBaseUrl
             | Self::WrongNetwork { .. }
             | Self::NetworkMissing { .. }
             | Self::PrivateKeyJwtUnsupported
@@ -613,7 +610,6 @@ impl AlpacaTokenizationError {
             | Self::RequestNotFound { .. }
             | Self::DuplicateMintIssuerRequestId { .. }
             | Self::InvalidBaseUrl(_)
-            | Self::InsecureBaseUrl
             | Self::WrongNetwork { .. }
             | Self::NetworkMissing { .. }
             | Self::PollTimeout { .. } => None,
@@ -671,21 +667,6 @@ fn map_mint_error(
 const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
-fn validate_credentialed_base_url(base_url: &str) -> Result<(), AlpacaTokenizationError> {
-    let parsed = Url::parse(base_url)?;
-    let is_loopback = match parsed.host() {
-        Some(Host::Ipv4(address)) => address.is_loopback(),
-        Some(Host::Ipv6(address)) => address.is_loopback(),
-        Some(Host::Domain(_)) | None => false,
-    };
-
-    if parsed.scheme() == "https" || (parsed.scheme() == "http" && is_loopback) {
-        return Ok(());
-    }
-
-    Err(AlpacaTokenizationError::InsecureBaseUrl)
-}
-
 /// Client for Alpaca's tokenization API.
 struct AlpacaTokenizationClient {
     http_client: Client,
@@ -702,7 +683,7 @@ impl AlpacaTokenizationClient {
         auth: AlpacaAuth,
         chain: Chain,
     ) -> Result<Self, AlpacaTokenizationError> {
-        validate_credentialed_base_url(&base_url)?;
+        validate_origin(&base_url, EndpointRole::BaseUrl)?;
 
         // Tokenization carries a raw base_url with no mode, so JWT
         // credentials mint at the live authx endpoint. Basic and KmsJwt
@@ -1286,8 +1267,36 @@ mod tests {
 
         assert!(matches!(
             result,
-            Err(AlpacaTokenizationError::InsecureBaseUrl)
+            Err(AlpacaTokenizationError::InvalidBaseUrl(
+                EndpointError::InsecureScheme { .. }
+            ))
         ));
+
+        for rejected in [
+            "https://user:pass@broker-api.alpaca.markets",
+            "https://broker-api.alpaca.markets?token=secret",
+        ] {
+            assert!(
+                matches!(
+                    AlpacaTokenizationClient::new(
+                        rejected.to_string(),
+                        TEST_ACCOUNT_ID,
+                        test_auth(),
+                        Chain::Base,
+                    ),
+                    Err(AlpacaTokenizationError::InvalidBaseUrl(_))
+                ),
+                "{rejected}"
+            );
+        }
+
+        AlpacaTokenizationClient::new(
+            "http://localhost:8080".to_string(),
+            TEST_ACCOUNT_ID,
+            test_auth(),
+            Chain::Base,
+        )
+        .unwrap();
     }
 
     #[test]

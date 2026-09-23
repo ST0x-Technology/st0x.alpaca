@@ -41,7 +41,9 @@ pub use client::AlpacaWalletClient;
 use client::AlpacaWalletClient;
 pub use client::AlpacaWalletError;
 pub use status::PollingConfig;
-pub use transfer::{AlpacaTransferId, Network, TokenSymbol, Transfer, TransferStatus};
+pub use transfer::{
+    AlpacaTransferId, Network, TokenSymbol, Transfer, TransferDirection, TransferStatus,
+};
 pub use whitelist::{TravelRuleInfo, WhitelistEntry, WhitelistStatus};
 
 /// Service facade for Alpaca crypto wallet operations.
@@ -213,7 +215,7 @@ impl AlpacaWalletService {
 
         let matching: Vec<_> = entries
             .into_iter()
-            .filter(|e| e.address == *address)
+            .filter(|entry| entry.address == *address)
             .collect();
 
         if matching.is_empty() {

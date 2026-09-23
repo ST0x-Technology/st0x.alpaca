@@ -21,14 +21,14 @@ use crate::broker::{AlpacaAmount, Positive};
 pub struct TokenSymbol(pub String);
 
 impl TokenSymbol {
-    pub fn new(s: impl Into<String>) -> Self {
-        Self(s.into())
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
     }
 }
 
 impl From<String> for TokenSymbol {
-    fn from(s: String) -> Self {
-        Self(s)
+    fn from(value: String) -> Self {
+        Self(value)
     }
 }
 
@@ -39,8 +39,8 @@ impl AsRef<str> for TokenSymbol {
 }
 
 impl std::fmt::Display for TokenSymbol {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}", self.0)
     }
 }
 
@@ -61,8 +61,8 @@ impl From<Uuid> for AlpacaTransferId {
 }
 
 impl std::fmt::Display for AlpacaTransferId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}", self.0)
     }
 }
 
@@ -127,14 +127,14 @@ impl<'de> serde::Deserialize<'de> for Network {
 }
 
 impl Network {
-    pub fn new(s: impl Into<String>) -> Self {
-        Self(s.into().to_lowercase())
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into().to_lowercase())
     }
 }
 
 impl From<String> for Network {
-    fn from(s: String) -> Self {
-        Self(s.to_lowercase())
+    fn from(value: String) -> Self {
+        Self(value.to_lowercase())
     }
 }
 
@@ -145,8 +145,8 @@ impl AsRef<str> for Network {
 }
 
 impl std::fmt::Display for Network {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}", self.0)
     }
 }
 

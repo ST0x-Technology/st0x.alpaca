@@ -64,8 +64,7 @@ pub use order::{
     CryptoOrderResponse, ParseAlpacaLimitPriceError,
 };
 pub use positions::{AccountFunds, EquityPosition, Inventory};
-pub use precision::ALPACA_MAX_DECIMAL_PLACES;
-pub(crate) use precision::truncate_to_decimal_places;
+pub use precision::{ALPACA_MAX_DECIMAL_PLACES, truncate_to_decimal_places};
 pub use session::{
     IndicativeQuote, LatestQuote, LatestQuoteError, MarketSession, MarketSessionStatus,
     PostCloseGap,
@@ -135,10 +134,10 @@ impl fmt::Display for CryptoOrderFailureReason {
 }
 
 impl fmt::Display for TimeInForce {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Day => write!(f, "day"),
-            Self::MarketOnClose => write!(f, "market-on-close"),
+            Self::Day => write!(formatter, "day"),
+            Self::MarketOnClose => write!(formatter, "market-on-close"),
         }
     }
 }
@@ -523,8 +522,8 @@ impl AlpacaBrokerApiError {
     /// forces a conscious decision here rather than silently classifying as
     /// "not backpressure".
     ///
-    /// The bare-429 assumption is not a guess: it is the classification
-    /// RAI-1492's actual incident (a `PollOrderStatus` job's persisted
+    /// The bare-429 assumption is not a guess: it is the classification a
+    /// real production incident (a `PollOrderStatus` job's persisted
     /// `last_result`) recorded, and matches RFC 6585's standard status code
     /// for rate limiting that Alpaca (like virtually every REST API) uses.
     /// The `Retry-After` hint carried alongside it is a separate, softer

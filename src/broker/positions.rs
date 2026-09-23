@@ -90,8 +90,9 @@ struct PositionResponse {
 }
 
 impl std::fmt::Debug for PositionResponse {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PositionResponse")
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PositionResponse")
             .field("symbol", &self.symbol)
             .field("asset_class", &self.asset_class)
             .field("exchange", &self.exchange)
@@ -142,8 +143,9 @@ struct AccountDetailsResponse {
 }
 
 impl std::fmt::Debug for AccountDetailsResponse {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AccountDetailsResponse")
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AccountDetailsResponse")
             .field("cash", &DebugFloat(&self.cash))
             .field(
                 "cash_withdrawable",
@@ -453,7 +455,7 @@ mod tests {
         let aapl = state
             .positions
             .iter()
-            .find(|p| p.symbol.as_str() == "AAPL")
+            .find(|position| position.symbol.as_str() == "AAPL")
             .unwrap();
         assert_eq!(aapl.quantity, shares("10.5"));
         assert!(option_float_eq(
@@ -638,7 +640,7 @@ mod tests {
         let aapl = inventory
             .positions
             .iter()
-            .find(|p| p.symbol.as_str() == "AAPL")
+            .find(|position| position.symbol.as_str() == "AAPL")
             .unwrap();
         assert!(
             option_float_eq(

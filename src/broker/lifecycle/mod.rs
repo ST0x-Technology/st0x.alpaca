@@ -134,10 +134,10 @@ impl ClientOrderId {
 }
 
 impl Display for ClientOrderId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Automated(uuid) => Display::fmt(uuid, f),
-            Self::Cli(uuid) => write!(f, "{CLI_PREFIX}{uuid}"),
+            Self::Automated(uuid) => Display::fmt(uuid, formatter),
+            Self::Cli(uuid) => write!(formatter, "{CLI_PREFIX}{uuid}"),
         }
     }
 }
@@ -233,8 +233,9 @@ pub struct OrderUpdate<OrderId> {
 }
 
 impl<OrderId: Debug> Debug for OrderUpdate<OrderId> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("OrderUpdate")
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OrderUpdate")
             .field("order_id", &self.order_id)
             .field("symbol", &self.symbol)
             .field("shares", &self.shares)

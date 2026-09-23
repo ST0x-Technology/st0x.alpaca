@@ -37,8 +37,9 @@ pub(crate) struct AlpacaBrokerApiClient {
 }
 
 impl std::fmt::Debug for AlpacaBrokerApiClient {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AlpacaBrokerApiClient")
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AlpacaBrokerApiClient")
             .field("base_url", &self.base_url)
             .field("account_id", &self.account_id)
             .field("mode", &self.mode)

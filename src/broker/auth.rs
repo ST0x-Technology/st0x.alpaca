@@ -18,8 +18,8 @@ impl AlpacaAccountId {
 }
 
 impl std::fmt::Display for AlpacaAccountId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}", self.0)
     }
 }
 
@@ -206,8 +206,9 @@ impl AlpacaBrokerApiCtx {
 }
 
 impl std::fmt::Debug for AlpacaBrokerApiCtx {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AlpacaBrokerApiCtx")
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AlpacaBrokerApiCtx")
             .field("auth", &self.auth)
             .field("account_id", &self.account_id)
             .field("mode", &self.mode())

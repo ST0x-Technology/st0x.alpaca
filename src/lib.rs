@@ -47,5 +47,7 @@ pub use core::{AlpacaAuth, Backpressure, Permanence};
 pub use core::{AlpacaClient, AlpacaError};
 #[cfg(any(feature = "issuer", feature = "broker"))]
 pub use endpoint::{EndpointError, EndpointRole};
+/// The `st0x-finance` release every public amount, quantity, and symbol type
+/// comes from; consumers must use the same version.
 #[cfg(any(feature = "issuer", feature = "broker"))]
-pub use rate_limit::retry_after_from_response_headers;
+pub use st0x_finance;

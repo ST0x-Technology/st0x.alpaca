@@ -15,7 +15,8 @@ Sources:
 Status values:
 
 - **Same**: ported with the same behavior and tests. Only import paths,
-  lint-driven doc sections, and `#[must_use]` attributes changed.
+  lint-driven doc sections, `#[must_use]` attributes, single-letter variable
+  renames, and ticket references in comments changed.
 - **Moved**: the same behavior, exposed through a different public item.
 - **Changed**: an intentional difference. The row gives the reason.
 - **Stays in consumer**: consumer orchestration that is not Alpaca API
@@ -49,11 +50,13 @@ listed under Test parity.
 | `KmsJwtError` and `is_deterministic` / `is_rate_limited` / `retry_after` | same | Same, plus `InvalidTokenUrl`. |
 | `rate_limit::parse_retry_after`, `retry_after_from_response_headers` | same | Same (the liquidity file and its 10 tests replace the shorter issuer copy). |
 | `Backpressure`, `Permanence` | `core::{Backpressure, Permanence}` | Same. |
-| liquidity `status_permanence(StatusCode)` | `core::response_status_permanence` | Same policy and test. The issuer keeps its existing `u16` classifier. |
-| issuer `AlpacaClient` public `get`/`post`/`delete`/`patch`/`market_data_get` taking any HTTPS URL | crate-private `get`/`post` taking an absolute path | Changed: paths resolve against the configured base URL and must stay on its origin, so credentials cannot reach another host. `delete`, `patch`, and `market_data_get` had no callers and are removed. |
+| liquidity `status_permanence(StatusCode)` | `core::response_status_permanence` | Changed: a 3xx is now Permanent. The source clients followed redirects, so a 3xx never surfaced; with redirects disabled the same request would be redirected again. Otherwise the same policy and test. The issuer keeps its existing `u16` classifier (3xx is already Permanent there). |
+| issuer `AlpacaClient` public `get`/`post`/`delete`/`patch`/`market_data_get` taking any HTTPS URL; ids interpolated into the path with `format!` | crate-private `get`/`post` taking path segments | Changed: the URL is built on the configured base URL from percent-encoded segments, so credentials cannot reach another host and an id containing `/`, `?`, or `#` cannot address another endpoint. Empty and dot segments are rejected (`EndpointError::InvalidPathSegment`). `delete`, `patch`, and `market_data_get` had no issuer callers and are removed. |
 | issuer `AlpacaError::InvalidUrl(String)` | `AlpacaError::InvalidUrl(EndpointError)` | Changed: typed error instead of an opaque string. |
 | Broker HTTP client (reqwest default: follows up to 10 redirects; mode URLs unvalidated) | `broker::client` | Changed: redirects disabled; the mode's broker and market-data URLs are validated (`AlpacaBrokerApiError::InvalidEndpoint`). Sandbox and production URLs are unchanged. |
-| Wallet HTTP client (`reqwest::Client::new()`: follows redirects; base URL unvalidated) | `wallet::client` | Changed: redirects disabled; base URL validated (`AlpacaWalletError::InvalidBaseUrl`). No timeouts, as in the source. |
+| Wallet HTTP client (`reqwest::Client::new()`: follows redirects; base URL unvalidated) | `wallet::client` | Changed: redirects disabled; base URL validated (`AlpacaWalletError::InvalidBaseUrl`). Still no connect or request timeout, as in the source: a timeout on the non-idempotent withdrawal POST would turn a hang into an ambiguous failure the consumer could retry into a second withdrawal. Adding one needs a consumer-side recovery path first. |
+| liquidity `rate_limit::retry_after_from_response_headers` re-exported from the crate root | crate-private | Changed: only the Alpaca clients used it, and they now live here. |
+| (none) | root `pub use st0x_finance` | New: every public amount, quantity, and symbol type is from `st0x-finance` `v0.2.0`; consumers must use that release (liquidity uses its in-repo copy today, see the `NotPositive` row below). |
 
 ## Issuer surface (`issuer`, st0x.issuance)
 
@@ -69,7 +72,8 @@ listed under Test parity.
 | `tx_hash` absent / null / empty on a pending redeem poll | `deserialize_optional_b256` with `serde(default)` | Same. |
 | `issuer_request_id` typed enum | `IssuerRequestId(String)` | Changed: kept as the wire string; issuance parses its own id format. |
 | Network (issuance dto enum) | `core::Network` (closed enum, same wire names) | Moved. |
-| `MockAlpacaService` (`new_success`, `new_failure`, `get_call_count`) | `issuer::mock::MockIssuerApi` | Same. |
+| `MockAlpacaService` (`new_success`, `new_failure`, `get_call_count`) | `issuer::mock::MockIssuerApi` (behind `test-support`) | Moved: the redeem echo returns the request quantity as `Qty(FractionalShares)` (numeric), following the response type change above. The mock now needs the `test-support` feature, like the other test doubles. |
+| Issuance ITN list comment (`robinhood` as the only unpublished entry) | same list | Changed comment only: `hyperevm` is not in the published enum either. |
 | Issuance log events (`Calling Alpaca redeem endpoint`, etc.) | none | Changed: the issuer surface stays telemetry-free, as reviewed earlier. Consumers log around the calls. |
 
 ## Broker API surface (`broker`, st0x.liquidity)
@@ -109,7 +113,10 @@ listed under Test parity.
 | `AlpacaAmount` (raw 9-decimal value for cash valuation, 6-decimal floored value for transfers) | `broker::AlpacaAmount` | Same. `Usdc::floor_to_6_decimals` is not in st0x-finance `v0.2.0`, so the same floor is a private function here with the source tests (4 unit tests and 1 proptest). |
 | `ClientOrderId`, `OrderState`, `OrderStatus`, `OrderUpdate`, `OrderPlacement`, `RecoveredOrderPlacement`, `CancellationOutcome`, `OrderFailureTerminality`, `MarketOrder`, `LimitOrder`, `ExecutorOrderId` | `broker::*` | Same. `OrderStatus` drops its `sqlx::Type` derive (persistence stays in the consumer). |
 | `st0x_dto::Direction` | `broker::Direction` | Same wire behavior (snake_case, case-insensitive parse, `BUY`/`SELL` display) without the `ts-rs` derive. |
-| `MarketSession`, `PostCloseGap`, `MarketSessionStatus`, `LatestQuote`, `IndicativeQuote`, `LatestQuoteError`, `ALPACA_MAX_DECIMAL_PLACES`, `truncate_to_decimal_places` | `broker::*` | Same. |
+| `MarketSession`, `PostCloseGap`, `MarketSessionStatus`, `LatestQuote`, `IndicativeQuote`, `LatestQuoteError`, `ALPACA_MAX_DECIMAL_PLACES` | `broker::*` | Same. |
+| `truncate_to_decimal_places` (crate-private) | `broker::truncate_to_decimal_places` | Changed: public so the consumer preflight uses the same quantity grid instead of a copy. Same behavior and tests. |
+| `prepare_counter_trade_shares` and `PreparedCounterTradeShares` (private) | `AlpacaBrokerApi::prepare_counter_trade_shares` -> `PreparedShares` | Moved: public so the consumer preflight gets the asset's fractional eligibility and quantity precision. Same rule (9 decimals when fractionable, and for extended hours also fractional-extended-hours enabled; whole shares otherwise; missing metadata is whole shares) and warnings. |
+| `Executor::parse_order_id` | `AlpacaBrokerApi::parse_order_id` | Moved (UUID check). |
 | `Inventory`, `EquityPosition` | `broker::{Inventory, EquityPosition}` | Same. |
 | `TimeInForce`, `AccountStatus`, `AssetStatus`, `AssetDetails`, `JournalResponse`, `JournalStatus`, `AccountActivity`, `AccountActivitiesQuery`, `AlpacaLimitOrder`, `AlpacaLimitPrice`, `ConversionOrder`, `ConversionDirection`, `CryptoOrderResponse`, `CryptoOrderOutcome`, `CryptoOrderFailureReason`, `DeadlineCancel`, `MissingOrderField`, `HTTP_REQUEST_TIMEOUT` | same | Same. |
 | st0x-finance `NotPositive { value }` (comparison failure treated as positive) | st0x-finance `v0.2.0` `NotPositive::{Constraint, Comparison}` | Changed by the dependency: a failed zero comparison now rejects the value instead of accepting it. `broker::rejected_value` reads the value from either variant where the source read `.value`. |
@@ -137,6 +144,7 @@ listed under Test parity.
 | Polling: 10 s interval, 30 min deadline, 5xx exponential retry (10 attempts, 1-60 s), backwards-status detection | `status.rs`, `PollingConfig` | same | Same. |
 | Beneficiary redaction in logs and `ApiError` messages, fail-closed | `client.rs` | same | Same. |
 | `AlpacaWalletClient` (public under `test-support`), `AlpacaWalletService::new_with_client` | same | Same (`test-support` feature). |
+| `TransferDirection` (type of the public `Transfer.direction`, not re-exported) | `wallet::TransferDirection` | Changed: re-exported so consumers can name it. |
 | `alpaca_wallet/serde.rs` | none | Not ported: the module was never declared in the source, so its code and 2 tests never compiled. |
 
 ## Tokenization surface (`tokenization`, st0x.liquidity)
@@ -150,8 +158,8 @@ listed under Test parity.
 | Network confirmation (a request on another network, or with no network, is refused on every single-request path) | `confirm_network` | same | Same. The bound network is `core::Network` instead of `st0x_evm::Chain`; the wire names are identical (`base`, `ethereum`, `hyperevm`, `robinhood`). |
 | Polling: `PollingConfig` interval (10 s) and timeout (30 min), `PollTimeout` | `poll_until_terminal`, `poll_for_redemption_detection` | `poll_mint_until_complete`, `poll_for_redemption`, `poll_redemption_until_complete` | Same. |
 | 429 `Retry-After` backpressure, `status_code()` | `AlpacaTokenizationError::backpressure` | same | Same. |
-| Credentialed base URL must be HTTPS or HTTP loopback; no redirects | `validate_credentialed_base_url` | same | Same. |
-| `TokenizationRequest`, `TokenizationRequestStatus`, `TokenizationRequestType`, `ClientRequestId`, validated `TokenizationRequestId`, `IssuerRequestId`, `AlpacaApiErrorMessage` | `alpaca.rs`, `lib.rs` | `tokenization::*` | Same. The issuer surface keeps its own unvalidated `core::TokenizationRequestId`. |
+| Credentialed base URL must be HTTPS or HTTP on a loopback IP; no redirects | `validate_credentialed_base_url`; `InvalidBaseUrl(url::ParseError)`, `InsecureBaseUrl` | `endpoint::validate_origin`; `InvalidBaseUrl(EndpointError)` | Changed: one validator for every client. It now also rejects embedded credentials, a query, or a fragment, and accepts `http://localhost` (a loopback host the source refused). The two error variants became one typed variant. |
+| `TokenizationRequest`, `TokenizationRequestStatus`, `TokenizationRequestType`, `ClientRequestId`, validated `TokenizationRequestId`, `IssuerRequestId`, `AlpacaApiErrorMessage` | `alpaca.rs`, `lib.rs` | `tokenization::*` | Same. `InvalidTokenizationParameters` is now re-exported (it is a public error field type). |
 | Generic `AlpacaTokenizationService<W: Wallet>` with `redemption_wallet` | same | non-generic `AlpacaTokenizationService` | Changed: no Alpaca method reads the wallet or the redemption wallet. |
 | `AlpacaTokenizationError::{Evm, MissingRedemptionWallet}` | same | removed | Changed: only the onchain `send_for_redemption` produced them; the consumer error carries them. |
 | `send_for_redemption`, `wait_for_block`, `verify_mint_tx`, `redemption_wallet`, `Tokenizer`, `TokenizerError`, `MintVerificationError`, `MockTokenizer` | `alpaca.rs`, `lib.rs`, `mock.rs` | none | Stays in consumer (onchain actions and the trait). |
@@ -164,6 +172,22 @@ listed under Test parity.
 | `AlpacaTokenizationMock`, `TokenizationStatus`, `TokenizationRequestType`, `RedemptionOutcome`, `MockTokenizationRequestSnapshot`, `REDEMPTION_WALLET` | `tokenization_mock::*` | Same endpoints, idempotency replay, redemption watcher, and mint executor. |
 | `DeployableERC20` / `TestERC20` bindings from `ST0X_*_ABI` environment variables | inline `alloy::sol!` ERC-20 interface (`transfer`, `Transfer`) | Changed: this repository has no ABI artifacts; the mock calls only `transfer` and reads `Transfer` logs, so any deployed ERC-20 works. |
 | Request-parsing blocks inside the mock responders | extracted helpers | Changed shape only, to meet `too_many_lines`; the responses and status codes are the same and the 23 source tests pass unchanged. |
+
+## Same names, different types
+
+Each surface keeps its source types, so a few names exist more than once.
+They are not interchangeable:
+
+| Name | Where | Meaning |
+| --- | --- | --- |
+| `TokenizationRequestId` | `core` (issuer) | Unvalidated `String`, public `.0`, from issuance. |
+| `TokenizationRequestId` | `tokenization` | Validated non-empty id, from liquidity. |
+| `IssuerRequestId` | `issuer` | The issuer's wire string (a tx hash). |
+| `IssuerRequestId` | `tokenization` | Liquidity's UUID mint tracking id. |
+| `Network` | `core` | Closed enum of issued networks (issuer and tokenization). |
+| `Network` | `wallet` | Lowercased string newtype for wallet endpoints. |
+| `TokenSymbol` | `issuer` / `wallet` | Issuer token ticker / wallet asset symbol. |
+| `OrderStatus`, `TransferStatus`, `WhitelistStatus` | `broker` and `wallet` / `broker::mock` | Domain status / mock wire status. |
 
 ## Telemetry
 
