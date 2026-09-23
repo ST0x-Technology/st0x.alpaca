@@ -1,31 +1,44 @@
 # st0x.alpaca
 
-Shared Alpaca transport and the issuer API surface used by st0x.issuance. The
-st0x.liquidity broker, wallet, and market-data extraction is deferred until its
-existing endpoint and recovery contracts have parity tests.
+Shared Alpaca client library for st0x services. It holds every Alpaca API
+integration that st0x.issuance and st0x.liquidity use, with the behavior and
+tests of the consumer code it replaces. [docs/parity.md](docs/parity.md) maps
+each source item to its counterpart here and lists every intentional
+difference.
 
-| Feature  | Surface                                                                       | Consumer      |
-| -------- | ----------------------------------------------------------------------------- | ------------- |
-| `issuer` | ITN callbacks and polling across Base, Ethereum, HyperEVM, Robinhood, and BNB | st0x.issuance |
+| Feature        | Surface                                                                                                                       | Consumer       |
+| -------------- | ----------------------------------------------------------------------------------------------------------------------------- | -------------- |
+| `issuer`       | ITN mint callback, redeem initiation with the network preflight, keyed request polling                                        | st0x.issuance  |
+| `broker`       | Broker API account, assets, equity orders, USD/USDC conversion, positions, journals, account activities, market hours, quotes | st0x.liquidity |
+| `wallet`       | Crypto wallet deposit addresses, USDC withdrawals and deposits, transfer polling, withdrawal whitelists                       | st0x.liquidity |
+| `tokenization` | Mint requests, request history lookups, redemption detection, terminal-state polling                                          | st0x.liquidity |
+| `mock`         | Stateful httpmock broker, wallet, and tokenization servers for end-to-end suites                                              | st0x.liquidity |
+| `test-support` | Test-only constructors (`AlpacaWalletClient`, `AlpacaApiErrorMessage::for_test`, request mocks)                               | both           |
 
 ```toml
 [dependencies]
-st0x-alpaca = { git = "ssh://git@github.com/ST0x-Technology/st0x.alpaca", features = ["issuer"] }
+st0x-alpaca = { git = "ssh://git@github.com/ST0x-Technology/st0x.alpaca", features = ["broker", "wallet", "tokenization"] }
 ```
 
 ## Design
 
-- **Shared transport (`core`)**: `AlpacaClient` carries the base URL, account
-  id, exponential-backoff retry policy, and one of three authentication modes:
-  legacy Basic/APCA headers, a Cloud KMS-backed `private_key_jwt`, or a local
-  P-256 private-key JWT. `AlpacaError` preserves rate-limit backpressure and
-  classifies transient versus permanent failures; surface modules add their own
-  invariant variants on top.
-- **Issuer finance types**: validated symbols and share quantities use the
-  released `st0x-finance` `v0.2.0` contract. Redeem requests preserve the
-  issuer's decimal spelling at the wire boundary.
-- **Telemetry-free**: no `tracing` dependency; consumers wrap calls with their
-  own instrumentation.
+- **Authentication (`core::AlpacaAuth`)**: legacy Basic/APCA headers, a Cloud
+  KMS-backed `private_key_jwt`, or a local P-256 private-key JWT. The token
+  cache refreshes early and rides a still-valid token when a refresh fails.
+- **Credential-bearing URLs**: base and token URLs must be HTTPS (plain HTTP
+  only on loopback) without embedded credentials, query, or fragment. Issuer
+  request paths resolve against the configured origin and cannot leave it.
+  No client follows redirects.
+- **Consumer boundary**: Alpaca wire types, validation, retries, polling, and
+  error classification live here. Consumer traits (liquidity's `Executor` and
+  `Tokenizer`), onchain actions, and trading policy (preflight sizing,
+  slippage, hedge floor) stay in the consumer.
+- **Finance types**: quantities, prices, fees, and amounts use the Rain
+  Float-backed `st0x-finance` `v0.2.0` types. The issuer redeem request keeps
+  the caller's exact quantity spelling on the wire.
+- **Telemetry**: the broker, wallet, and tokenization surfaces emit the same
+  `tracing` events as the code they replace. The crate installs no
+  subscriber. The issuer surface emits no events.
 
 ## Development
 
@@ -37,5 +50,5 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo fmt --all -- --check
 ```
 
-The `issuer` feature must also compile standalone
-(`cargo check --no-default-features --features issuer`).
+Each feature must also compile standalone, for example
+`cargo check --no-default-features --features broker`.
