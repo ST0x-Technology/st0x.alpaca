@@ -29,6 +29,8 @@ jobs:
             command: cargo check --locked --no-default-features --features wallet
           - name: tokenization
             command: cargo check --locked --no-default-features --features tokenization
+          - name: corporate-actions
+            command: cargo check --locked --no-default-features --features corporate-actions
           - name: mock
             command: cargo check --locked --no-default-features --features mock
           - name: test

@@ -8,6 +8,10 @@ publish = false
 
 [features]
 default = []
+# Corporate-action SSE stream client used by st0x.issuance: endpoint
+# validation, authenticated replay requests, the bounded SSE decoder, and
+# the stream's wire identities.
+corporate-actions = []
 # ITN issuer-callback surface: mint callback, redeem initiation, request
 # polling (st0x.issuance).
 issuer = [
@@ -96,7 +100,7 @@ alloy-primitives = { version = "1", features = ["rand"] }
 httpmock = "0.8"
 proptest = "1"
 tracing-test = { version = "0.2", features = ["no-env-filter"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread"] }
 
 [lints.rust]
 unsafe_code = "forbid"

@@ -9,6 +9,7 @@ difference.
 | Feature        | Surface                                                                                                                       | Consumer       |
 | -------------- | ----------------------------------------------------------------------------------------------------------------------------- | -------------- |
 | `issuer`       | ITN mint callback, redeem initiation with the network preflight, keyed request polling                                        | st0x.issuance  |
+| `corporate-actions` | Corporate-action SSE stream: endpoint validation, authenticated replay requests, bounded SSE decoder, wire identities | st0x.issuance |
 | `broker`       | Broker API account, assets, equity orders, USD/USDC conversion, positions, journals, account activities, market hours, quotes | st0x.liquidity |
 | `wallet`       | Crypto wallet deposit addresses, USDC withdrawals and deposits, transfer polling, withdrawal whitelists                       | st0x.liquidity |
 | `tokenization` | Mint requests, request history lookups, redemption detection, terminal-state polling                                          | st0x.liquidity |

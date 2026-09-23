@@ -10,7 +10,8 @@ Sources:
 
 - st0x.liquidity `5a9895b8` (`crates/execution`, `crates/tokenization`,
   `crates/dto` `Direction`).
-- st0x.issuance `b3b955f` (`src/alpaca/{mod,itn,service,mock}.rs`).
+- st0x.issuance `b3b955f` (`src/alpaca/{mod,itn,service,mock}.rs` and the
+  corporate-action stream in `src/tokenized_asset/corporate_action_feed.rs`).
 
 Status values:
 
@@ -26,14 +27,15 @@ Status values:
 
 | Surface | Distinct endpoints (method + path) | Ported | Intentional differences |
 | --- | ---: | ---: | --- |
-| Issuer (st0x.issuance) | 3 | 3 | `Fees` and response qty on Rain Float; 429 as `RateLimited`; typed `InvalidUrl`; no log events. |
+| Issuer (st0x.issuance) | 3 | 3 | `Fees` and response qty on Rain Float; 429 as `RateLimited`; typed `InvalidUrl`; percent-encoded path segments; no log events. |
+| Corporate-action stream (st0x.issuance) | 1 | 1 | Errors split into endpoint and stream errors; JWT modes send a bearer token; no log events. Projection, cursor, and reconnect loop stay in issuance. |
 | Broker and Market Data (st0x.liquidity) | 13 | 13 | Preflight policy fields and errors stay in the consumer; trait mappings became inherent methods; redirects disabled and mode URLs validated. |
 | Wallet (st0x.liquidity) | 8 | 8 | Redirects disabled and base URL validated. |
 | Tokenization (st0x.liquidity) | 2 | 2 | Non-generic service; onchain actions and their error variants stay in the consumer. |
 | Mocks (st0x.liquidity e2e) | 2 servers | 2 | Inline ERC-20 interface instead of ABI environment variables. |
 | Shared auth and transport | - | - | Public auth internals made private; request paths confined to the configured origin; token URLs validated. |
 
-Tests: 604 pass with `--all-features` (plus 1 live-sandbox test ignored, as
+Tests: 645 pass with `--all-features` (plus 1 live-sandbox test ignored, as
 in the source). Every source test is ported except the consumer-side tests
 listed under Test parity.
 
@@ -75,6 +77,34 @@ listed under Test parity.
 | `MockAlpacaService` (`new_success`, `new_failure`, `get_call_count`) | `issuer::mock::MockIssuerApi` (behind `test-support`) | Moved: the redeem echo returns the request quantity as `Qty(FractionalShares)` (numeric), following the response type change above. The mock now needs the `test-support` feature, like the other test doubles. |
 | Issuance ITN list comment (`robinhood` as the only unpublished entry) | same list | Changed comment only: `hyperevm` is not in the published enum either. |
 | Issuance log events (`Calling Alpaca redeem endpoint`, etc.) | none | Changed: the issuer surface stays telemetry-free, as reviewed earlier. Consumers log around the calls. |
+
+## Corporate-action stream (`corporate-actions`, st0x.issuance)
+
+Source: st0x.issuance `b3b955f` `src/tokenized_asset/corporate_action_feed.rs`,
+`src/tokenized_asset/mod.rs` (id types), and `src/alpaca/service.rs` (stream
+URL, bootstrap instant). `src/tokenized_asset/corporate_actions.rs` is not
+compiled at that commit (the module is not declared) and is not ported.
+
+| Source item | st0x.alpaca item | Status |
+| --- | --- | --- |
+| `validate_corporate_action_endpoint(endpoint, Environment)` -> `CorporateActionStreamTransport` | `CorporateActionStreamEndpoint::parse(endpoint, DevelopmentLoopback)`, `.transport()` | Moved: `Environment::Development` becomes `DevelopmentLoopback::Allow`. Credentials go only to `stream.data.alpaca.markets` over HTTPS; a plain-HTTP loopback IP is credential-free and allowed in development only; `since`, `since_id`, and `until` are reserved. |
+| `CorporateActionStreamTransport {AuthenticatedAlpaca, CredentialFreeDevelopment}` | same | Same. |
+| `CorporateActionFeedBuildError {InvalidEndpoint, InsecureEndpointScheme, UnexpectedEndpointHost, ReservedReplayQueryParameter, Client}` | `CorporateActionEndpointError` (first four) and `CorporateActionStreamBuildError {Client, Auth}` | Changed: split into endpoint and client errors with the same messages. `Auth` is new (credential or token-URL failure). |
+| Struct-literal `AuthenticatedAlpaca` endpoint on a loopback URL (issuance tests) | `CorporateActionStreamEndpoint::authenticated_loopback` (`test-support`) | Moved: consumer tests get an authenticated loopback endpoint without bypassing validation. |
+| `DEFAULT_CORPORATE_ACTIONS_STREAM_URL` | same | Same. |
+| Stream client: connect timeout, read timeout, no redirects | `CorporateActionStreamClient::new(.., connect_timeout, read_timeout)` | Same. The timeouts are parameters; issuance keeps its 10 s and 90 s defaults in its config. |
+| Raw `APCA-API-KEY-ID` / `APCA-API-SECRET-KEY` headers | `AuthRuntime::apply_apca` through `AlpacaAuth` | Same headers for Basic, now marked sensitive, with no `Authorization`. Changed: the KMS and private-key JWT modes send the bearer token (issuance had Basic only). Credential-free development never builds credentials. |
+| Replay query: `since_id`, `since` + `until`, `since`, or none | `CorporateActionReplay {SinceId, Window, Since, Live}` | Moved: same parameters and order. The rule that a live `since` applies only to the authenticated transport stays in the consumer. |
+| Status and content-type checks; `CorporateActionFeedError::{Http, HttpStatus, InvalidContentType}` | `CorporateActionStreamClient::connect`; `CorporateActionStreamError {Http, HttpStatus, InvalidContentType, Auth}` | Same messages; `Auth` is new. |
+| `response.bytes_stream()` feeding `CorporateActionSseDecoder::push` | `CorporateActionStream::next_batch`, `has_pending_frame` | Changed shape: `Response::chunk()` instead of `bytes_stream()` (no `futures` dependency); the same chunks, errors, and decoding. |
+| `CorporateActionSseDecoder` (64 KiB frame cap, 4-byte separator allowance, CR/LF/CRLF, poison releases the buffer) | same | Same. `has_pending_frame` is public. |
+| `CorporateActionDecodeBatch`, `CorporateActionStreamDecodeError` (with `event_id`), `CorporateActionDecodeError` | same | Same variants and messages. `event_id()` is public (issuance reached it through `CorporateActionFeedError::event_id`). |
+| `decode_sse_frame`, envelope and payload types, SSE line/field/frame helpers | private in `corporate_actions::sse` | Same. |
+| `CorporateActionMutationKind`, `CorporateActionMutation`, `DividendCorporateAction` | same | Changed: `underlying` is `CorporateActionSymbol` instead of issuance's `UnderlyingSymbol` (the same trim and non-empty rule). |
+| `CorporateActionEventId` (canonical ULID), `CorporateActionId` (1 to 128 bytes), validating `Deserialize` | same | Moved: the stream's wire identities are owned here; `Hash` is added. |
+| `CorporateActionBootstrapSince` (with its error, `FromStr`, `try_from_instant`, `query_value`), `CorporateActionReplayUntil` | same | Same. |
+| `info!` "Connected to Alpaca corporate-action stream" | none | Changed: this surface is telemetry-free like the issuer surface; the consumer logs after `connect` returns. |
+| `CorporateActionFeed` and its run loop, baselines, replay-anchor check, reconnect backoff and alerts, notifications, projection, cursor, blocked boundary, reconciliation, holds, admission guard, spawn and shutdown | none | Stays in consumer. |
 
 ## Broker API surface (`broker`, st0x.liquidity)
 
@@ -234,6 +264,16 @@ Issuance (`b3b955f`): every Alpaca test in `src/alpaca/{mod,itn,service,mock}.rs
 has a counterpart in `src/issuer/`, including the ITN list test and the
 three Ethereum-network tests. Not ported: the eight log-assertion tests,
 because the issuer surface emits no events.
+
+Corporate-action stream: 23 source tests are ported (4 identity, 4 bootstrap
+instant through `FromStr`, 1 endpoint, 14 decoder;
+`invalid_payload_error_logs_the_valid_sse_event_id` is renamed
+`invalid_payload_error_retains_the_valid_sse_event_id` without its log
+assertion). The request-side assertions of 6 feed tests are kept as new
+client tests (cursor replay, first install, bounded window, EOF inside a
+frame, truncated body, wrong content type). Not ported: 29 projection,
+database, reconnect, notification, and shutdown tests, which stay in
+issuance.
 
 New tests (not in either source): origin/path validation and redirect
 refusal for the issuer, broker, and wallet clients; token-URL validation for

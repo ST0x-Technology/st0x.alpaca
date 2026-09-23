@@ -12,6 +12,9 @@
 //!   whitelists.
 //! - `tokenization`: the liquidity-side tokenization client (mint requests,
 //!   request history, redemption detection, polling).
+//! - `corporate-actions`: the corporate-action SSE stream client used by
+//!   st0x.issuance (endpoint validation, authenticated replay requests, the
+//!   bounded SSE decoder, and the stream's wire identities).
 //! - `mock`: stateful httpmock broker, wallet, and tokenization servers for
 //!   consumer end-to-end suites.
 //!
@@ -21,16 +24,18 @@
 //! every client refuses redirects. See `docs/parity.md` for the parity matrix
 //! against the consumer implementations this crate replaces.
 
-#[cfg(any(feature = "issuer", feature = "broker"))]
+#[cfg(any(feature = "issuer", feature = "broker", feature = "corporate-actions"))]
 mod auth;
 pub mod core;
-#[cfg(any(feature = "issuer", feature = "broker"))]
+#[cfg(any(feature = "issuer", feature = "broker", feature = "corporate-actions"))]
 mod endpoint;
-#[cfg(any(feature = "issuer", feature = "broker"))]
+#[cfg(any(feature = "issuer", feature = "broker", feature = "corporate-actions"))]
 mod rate_limit;
 
 #[cfg(feature = "broker")]
 pub mod broker;
+#[cfg(feature = "corporate-actions")]
+pub mod corporate_actions;
 #[cfg(feature = "issuer")]
 pub mod issuer;
 #[cfg(feature = "tokenization")]
@@ -40,12 +45,12 @@ pub mod tokenization_mock;
 #[cfg(feature = "wallet")]
 pub mod wallet;
 
-#[cfg(any(feature = "issuer", feature = "broker"))]
+#[cfg(any(feature = "issuer", feature = "broker", feature = "corporate-actions"))]
 pub use auth::{ALPACA_SANDBOX_TOKEN_URL, ALPACA_TOKEN_URL, KmsJwtError};
 pub use core::{AlpacaAuth, Backpressure, Permanence};
 #[cfg(feature = "issuer")]
 pub use core::{AlpacaClient, AlpacaError};
-#[cfg(any(feature = "issuer", feature = "broker"))]
+#[cfg(any(feature = "issuer", feature = "broker", feature = "corporate-actions"))]
 pub use endpoint::{EndpointError, EndpointRole};
 /// The `st0x-finance` release every public amount, quantity, and symbol type
 /// comes from; consumers must use the same version.
