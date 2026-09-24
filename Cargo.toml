@@ -79,9 +79,9 @@ rain-math-float = { git = "https://github.com/rainlanguage/rain.math.float", rev
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
-st0x-float-macro = { git = "https://github.com/ST0x-Technology/st0x.finance", version = "0.2.0", optional = true, tag = "v0.2.0" }
-st0x-float-serde = { git = "https://github.com/ST0x-Technology/st0x.finance", version = "0.2.0", optional = true, tag = "v0.2.0" }
-st0x-finance = { git = "https://github.com/ST0x-Technology/st0x.finance", version = "0.2.0", optional = true, tag = "v0.2.0" }
+st0x-float-macro = { git = "https://github.com/ST0x-Technology/st0x.finance", version = "0.3.0", optional = true, tag = "v0.3.0" }
+st0x-float-serde = { git = "https://github.com/ST0x-Technology/st0x.finance", version = "0.3.0", optional = true, tag = "v0.3.0" }
+st0x-finance = { git = "https://github.com/ST0x-Technology/st0x.finance", version = "0.3.0", optional = true, tag = "v0.3.0" }
 thiserror = "2"
 tracing = "0.1"
 tokio = { version = "1", features = ["time", "sync"] }
@@ -95,7 +95,7 @@ anyhow = { version = "1", optional = true }
 
 [dev-dependencies]
 rain-math-float = { git = "https://github.com/rainlanguage/rain.math.float", rev = "e226e5a27125e75208e3e709e1c5eee128bd8b3b" }
-st0x-float-macro = { git = "https://github.com/ST0x-Technology/st0x.finance", version = "0.2.0", tag = "v0.2.0" }
+st0x-float-macro = { git = "https://github.com/ST0x-Technology/st0x.finance", version = "0.3.0", tag = "v0.3.0" }
 alloy-primitives = { version = "1", features = ["rand"] }
 httpmock = "0.8"
 proptest = "1"
