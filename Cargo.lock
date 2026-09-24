@@ -3994,6 +3994,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "48fd7bd8a6377e15ad9d42a8ec25371b94ddc67abe7c8b9127bec79bebaaae18"
 
 [[package]]
+name = "rust_decimal"
+version = "1.43.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7653272e75dcac41dc199fbea6f5797633994fafd339943c06c9af16bf29cd3a"
+dependencies = [
+ "arrayvec",
+ "borsh",
+ "bytes",
+ "num-traits",
+ "rand 0.8.7",
+ "rand 0.9.5",
+ "serde",
+ "serde_json",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "rustc-hash"
 version = "2.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4611,11 +4628,12 @@ dependencies = [
 
 [[package]]
 name = "st0x-finance"
-version = "0.2.0"
-source = "git+https://github.com/ST0x-Technology/st0x.finance?tag=v0.2.0#49cf157109508516ff6a01868d471c7649234b2f"
+version = "0.3.0"
+source = "git+https://github.com/ST0x-Technology/st0x.finance?tag=v0.3.0#563f82511309dc30910ea40da1975edd0ef37736"
 dependencies = [
  "alloy-primitives",
  "rain-math-float",
+ "rust_decimal",
  "serde",
  "st0x-float-macro",
  "st0x-float-serde",
@@ -4624,16 +4642,16 @@ dependencies = [
 
 [[package]]
 name = "st0x-float-macro"
-version = "0.2.0"
-source = "git+https://github.com/ST0x-Technology/st0x.finance?tag=v0.2.0#49cf157109508516ff6a01868d471c7649234b2f"
+version = "0.3.0"
+source = "git+https://github.com/ST0x-Technology/st0x.finance?tag=v0.3.0#563f82511309dc30910ea40da1975edd0ef37736"
 dependencies = [
  "rain-math-float",
 ]
 
 [[package]]
 name = "st0x-float-serde"
-version = "0.2.0"
-source = "git+https://github.com/ST0x-Technology/st0x.finance?tag=v0.2.0#49cf157109508516ff6a01868d471c7649234b2f"
+version = "0.3.0"
+source = "git+https://github.com/ST0x-Technology/st0x.finance?tag=v0.3.0#563f82511309dc30910ea40da1975edd0ef37736"
 dependencies = [
  "rain-math-float",
  "serde",
@@ -5277,6 +5295,7 @@ dependencies = [
  "cfg-if",
  "once_cell",
  "rustversion",
+ "serde",
  "wasm-bindgen-macro",
  "wasm-bindgen-shared",
 ]

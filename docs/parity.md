@@ -58,7 +58,7 @@ listed under Test parity.
 | Broker HTTP client (reqwest default: follows up to 10 redirects; mode URLs unvalidated) | `broker::client` | Changed: redirects disabled; the mode's broker and market-data URLs are validated (`AlpacaBrokerApiError::InvalidEndpoint`). Sandbox and production URLs are unchanged. |
 | Wallet HTTP client (`reqwest::Client::new()`: follows redirects; base URL unvalidated) | `wallet::client` | Changed: redirects disabled; base URL validated (`AlpacaWalletError::InvalidBaseUrl`). Still no connect or request timeout, as in the source: a timeout on the non-idempotent withdrawal POST would turn a hang into an ambiguous failure the consumer could retry into a second withdrawal. Adding one needs a consumer-side recovery path first. |
 | liquidity `rate_limit::retry_after_from_response_headers` re-exported from the crate root | crate-private | Changed: only the Alpaca clients used it, and they now live here. |
-| (none) | root `pub use st0x_finance` | New: every public amount, quantity, and symbol type is from `st0x-finance` `v0.2.0`; consumers must use that release (liquidity uses its in-repo copy today, see the `NotPositive` row below). |
+| (none) | root `pub use st0x_finance` | New: every public amount, quantity, and symbol type is from `st0x-finance` `v0.3.0`; consumers must use that release (liquidity uses its in-repo copy today, see the `NotPositive` row below). |
 
 ## Issuer surface (`issuer`, st0x.issuance)
 
@@ -140,7 +140,7 @@ compiled at that commit (the module is not declared) and is not ported.
 | `AlpacaBrokerApiCtx { auth, account_id, mode, asset_cache_ttl, time_in_force, counter_trade_slippage_bps, hedge_floor }` | `AlpacaBrokerApiCtx { auth, account_id, mode, asset_cache_ttl, time_in_force }` | Changed: slippage and hedge floor are consumer preflight policy. |
 | `AlpacaBrokerApiError` | same | Same, minus `BuyingPowerReservationOutOfRange`, `BuyingPowerReservationOverflow`, and `CounterTradeCost` (raised only by consumer preflight), plus `InvalidEndpoint`. |
 | `AlpacaMarketDataError` (public only under `test-support`) | public | Changed: it is reachable through the public `LatestTrade`/`LatestQuote` variants. |
-| `AlpacaAmount` (raw 9-decimal value for cash valuation, 6-decimal floored value for transfers) | `broker::AlpacaAmount` | Same. `Usdc::floor_to_6_decimals` is not in st0x-finance `v0.2.0`, so the same floor is a private function here with the source tests (4 unit tests and 1 proptest). |
+| `AlpacaAmount` (raw 9-decimal value for cash valuation, 6-decimal floored value for transfers) | `broker::AlpacaAmount` | Same. `Usdc::floor_to_6_decimals` is not in st0x-finance `v0.3.0`, so the same floor is a private function here with the source tests (4 unit tests and 1 proptest). |
 | `ClientOrderId`, `OrderState`, `OrderStatus`, `OrderUpdate`, `OrderPlacement`, `RecoveredOrderPlacement`, `CancellationOutcome`, `OrderFailureTerminality`, `MarketOrder`, `LimitOrder`, `ExecutorOrderId` | `broker::*` | Same. `OrderStatus` drops its `sqlx::Type` derive (persistence stays in the consumer). |
 | `st0x_dto::Direction` | `broker::Direction` | Same wire behavior (snake_case, case-insensitive parse, `BUY`/`SELL` display) without the `ts-rs` derive. |
 | `MarketSession`, `PostCloseGap`, `MarketSessionStatus`, `LatestQuote`, `IndicativeQuote`, `LatestQuoteError`, `ALPACA_MAX_DECIMAL_PLACES` | `broker::*` | Same. |
@@ -149,7 +149,7 @@ compiled at that commit (the module is not declared) and is not ported.
 | `Executor::parse_order_id` | `AlpacaBrokerApi::parse_order_id` | Moved (UUID check). |
 | `Inventory`, `EquityPosition` | `broker::{Inventory, EquityPosition}` | Same. |
 | `TimeInForce`, `AccountStatus`, `AssetStatus`, `AssetDetails`, `JournalResponse`, `JournalStatus`, `AccountActivity`, `AccountActivitiesQuery`, `AlpacaLimitOrder`, `AlpacaLimitPrice`, `ConversionOrder`, `ConversionDirection`, `CryptoOrderResponse`, `CryptoOrderOutcome`, `CryptoOrderFailureReason`, `DeadlineCancel`, `MissingOrderField`, `HTTP_REQUEST_TIMEOUT` | same | Same. |
-| st0x-finance `NotPositive { value }` (comparison failure treated as positive) | st0x-finance `v0.2.0` `NotPositive::{Constraint, Comparison}` | Changed by the dependency: a failed zero comparison now rejects the value instead of accepting it. `broker::rejected_value` reads the value from either variant where the source read `.value`. |
+| st0x-finance `NotPositive { value }` (comparison failure treated as positive) | st0x-finance `v0.3.0` `NotPositive::{Constraint, Comparison}` | Changed by the dependency: a failed zero comparison now rejects the value instead of accepting it. `broker::rejected_value` reads the value from either variant where the source read `.value`. |
 
 ### Stays in the consumer (st0x.liquidity)
 

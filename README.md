@@ -38,7 +38,7 @@ st0x-alpaca = { git = "ssh://git@github.com/ST0x-Technology/st0x.alpaca", featur
   `Tokenizer`), onchain actions, and trading policy (preflight sizing,
   slippage, hedge floor) stay in the consumer.
 - **Finance types**: quantities, prices, fees, and amounts use the Rain
-  Float-backed `st0x-finance` `v0.2.0` types. The issuer redeem request keeps
+  Float-backed `st0x-finance` `v0.3.0` types. The issuer redeem request keeps
   the caller's exact quantity spelling on the wire.
 - **Telemetry**: the broker, wallet, and tokenization surfaces emit the same
   `tracing` events as the code they replace. The crate installs no
