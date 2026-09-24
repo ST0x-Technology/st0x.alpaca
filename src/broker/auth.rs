@@ -1,0 +1,480 @@
+use serde::de::{self, MapAccess, Visitor};
+use serde::{Deserialize, Serialize};
+use std::str::FromStr;
+use uuid::Uuid;
+
+use super::TimeInForce;
+use crate::core::AlpacaAuth;
+
+/// Strongly typed Alpaca account identifier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AlpacaAccountId(Uuid);
+
+impl AlpacaAccountId {
+    #[must_use]
+    pub const fn new(uuid: Uuid) -> Self {
+        Self(uuid)
+    }
+}
+
+impl std::fmt::Display for AlpacaAccountId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}", self.0)
+    }
+}
+
+impl FromStr for AlpacaAccountId {
+    type Err = uuid::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Uuid::from_str(value).map(Self)
+    }
+}
+
+/// Mode for Alpaca Broker API
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AlpacaBrokerApiMode {
+    /// Sandbox environment (paper trading)
+    Sandbox,
+    /// Production environment (real money)
+    Production,
+    /// Mock mode for testing (available via `mock` feature or in tests)
+    #[cfg(any(test, feature = "mock"))]
+    Mock(String),
+}
+
+impl<'de> Deserialize<'de> for AlpacaBrokerApiMode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(AlpacaBrokerApiModeVisitor)
+    }
+}
+
+struct AlpacaBrokerApiModeVisitor;
+
+impl<'de> Visitor<'de> for AlpacaBrokerApiModeVisitor {
+    type Value = AlpacaBrokerApiMode;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .write_str("\"sandbox\", \"production\", or { type = \"mock\", base_url = \"...\" }")
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        match value {
+            "sandbox" => Ok(AlpacaBrokerApiMode::Sandbox),
+            "production" => Ok(AlpacaBrokerApiMode::Production),
+            #[cfg(any(test, feature = "mock"))]
+            "mock" => Err(E::custom(
+                "mock mode requires { type = \"mock\", base_url = \"...\" }",
+            )),
+            #[cfg(not(any(test, feature = "mock")))]
+            "mock" => Err(E::custom("mock mode requires the mock feature")),
+            _ => Err(E::unknown_variant(value, &["sandbox", "production"])),
+        }
+    }
+
+    fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+    where
+        M: MapAccess<'de>,
+    {
+        let mut mode_type = None;
+        // `base_url` is only meaningful for the mock variant, which is
+        // feature-gated. Without the mock feature the value is consumed and
+        // discarded so parsing still succeeds (and yields the clearer
+        // "mock mode requires the mock feature" error below).
+        #[cfg(any(test, feature = "mock"))]
+        let mut base_url = None;
+
+        while let Some(key) = map.next_key::<String>()? {
+            match key.as_str() {
+                "type" => mode_type = Some(map.next_value::<String>()?),
+                #[cfg(any(test, feature = "mock"))]
+                "base_url" => base_url = Some(map.next_value::<String>()?),
+                #[cfg(not(any(test, feature = "mock")))]
+                "base_url" => {
+                    map.next_value::<de::IgnoredAny>()?;
+                }
+                _ => return Err(de::Error::unknown_field(&key, &["type", "base_url"])),
+            }
+        }
+
+        match mode_type.as_deref() {
+            #[cfg(any(test, feature = "mock"))]
+            Some("mock") => {
+                let base_url = base_url.ok_or_else(|| de::Error::missing_field("base_url"))?;
+                Ok(AlpacaBrokerApiMode::Mock(base_url))
+            }
+            #[cfg(not(any(test, feature = "mock")))]
+            Some("mock") => Err(de::Error::custom("mock mode requires the mock feature")),
+            Some(other) => Err(de::Error::unknown_variant(
+                other,
+                &["sandbox", "production", "mock"],
+            )),
+            None => Err(de::Error::missing_field("type")),
+        }
+    }
+}
+
+impl AlpacaBrokerApiMode {
+    pub(super) fn base_url(&self) -> &str {
+        match self {
+            Self::Sandbox => "https://broker-api.sandbox.alpaca.markets",
+            Self::Production => "https://broker-api.alpaca.markets",
+            #[cfg(any(test, feature = "mock"))]
+            Self::Mock(url) => url,
+        }
+    }
+
+    /// Sandbox keys authenticate only against the sandbox market-data host
+    /// (the production host answers 401 for them; verified empirically
+    /// 2026-08-25), so the data host splits by mode exactly like the broker
+    /// host.
+    pub(super) fn market_data_base_url(&self) -> &str {
+        match self {
+            Self::Sandbox => "https://data.sandbox.alpaca.markets",
+            Self::Production => "https://data.alpaca.markets",
+            #[cfg(any(test, feature = "mock"))]
+            Self::Mock(url) => url,
+        }
+    }
+
+    /// The authx token endpoint JWT-variant credentials mint at,
+    /// split by mode like every other Alpaca host.
+    pub(super) fn token_url(&self) -> String {
+        match self {
+            Self::Sandbox => crate::auth::ALPACA_SANDBOX_TOKEN_URL.to_string(),
+            Self::Production => crate::auth::ALPACA_TOKEN_URL.to_string(),
+            #[cfg(any(test, feature = "mock"))]
+            Self::Mock(url) => format!("{url}/v1/oauth2/token"),
+        }
+    }
+}
+
+#[derive(Clone, Deserialize)]
+pub struct AlpacaBrokerApiCtx {
+    #[serde(flatten)]
+    pub auth: AlpacaAuth,
+    pub account_id: AlpacaAccountId,
+    pub mode: Option<AlpacaBrokerApiMode>,
+    #[serde(
+        default = "default_asset_cache_ttl_secs",
+        deserialize_with = "deserialize_duration_secs"
+    )]
+    pub asset_cache_ttl: std::time::Duration,
+    #[serde(default)]
+    pub time_in_force: TimeInForce,
+}
+
+fn default_asset_cache_ttl_secs() -> std::time::Duration {
+    std::time::Duration::from_secs(3600)
+}
+
+fn deserialize_duration_secs<'de, D>(deserializer: D) -> Result<std::time::Duration, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let secs = u64::deserialize(deserializer)?;
+    Ok(std::time::Duration::from_secs(secs))
+}
+
+impl AlpacaBrokerApiCtx {
+    #[must_use]
+    pub fn mode(&self) -> AlpacaBrokerApiMode {
+        self.mode.clone().unwrap_or(AlpacaBrokerApiMode::Sandbox)
+    }
+
+    #[must_use]
+    pub fn base_url(&self) -> &str {
+        self.mode.as_ref().map_or_else(
+            || AlpacaBrokerApiMode::Sandbox.base_url(),
+            |mode| mode.base_url(),
+        )
+    }
+
+    #[must_use]
+    pub fn is_sandbox(&self) -> bool {
+        self.mode
+            .as_ref()
+            .is_none_or(|mode| !matches!(mode, AlpacaBrokerApiMode::Production))
+    }
+}
+
+impl std::fmt::Debug for AlpacaBrokerApiCtx {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AlpacaBrokerApiCtx")
+            .field("auth", &self.auth)
+            .field("account_id", &self.account_id)
+            .field("mode", &self.mode())
+            .field("asset_cache_ttl", &self.asset_cache_ttl)
+            .field("time_in_force", &self.time_in_force)
+            .finish()
+    }
+}
+
+/// Account status from Alpaca Broker API
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum AccountStatus {
+    Onboarding,
+    SubmissionFailed,
+    Submitted,
+    AccountUpdated,
+    ApprovalPending,
+    Active,
+    Rejected,
+    Disabled,
+    DisableRequested,
+    AccountClosed,
+}
+
+/// Response from the account verification endpoint
+#[derive(Debug, Deserialize)]
+pub(crate) struct AccountResponse {
+    pub id: Uuid,
+    pub status: AccountStatus,
+}
+
+#[cfg(test)]
+mod tests {
+    use uuid::uuid;
+
+    use super::*;
+
+    const TEST_ACCOUNT_ID: AlpacaAccountId =
+        AlpacaAccountId::new(uuid!("904837e3-3b76-47ec-b432-046db621571b"));
+
+    fn create_test_ctx(mode: AlpacaBrokerApiMode) -> AlpacaBrokerApiCtx {
+        AlpacaBrokerApiCtx {
+            auth: crate::core::AlpacaAuth::Basic {
+                api_key: "test_key_id".to_string(),
+                api_secret: "test_secret_key".to_string(),
+            },
+            account_id: TEST_ACCOUNT_ID,
+            mode: Some(mode),
+            asset_cache_ttl: std::time::Duration::from_secs(3600),
+            time_in_force: TimeInForce::Day,
+        }
+    }
+
+    #[test]
+    fn test_alpaca_broker_api_mode_urls() {
+        assert_eq!(
+            AlpacaBrokerApiMode::Sandbox.base_url(),
+            "https://broker-api.sandbox.alpaca.markets"
+        );
+        assert_eq!(
+            AlpacaBrokerApiMode::Production.base_url(),
+            "https://broker-api.alpaca.markets"
+        );
+    }
+
+    #[test]
+    fn test_market_data_base_url_splits_by_mode() {
+        // Sandbox keys 401 against the production data host, so the data
+        // host must follow the mode exactly like the broker host.
+        assert_eq!(
+            AlpacaBrokerApiMode::Sandbox.market_data_base_url(),
+            "https://data.sandbox.alpaca.markets"
+        );
+        assert_eq!(
+            AlpacaBrokerApiMode::Production.market_data_base_url(),
+            "https://data.alpaca.markets"
+        );
+    }
+
+    #[test]
+    fn test_alpaca_broker_api_auth_env_base_url() {
+        let sandbox_ctx = create_test_ctx(AlpacaBrokerApiMode::Sandbox);
+        assert_eq!(
+            sandbox_ctx.base_url(),
+            "https://broker-api.sandbox.alpaca.markets"
+        );
+
+        let production_ctx = create_test_ctx(AlpacaBrokerApiMode::Production);
+        assert_eq!(
+            production_ctx.base_url(),
+            "https://broker-api.alpaca.markets"
+        );
+    }
+
+    #[test]
+    fn test_alpaca_broker_api_mode_deserializes_mock_table() {
+        let mode: AlpacaBrokerApiMode =
+            serde_json::from_str(r#"{"type":"mock","base_url":"http://127.0.0.1:1234"}"#).unwrap();
+
+        assert_eq!(
+            mode,
+            AlpacaBrokerApiMode::Mock("http://127.0.0.1:1234".to_string())
+        );
+    }
+
+    #[test]
+    fn test_alpaca_broker_api_mode_deserializes_string_forms() {
+        let sandbox: AlpacaBrokerApiMode = serde_json::from_str(r#""sandbox""#).unwrap();
+        assert_eq!(sandbox, AlpacaBrokerApiMode::Sandbox);
+
+        let production: AlpacaBrokerApiMode = serde_json::from_str(r#""production""#).unwrap();
+        assert_eq!(production, AlpacaBrokerApiMode::Production);
+    }
+
+    #[test]
+    fn test_alpaca_broker_api_mode_unknown_string_errors() {
+        let error = serde_json::from_str::<AlpacaBrokerApiMode>(r#""fidelity""#).unwrap_err();
+        assert!(
+            error.to_string().contains("fidelity"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn test_alpaca_broker_api_mode_mock_table_missing_base_url_errors() {
+        let error = serde_json::from_str::<AlpacaBrokerApiMode>(r#"{"type":"mock"}"#).unwrap_err();
+        assert!(
+            error.to_string().contains("base_url"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn test_alpaca_broker_api_mode_unknown_type_errors() {
+        let error =
+            serde_json::from_str::<AlpacaBrokerApiMode>(r#"{"type":"fidelity"}"#).unwrap_err();
+        assert!(
+            error.to_string().contains("fidelity"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn test_alpaca_broker_api_mode_unknown_field_errors() {
+        let error = serde_json::from_str::<AlpacaBrokerApiMode>(
+            r#"{"type":"mock","base_url":"http://x","extra":"y"}"#,
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("extra"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn test_alpaca_account_id_from_str() {
+        let account_id: AlpacaAccountId = "904837e3-3b76-47ec-b432-046db621571b".parse().unwrap();
+
+        assert_eq!(account_id, TEST_ACCOUNT_ID);
+    }
+
+    #[test]
+    fn test_alpaca_account_id_from_str_invalid() {
+        let result = "not-a-uuid".parse::<AlpacaAccountId>();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn kms_auth_debug_prints_identifiers_and_parses_from_fields() {
+        // The KmsJwt Debug arm intentionally prints both fields: neither
+        // is a secret, and hiding them would hurt diagnosis.
+        let auth = AlpacaAuth::KmsJwt {
+            client_id: "CKTEST".to_string(),
+            kms_key_version: "projects/p/cryptoKeyVersions/1".to_string(),
+        };
+        let output = format!("{auth:?}");
+        assert!(output.contains("CKTEST"));
+        assert!(output.contains("projects/p/cryptoKeyVersions/1"));
+        assert!(!output.contains("REDACTED"));
+
+        // Untagged deserialization picks the variant from field names.
+        let parsed: AlpacaAuth = serde_json::from_value(serde_json::json!({
+            "client_id": "CKTEST",
+            "kms_key_version": "projects/p/cryptoKeyVersions/1",
+        }))
+        .unwrap();
+        assert!(matches!(parsed, AlpacaAuth::KmsJwt { .. }));
+    }
+
+    #[test]
+    fn private_key_jwt_auth_deserializes_from_flattened_fields() {
+        // The untagged auth enum picks the variant from field names alone:
+        // client_id + private_key_pem selects PrivateKeyJwt.
+        let ctx: AlpacaBrokerApiCtx = serde_json::from_str(
+            r#"{
+                "client_id": "CKLOCAL",
+                "private_key_pem": "-----BEGIN EC PRIVATE KEY-----\nfixture\n-----END EC PRIVATE KEY-----",
+                "account_id": "904837e3-3b76-47ec-b432-046db621571b",
+                "mode": "sandbox"
+            }"#,
+        )
+        .unwrap();
+
+        assert!(
+            matches!(
+                ctx.auth,
+                crate::core::AlpacaAuth::PrivateKeyJwt { ref client_id, .. }
+                    if client_id == "CKLOCAL"
+            ),
+            "expected PrivateKeyJwt, got {:?}",
+            ctx.auth
+        );
+    }
+
+    #[test]
+    fn private_key_jwt_debug_redacts_the_key() {
+        let auth = crate::core::AlpacaAuth::PrivateKeyJwt {
+            client_id: "CKLOCAL".to_string(),
+            private_key_pem:
+                "-----BEGIN EC PRIVATE KEY-----\nsupersecret\n-----END EC PRIVATE KEY-----"
+                    .to_string(),
+        };
+
+        let debug_output = format!("{auth:?}");
+
+        assert!(debug_output.contains("CKLOCAL"));
+        assert!(debug_output.contains("[REDACTED]"));
+        assert!(!debug_output.contains("supersecret"));
+    }
+
+    #[test]
+    fn token_url_splits_by_mode() {
+        assert_eq!(
+            AlpacaBrokerApiMode::Production.token_url(),
+            "https://authx.alpaca.markets/v1/oauth2/token"
+        );
+        assert_eq!(
+            AlpacaBrokerApiMode::Sandbox.token_url(),
+            "https://authx.sandbox.alpaca.markets/v1/oauth2/token"
+        );
+        assert_eq!(
+            AlpacaBrokerApiMode::Mock("http://127.0.0.1:9".to_string()).token_url(),
+            "http://127.0.0.1:9/v1/oauth2/token"
+        );
+    }
+
+    #[test]
+    fn test_alpaca_broker_api_auth_env_debug_redacts_secrets() {
+        let ctx = AlpacaBrokerApiCtx {
+            auth: crate::core::AlpacaAuth::Basic {
+                api_key: "super_secret_key_123".to_string(),
+                api_secret: "ultra_secret_secret_456".to_string(),
+            },
+            account_id: TEST_ACCOUNT_ID,
+            mode: None,
+            asset_cache_ttl: std::time::Duration::from_secs(3600),
+            time_in_force: TimeInForce::Day,
+        };
+
+        let debug_output = format!("{ctx:?}");
+
+        assert!(debug_output.contains("[REDACTED]"));
+        assert!(!debug_output.contains("super_secret_key_123"));
+        assert!(!debug_output.contains("ultra_secret_secret_456"));
+        assert!(debug_output.contains("904837e3-3b76-47ec-b432-046db621571b"));
+        assert!(debug_output.contains("Sandbox"));
+    }
+}

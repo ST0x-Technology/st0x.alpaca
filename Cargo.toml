@@ -1,0 +1,112 @@
+[package]
+name = "st0x-alpaca"
+version = "0.1.0"
+edition = "2024"
+description = "Shared Alpaca client library for st0x services"
+license = "LicenseRef-Proprietary"
+publish = false
+
+[features]
+default = []
+# Corporate-action SSE stream client used by st0x.issuance: endpoint
+# validation, authenticated replay requests, the bounded SSE decoder, and
+# the stream's wire identities.
+corporate-actions = []
+# ITN issuer-callback surface: mint callback, redeem initiation, request
+# polling (st0x.issuance).
+issuer = [
+  "dep:alloy-primitives",
+  "dep:async-trait",
+  "dep:st0x-finance",
+  "dep:uuid",
+]
+# Stateful httpmock Alpaca Broker, wallet, and tokenization servers with
+# onchain deposit/redemption watchers and a mint executor, for consumer e2e
+# suites.
+mock = [
+  "alloy-primitives/rand",
+  "broker",
+  "dep:alloy",
+  "dep:anyhow",
+  "dep:bon",
+  "dep:httpmock",
+  "test-support",
+  "wallet",
+]
+# Test-only constructors for consumer test suites.
+test-support = []
+# Crypto wallet surface used by st0x.liquidity: deposit addresses, USDC
+# withdrawals and deposits, transfer polling, and withdrawal whitelists.
+wallet = ["broker"]
+# Tokenization surface used by st0x.liquidity: mint requests, request
+# history lookups, redemption detection, and terminal-state polling. Needs
+# `wallet` for `PollingConfig` and the string `Network` wire type.
+tokenization = ["wallet"]
+# Broker API surface used by st0x.liquidity: account verification, assets,
+# equity orders, USD/USDC conversion orders, positions, journals, account
+# activities, calendar and clock market hours, and Market Data API quotes.
+broker = [
+  "dep:alloy-primitives",
+  "dep:chrono-tz",
+  "dep:rain-math-float",
+  "dep:st0x-finance",
+  "dep:st0x-float-macro",
+  "dep:st0x-float-serde",
+  "dep:urlencoding",
+  "dep:uuid",
+]
+
+[dependencies]
+alloy-primitives = { version = "1", features = ["serde"], optional = true }
+async-trait = { version = "0.1", optional = true }
+backon = "1"
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = { version = "0.10", optional = true }
+p256 = { version = "0.13", default-features = false, features = [
+  "ecdsa",
+  "pem",
+  "pkcs8",
+  "std",
+] }
+reqwest = { version = "0.13", default-features = false, features = [
+  "form",
+  "json",
+  "query",
+  "rustls",
+] }
+rain-math-float = { git = "https://github.com/rainlanguage/rain.math.float", rev = "e226e5a27125e75208e3e709e1c5eee128bd8b3b", optional = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+st0x-float-macro = { git = "https://github.com/ST0x-Technology/st0x.finance", version = "0.2.0", optional = true, tag = "v0.2.0" }
+st0x-float-serde = { git = "https://github.com/ST0x-Technology/st0x.finance", version = "0.2.0", optional = true, tag = "v0.2.0" }
+st0x-finance = { git = "https://github.com/ST0x-Technology/st0x.finance", version = "0.2.0", optional = true, tag = "v0.2.0" }
+thiserror = "2"
+tracing = "0.1"
+tokio = { version = "1", features = ["time", "sync"] }
+url = "2"
+urlencoding = { version = "2", optional = true }
+uuid = { version = "1", features = ["serde", "v4", "v5"], optional = true }
+alloy = { version = "1.6", default-features = false, features = ["std", "contract", "providers", "sol-types", "rpc-types"], optional = true }
+httpmock = { version = "0.8", optional = true }
+bon = { version = "3.9", optional = true }
+anyhow = { version = "1", optional = true }
+
+[dev-dependencies]
+rain-math-float = { git = "https://github.com/rainlanguage/rain.math.float", rev = "e226e5a27125e75208e3e709e1c5eee128bd8b3b" }
+st0x-float-macro = { git = "https://github.com/ST0x-Technology/st0x.finance", version = "0.2.0", tag = "v0.2.0" }
+alloy-primitives = { version = "1", features = ["rand"] }
+httpmock = "0.8"
+proptest = "1"
+tracing-test = { version = "0.2", features = ["no-env-filter"] }
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "deny"
+pedantic = "deny"
+unwrap_used = "deny"
+expect_used = "deny"
