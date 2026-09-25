@@ -15,6 +15,7 @@ use super::client::{AlpacaWalletClient, AlpacaWalletError};
 use super::transfer::{
     AlpacaTransferId, Transfer, TransferStatus, find_transfer_by_tx_hash, get_transfer_status,
 };
+use crate::core::{Permanence, response_status_permanence};
 
 pub struct PollingConfig {
     pub interval: Duration,
@@ -75,7 +76,7 @@ pub(super) async fn poll_transfer_status(
 }
 
 /// Polls a completed transfer until Alpaca reports its on-chain tx hash.
-/// Read failures only delay the result and are retried until the timeout.
+/// Transient read failures are retried until the timeout.
 pub(super) async fn poll_transfer_tx_hash(
     client: &AlpacaWalletClient,
     transfer_id: &AlpacaTransferId,
@@ -102,6 +103,10 @@ pub(super) async fn poll_transfer_tx_hash(
                 None => config.interval,
             },
             Err(error) => {
+                if !retryable_transfer_read_error(&error) {
+                    return Err(error);
+                }
+
                 let retry_after = error.backpressure().and_then(|hint| hint.retry_after);
                 warn!(target: "wallet", %transfer_id, %error, "Transfer read failed while waiting for its tx hash");
                 retry_after.map_or(config.interval, |hint| hint.max(config.interval))
@@ -109,6 +114,17 @@ pub(super) async fn poll_transfer_tx_hash(
         };
 
         sleep(delay.min(config.timeout.saturating_sub(start.elapsed()))).await;
+    }
+}
+
+fn retryable_transfer_read_error(error: &AlpacaWalletError) -> bool {
+    match error {
+        AlpacaWalletError::ApiError { status, .. } => {
+            response_status_permanence(*status) == Permanence::Transient
+        }
+        AlpacaWalletError::Auth(error) => !error.is_deterministic(),
+        AlpacaWalletError::Reqwest(_) => true,
+        _ => false,
     }
 }
 
@@ -511,6 +527,48 @@ mod tests {
             matches!(error, AlpacaWalletError::TransferTimeout { transfer_id: id, .. } if id == transfer_id.into())
         );
         assert!(failed_read.calls() > 1);
+    }
+
+    #[tokio::test]
+    async fn transfer_tx_hash_poll_returns_permanent_read_errors() {
+        for status in [404, 401] {
+            let server = MockServer::start();
+            let transfer_id = Uuid::new_v4();
+            let rejected_read = server.mock(|when, then| {
+                when.method(GET).path(format!(
+                    "/v1/accounts/{TEST_ACCOUNT_ID}/wallets/transfers/{transfer_id}"
+                ));
+                then.status(status).body("permanent failure");
+            });
+            let client = AlpacaWalletClient::new(
+                server.base_url(),
+                TEST_ACCOUNT_ID,
+                AlpacaAuth::Basic {
+                    api_key: "key".into(),
+                    api_secret: "secret".into(),
+                },
+            )
+            .unwrap();
+            let config = PollingConfig {
+                interval: Duration::from_millis(10),
+                timeout: Duration::from_millis(100),
+                max_retries: 1,
+                min_retry_delay: Duration::from_millis(5),
+                max_retry_delay: Duration::from_millis(10),
+            };
+
+            let error = poll_transfer_tx_hash(&client, &transfer_id.into(), &config)
+                .await
+                .unwrap_err();
+            match status {
+                404 => assert!(matches!(error, AlpacaWalletError::TransferNotFound { .. })),
+                401 => assert!(
+                    matches!(error, AlpacaWalletError::ApiError { status, .. } if status == reqwest::StatusCode::UNAUTHORIZED)
+                ),
+                _ => unreachable!(),
+            }
+            assert_eq!(rejected_read.calls(), 1);
+        }
     }
 
     #[tokio::test]
