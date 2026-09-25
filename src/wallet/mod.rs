@@ -42,7 +42,8 @@ use client::AlpacaWalletClient;
 pub use client::AlpacaWalletError;
 pub use status::PollingConfig;
 pub use transfer::{
-    AlpacaTransferId, Network, TokenSymbol, Transfer, TransferDirection, TransferStatus,
+    AlpacaTransferId, Network, ReportedFeesError, TokenSymbol, Transfer, TransferDirection,
+    TransferStatus, TransferWithFees,
 };
 pub use whitelist::{TravelRuleInfo, WhitelistEntry, WhitelistStatus};
 
@@ -132,6 +133,31 @@ impl AlpacaWalletService {
         transfer_id: &AlpacaTransferId,
     ) -> Result<Transfer, AlpacaWalletError> {
         status::poll_transfer_status(&self.client, transfer_id, &self.polling_config).await
+    }
+
+    /// Polls a completed transfer until Alpaca reports its on-chain tx hash.
+    ///
+    /// # Errors
+    ///
+    /// Returns `TransferTimeout` if no hash is reported within the polling
+    /// timeout. Read failures are retried until then.
+    pub async fn poll_transfer_tx_hash(
+        &self,
+        transfer_id: &AlpacaTransferId,
+    ) -> Result<TxHash, AlpacaWalletError> {
+        status::poll_transfer_tx_hash(&self.client, transfer_id, &self.polling_config).await
+    }
+
+    /// Reads a transfer's current state once, with no polling.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the API call fails.
+    pub async fn get_transfer(
+        &self,
+        transfer_id: &AlpacaTransferId,
+    ) -> Result<TransferWithFees, AlpacaWalletError> {
+        transfer::get_transfer_with_fees(&self.client, transfer_id).await
     }
 
     /// Polls for an incoming deposit by its on-chain transaction hash.
@@ -311,6 +337,34 @@ mod tests {
         .unwrap();
 
         AlpacaWalletService::new_with_client(client, None)
+    }
+
+    #[tokio::test]
+    async fn get_transfer_reads_the_requested_id_and_preserves_reported_fees() {
+        let server = MockServer::start();
+        let service = create_test_service(&server);
+        let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
+        let response = server.mock(|when, then| {
+            when.method(GET).path(format!(
+                "/v1/accounts/{TEST_ACCOUNT_ID}/wallets/transfers/{transfer_id}"
+            ));
+            then.status(200).json_body(json!({
+                "id": transfer_id, "direction": "OUTGOING", "amount": "100",
+                "chain": "ethereum", "asset": "USDC",
+                "from_address": "0x0000000000000000000000000000000000000001",
+                "to_address": "0x1234567890abcdef1234567890abcdef12345678",
+                "status": "COMPLETE", "created_at": "2024-01-01T00:00:00Z",
+                "network_fee": "0.5", "fees": "0.25"
+            }));
+        });
+
+        let transfer = service.get_transfer(&transfer_id).await.unwrap();
+        assert_eq!(transfer.transfer.id, transfer_id);
+        assert_eq!(
+            transfer.reported_fees().unwrap(),
+            Some(Usdc::new(float!(0.75)))
+        );
+        response.assert();
     }
 
     #[tokio::test]

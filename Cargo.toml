@@ -1,6 +1,6 @@
 [package]
 name = "st0x-alpaca"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Shared Alpaca client library for st0x services"
 license = "LicenseRef-Proprietary"
@@ -88,7 +88,13 @@ tokio = { version = "1", features = ["time", "sync"] }
 url = "2"
 urlencoding = { version = "2", optional = true }
 uuid = { version = "1", features = ["serde", "v4", "v5"], optional = true }
-alloy = { version = "1.6", default-features = false, features = ["std", "contract", "providers", "sol-types", "rpc-types"], optional = true }
+alloy = { version = "1.6", default-features = false, features = [
+  "std",
+  "contract",
+  "providers",
+  "sol-types",
+  "rpc-types",
+], optional = true }
 httpmock = { version = "0.8", optional = true }
 bon = { version = "3.9", optional = true }
 anyhow = { version = "1", optional = true }
@@ -100,7 +106,12 @@ alloy-primitives = { version = "1", features = ["rand"] }
 httpmock = "0.8"
 proptest = "1"
 tracing-test = { version = "0.2", features = ["no-env-filter"] }
-tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread"] }
+tokio = { version = "1", features = [
+  "io-util",
+  "macros",
+  "net",
+  "rt-multi-thread",
+] }
 
 [lints.rust]
 unsafe_code = "forbid"
