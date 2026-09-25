@@ -9,6 +9,7 @@ use chrono::{DateTime, Utc};
 use rain_math_float::{Float, FloatError};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 use tracing::warn;
 use uuid::Uuid;
 
@@ -111,6 +112,13 @@ pub struct Transfer {
     pub to: Address,
     pub status: TransferStatus,
     pub created_at: DateTime<Utc>,
+}
+
+/// A transfer read with Alpaca's optional fee fields retained for accounting.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TransferWithFees {
+    #[serde(flatten)]
+    pub transfer: Transfer,
     /// Network fee Alpaca deducts from the transfer, in the asset.
     #[serde(default)]
     network_fee: Option<AlpacaAmount>,
@@ -119,14 +127,28 @@ pub struct Transfer {
     fees: Option<AlpacaAmount>,
 }
 
-impl Transfer {
+#[derive(Debug, Error)]
+pub enum ReportedFeesError {
+    #[error("cannot interpret fees for non-USDC transfer asset {asset} as USDC")]
+    NonUsdcAsset { asset: TokenSymbol },
+    #[error(transparent)]
+    Float(#[from] FloatError),
+}
+
+impl TransferWithFees {
     /// The network fee plus Alpaca's fees this transfer reports, or `None`
     /// when Alpaca omits either one.
     ///
     /// # Errors
     ///
-    /// Returns an error if the sum overflows.
-    pub fn reported_fees(&self) -> Result<Option<Usdc>, FloatError> {
+    /// Returns an error for a non-USDC transfer or if the sum overflows.
+    pub fn reported_fees(&self) -> Result<Option<Usdc>, ReportedFeesError> {
+        if self.transfer.asset.as_ref() != "USDC" {
+            return Err(ReportedFeesError::NonUsdcAsset {
+                asset: self.transfer.asset.clone(),
+            });
+        }
+
         let (Some(network_fee), Some(fees)) = (self.network_fee, self.fees) else {
             return Ok(None);
         };
@@ -217,6 +239,22 @@ pub(super) async fn get_transfer_status(
     client: &AlpacaWalletClient,
     transfer_id: &AlpacaTransferId,
 ) -> Result<Transfer, AlpacaWalletError> {
+    let body = get_transfer_response(client, transfer_id).await?;
+    Ok(serde_json::from_str(&body)?)
+}
+
+pub(super) async fn get_transfer_with_fees(
+    client: &AlpacaWalletClient,
+    transfer_id: &AlpacaTransferId,
+) -> Result<TransferWithFees, AlpacaWalletError> {
+    let body = get_transfer_response(client, transfer_id).await?;
+    Ok(serde_json::from_str(&body)?)
+}
+
+async fn get_transfer_response(
+    client: &AlpacaWalletClient,
+    transfer_id: &AlpacaTransferId,
+) -> Result<String, AlpacaWalletError> {
     // Use the documented by-id endpoint for a single transfer:
     // https://docs.alpaca.markets/us/reference/getcryptofundingtransfer-1.
     // The list endpoint returns an account-wide array and has no documented
@@ -237,7 +275,7 @@ pub(super) async fn get_transfer_status(
         error => error,
     })?;
 
-    Ok(serde_json::from_str(&body)?)
+    Ok(body)
 }
 
 /// Lists all transfers for the account.
@@ -1172,7 +1210,7 @@ mod tests {
 
     #[test]
     fn reported_fees_sum_the_network_fee_and_fees() {
-        let transfer: Transfer = serde_json::from_value(json!({
+        let transfer: TransferWithFees = serde_json::from_value(json!({
             "id": Uuid::new_v4(), "direction": "OUTGOING", "amount": "1000",
             "chain": "ETH", "asset": "USDC", "from_address": Address::ZERO,
             "to_address": Address::ZERO, "status": "COMPLETE",
@@ -1188,7 +1226,7 @@ mod tests {
 
     #[test]
     fn reported_fees_are_none_when_alpaca_omits_a_fee() {
-        let transfer: Transfer = serde_json::from_value(json!({
+        let transfer: TransferWithFees = serde_json::from_value(json!({
             "id": Uuid::new_v4(), "direction": "OUTGOING", "amount": "1000",
             "chain": "ETH", "asset": "USDC", "from_address": Address::ZERO,
             "to_address": Address::ZERO, "status": "COMPLETE",
@@ -1197,6 +1235,22 @@ mod tests {
         .unwrap();
 
         assert_eq!(transfer.reported_fees().unwrap(), None);
+    }
+
+    #[test]
+    fn reported_fees_reject_non_usdc_transfer() {
+        let transfer: TransferWithFees = serde_json::from_value(json!({
+            "id": Uuid::new_v4(), "direction": "OUTGOING", "amount": "1",
+            "chain": "ETH", "asset": "BTC", "from_address": Address::ZERO,
+            "to_address": Address::ZERO, "status": "COMPLETE",
+            "created_at": "2025-01-01T00:00:00Z", "network_fee": "0.1", "fees": "0.01"
+        }))
+        .unwrap();
+
+        assert!(matches!(
+            transfer.reported_fees(),
+            Err(ReportedFeesError::NonUsdcAsset { .. })
+        ));
     }
 
     #[test]

@@ -42,7 +42,8 @@ use client::AlpacaWalletClient;
 pub use client::AlpacaWalletError;
 pub use status::PollingConfig;
 pub use transfer::{
-    AlpacaTransferId, Network, TokenSymbol, Transfer, TransferDirection, TransferStatus,
+    AlpacaTransferId, Network, ReportedFeesError, TokenSymbol, Transfer, TransferDirection,
+    TransferStatus, TransferWithFees,
 };
 pub use whitelist::{TravelRuleInfo, WhitelistEntry, WhitelistStatus};
 
@@ -155,8 +156,8 @@ impl AlpacaWalletService {
     pub async fn get_transfer(
         &self,
         transfer_id: &AlpacaTransferId,
-    ) -> Result<Transfer, AlpacaWalletError> {
-        transfer::get_transfer_status(&self.client, transfer_id).await
+    ) -> Result<TransferWithFees, AlpacaWalletError> {
+        transfer::get_transfer_with_fees(&self.client, transfer_id).await
     }
 
     /// Polls for an incoming deposit by its on-chain transaction hash.
@@ -358,7 +359,7 @@ mod tests {
         });
 
         let transfer = service.get_transfer(&transfer_id).await.unwrap();
-        assert_eq!(transfer.id, transfer_id);
+        assert_eq!(transfer.transfer.id, transfer_id);
         assert_eq!(
             transfer.reported_fees().unwrap(),
             Some(Usdc::new(float!(0.75)))
