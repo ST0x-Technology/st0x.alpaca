@@ -135,12 +135,21 @@ impl AlpacaWalletService {
         status::poll_transfer_status(&self.client, transfer_id, &self.polling_config).await
     }
 
-    /// Polls a completed transfer until Alpaca reports its on-chain tx hash.
+    /// Polls a transfer until it is `Complete` and Alpaca reports its
+    /// on-chain tx hash. A hash on a transfer that is not yet `Complete` is
+    /// ignored.
     ///
     /// # Errors
     ///
-    /// Returns `TransferTimeout` if no hash is reported within the polling
-    /// timeout. Read failures are retried until then.
+    /// - `TransferTimeout` if no completed hash is reported within the polling
+    ///   timeout. Transient read failures (5xx, 408, 429, transport errors,
+    ///   non-deterministic auth errors) are retried until then, honoring
+    ///   `Retry-After`.
+    /// - `TransferFailed` or `FailedTransferHasTx` as soon as the transfer is
+    ///   `Failed`.
+    /// - Permanent read errors, returned without retry: `TransferNotFound`,
+    ///   other non-retryable HTTP statuses, deterministic auth errors, and
+    ///   response decoding errors.
     pub async fn poll_transfer_tx_hash(
         &self,
         transfer_id: &AlpacaTransferId,

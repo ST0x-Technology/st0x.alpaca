@@ -1,6 +1,6 @@
 [package]
 name = "st0x-alpaca"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 description = "Shared Alpaca client library for st0x services"
 license = "LicenseRef-Proprietary"

@@ -75,8 +75,10 @@ pub(super) async fn poll_transfer_status(
     }
 }
 
-/// Polls a completed transfer until Alpaca reports its on-chain tx hash.
-/// Transient read failures are retried until the timeout.
+/// Polls a transfer until it is `Complete` and Alpaca reports its on-chain
+/// tx hash. Transient read failures (5xx, 408, 429, transport errors,
+/// non-deterministic auth errors) are retried until the timeout; permanent
+/// read errors and failed transfers are returned immediately.
 pub(super) async fn poll_transfer_tx_hash(
     client: &AlpacaWalletClient,
     transfer_id: &AlpacaTransferId,
@@ -642,7 +644,12 @@ mod tests {
             max_retry_delay: Duration::from_millis(10),
         };
 
-        let result = poll_transfer_tx_hash(&client, &transfer_id.into(), &config).await;
+        let result = tokio::time::timeout(
+            Duration::from_millis(500),
+            poll_transfer_tx_hash(&client, &transfer_id.into(), &config),
+        )
+        .await
+        .expect("the Retry-After delay must be clamped to the polling deadline");
         assert!(matches!(
             result,
             Err(AlpacaWalletError::TransferTimeout { .. })
