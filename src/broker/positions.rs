@@ -258,7 +258,8 @@ pub(super) async fn get_account_funds(
 /// the broker omits `current_price`, or when the value is not positive. None of
 /// those are errors: they mean "no mark to price against", and the caller falls
 /// through to its next reference source rather than abandoning the hedge
-/// (ADR 0019).
+/// (ADR 0019). A failed zero comparison is an error
+/// (`AlpacaBrokerApiError::FloatConversion`), not a missing mark.
 pub(super) async fn fetch_position_mark(
     client: &AlpacaBrokerApiClient,
     symbol: &Symbol,

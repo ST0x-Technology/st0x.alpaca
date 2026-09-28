@@ -458,7 +458,9 @@ impl AlpacaBrokerApi {
     /// # Errors
     ///
     /// Returns [`AlpacaBrokerApiError::PositionSymbolMismatch`] when the
-    /// broker answers for another symbol, or the HTTP/parse error.
+    /// broker answers for another symbol,
+    /// [`AlpacaBrokerApiError::FloatConversion`] when the mark's comparison
+    /// with zero fails, or the HTTP/parse error.
     pub async fn fetch_position_mark(
         &self,
         symbol: &Symbol,
