@@ -533,19 +533,21 @@ mod tests {
     fn test_initiate_withdrawal_zero_amount() {
         let zero = Float::zero().unwrap();
         let error = Positive::new(Usdc::new(zero)).unwrap_err();
-        assert_eq!(
-            crate::broker::rejected_value(error),
-            Usdc::new(Float::zero().unwrap())
-        );
+        assert!(matches!(
+            error,
+            st0x_finance::NotPositive::Constraint { value }
+                if value == Usdc::new(Float::zero().unwrap())
+        ));
     }
 
     #[test]
     fn test_initiate_withdrawal_negative_amount() {
         let error = Positive::new(Usdc::new(float!(-100))).unwrap_err();
-        assert_eq!(
-            crate::broker::rejected_value(error),
-            Usdc::new(float!(-100))
-        );
+        assert!(matches!(
+            error,
+            st0x_finance::NotPositive::Constraint { value }
+                if value == Usdc::new(float!(-100))
+        ));
     }
 
     #[tokio::test]
