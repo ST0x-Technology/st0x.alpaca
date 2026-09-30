@@ -1,11 +1,13 @@
 //! Shared Alpaca market-data lookups used for hedge preflight checks.
 
 use chrono::{DateTime, Utc};
-use rain_math_float::Float;
+use rain_math_float::{Float, FloatError};
 use reqwest::{RequestBuilder, StatusCode};
 use serde::Deserialize;
 use std::time::Duration;
 use tracing::trace;
+
+use st0x_finance::NotPositive;
 
 use crate::auth::KmsJwtError;
 use crate::broker::AlpacaBrokerApiClient;
@@ -94,6 +96,8 @@ pub enum AlpacaMarketDataError {
         #[source]
         source: LatestQuoteError,
     },
+    #[error("market data Float comparison failed: {0}")]
+    Float(#[from] FloatError),
 }
 
 impl AlpacaMarketDataError {
@@ -133,7 +137,8 @@ impl AlpacaMarketDataError {
             | Self::MissingQuoteTimestamp { .. }
             | Self::NonPositiveBid { .. }
             | Self::NonPositiveAsk { .. }
-            | Self::InvalidQuote { .. } => None,
+            | Self::InvalidQuote { .. }
+            | Self::Float(_) => None,
         }
     }
 
@@ -156,7 +161,8 @@ impl AlpacaMarketDataError {
             | Self::LatestQuoteJsonParse(_)
             | Self::Entitlement { .. }
             | Self::MissingPrice { .. }
-            | Self::NonPositivePrice { .. } => Permanence::Permanent,
+            | Self::NonPositivePrice { .. }
+            | Self::Float(_) => Permanence::Permanent,
 
             // Transport failures can clear, and syntactically valid latest
             // quotes are dynamic snapshots: a later request can carry a
@@ -279,10 +285,10 @@ pub(crate) async fn fetch_latest_trade_price(
     response
         .trade
         .map(|trade| {
-            Positive::new(Usd::new(trade.price)).map_err(|error| {
+            map_positive_usd(Positive::new(Usd::new(trade.price)), |value| {
                 AlpacaMarketDataError::NonPositivePrice {
                     symbol: symbol.clone(),
-                    price: crate::broker::rejected_value(error).inner(),
+                    price: value.inner(),
                 }
             })
         })
@@ -351,16 +357,18 @@ async fn fetch_quote_and_timestamp(
     let ask = quote.ask.ok_or_else(|| AlpacaMarketDataError::MissingAsk {
         symbol: symbol.clone(),
     })?;
-    let bid =
-        Positive::new(Usd::new(bid)).map_err(|error| AlpacaMarketDataError::NonPositiveBid {
+    let bid = map_positive_usd(Positive::new(Usd::new(bid)), |value| {
+        AlpacaMarketDataError::NonPositiveBid {
             symbol: symbol.clone(),
-            bid: crate::broker::rejected_value(error),
-        })?;
-    let ask =
-        Positive::new(Usd::new(ask)).map_err(|error| AlpacaMarketDataError::NonPositiveAsk {
+            bid: value,
+        }
+    })?;
+    let ask = map_positive_usd(Positive::new(Usd::new(ask)), |value| {
+        AlpacaMarketDataError::NonPositiveAsk {
             symbol: symbol.clone(),
-            ask: crate::broker::rejected_value(error),
-        })?;
+            ask: value,
+        }
+    })?;
 
     let validated =
         LatestQuote::new(bid, ask).map_err(|source| AlpacaMarketDataError::InvalidQuote {
@@ -371,10 +379,23 @@ async fn fetch_quote_and_timestamp(
     Ok((validated, quote.at))
 }
 
+fn map_positive_usd(
+    value: Result<Positive<Usd>, NotPositive<Usd>>,
+    constraint_error: impl FnOnce(Usd) -> AlpacaMarketDataError,
+) -> Result<Positive<Usd>, AlpacaMarketDataError> {
+    value.map_err(|error| match error {
+        NotPositive::Constraint { value } => constraint_error(value),
+        NotPositive::Comparison { source, .. } => source.into(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use httpmock::prelude::*;
+    use rain_math_float::FloatError;
     use serde_json::json;
+
+    use st0x_finance::HasZero;
 
     use super::*;
     use crate::broker::{AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, TimeInForce};
@@ -977,6 +998,41 @@ mod tests {
             AlpacaMarketDataError::Http(http_error),
         ] {
             assert_eq!(error.permanence(), Permanence::Transient, "{error:?}");
+        }
+    }
+
+    #[test]
+    fn trade_and_quote_comparison_failures_preserve_float_error() {
+        let comparison_failure = || NotPositive::Comparison {
+            value: Usd::ZERO,
+            source: FloatError::InvalidHex("comparison failed".to_owned()),
+        };
+        let symbol = Symbol::new("AAPL").unwrap();
+        let errors = [
+            map_positive_usd(Err(comparison_failure()), |value| {
+                AlpacaMarketDataError::NonPositivePrice {
+                    symbol: symbol.clone(),
+                    price: value.inner(),
+                }
+            })
+            .unwrap_err(),
+            map_positive_usd(Err(comparison_failure()), |value| {
+                AlpacaMarketDataError::NonPositiveBid {
+                    symbol: symbol.clone(),
+                    bid: value,
+                }
+            })
+            .unwrap_err(),
+        ];
+
+        for error in errors {
+            assert!(matches!(
+                error,
+                AlpacaMarketDataError::Float(FloatError::InvalidHex(ref message))
+                    if message == "comparison failed"
+            ));
+            assert_eq!(error.permanence(), Permanence::Permanent);
+            assert_eq!(error.backpressure(), None);
         }
     }
 }

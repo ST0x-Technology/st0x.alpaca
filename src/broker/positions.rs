@@ -5,7 +5,7 @@ use serde::Deserialize;
 use tracing::{debug, error, trace, warn};
 use urlencoding::encode;
 
-use st0x_finance::{HasZero, Usdc};
+use st0x_finance::{HasZero, NotPositive, Usdc};
 use st0x_float_macro::float;
 use st0x_float_serde::{DebugFloat, DebugOptionFloat};
 
@@ -258,7 +258,8 @@ pub(super) async fn get_account_funds(
 /// the broker omits `current_price`, or when the value is not positive. None of
 /// those are errors: they mean "no mark to price against", and the caller falls
 /// through to its next reference source rather than abandoning the hedge
-/// (ADR 0019).
+/// (ADR 0019). A failed zero comparison is an error
+/// (`AlpacaBrokerApiError::FloatConversion`), not a missing mark.
 pub(super) async fn fetch_position_mark(
     client: &AlpacaBrokerApiClient,
     symbol: &Symbol,
@@ -301,16 +302,24 @@ pub(super) async fn fetch_position_mark(
         return Ok(None);
     };
 
-    match Positive::new(Usd::new(current_price)) {
+    classify_position_mark(symbol, Positive::new(Usd::new(current_price)))
+}
+
+fn classify_position_mark(
+    symbol: &Symbol,
+    mark: Result<Positive<Usd>, NotPositive<Usd>>,
+) -> Result<Option<Positive<Usd>>, AlpacaBrokerApiError> {
+    match mark {
         Ok(mark) => Ok(Some(mark)),
-        Err(error) => {
+        Err(NotPositive::Constraint { value }) => {
             warn!(
                 %symbol,
-                mark = %crate::broker::rejected_value(error),
+                mark = %value,
                 "Broker position reported a non-positive mark; no mark available"
             );
             Ok(None)
         }
+        Err(NotPositive::Comparison { source, .. }) => Err(source.into()),
     }
 }
 
@@ -371,6 +380,7 @@ fn to_cash_value_cents(cash: Float) -> Result<i64, AlpacaBrokerApiError> {
 #[cfg(test)]
 mod tests {
     use httpmock::prelude::*;
+    use rain_math_float::FloatError;
     use serde_json::json;
     use uuid::uuid;
 
@@ -389,6 +399,25 @@ mod tests {
             (None, None) => true,
             _ => false,
         }
+    }
+
+    #[test]
+    fn position_mark_preserves_float_comparison_failure() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let error = classify_position_mark(
+            &symbol,
+            Err(NotPositive::Comparison {
+                value: Usd::ZERO,
+                source: FloatError::InvalidHex("comparison failed".to_owned()),
+            }),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            AlpacaBrokerApiError::FloatConversion(FloatError::InvalidHex(message))
+                if message == "comparison failed"
+        ));
     }
 
     const TEST_ACCOUNT_ID: AlpacaAccountId =

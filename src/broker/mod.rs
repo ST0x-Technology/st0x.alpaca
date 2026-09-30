@@ -17,9 +17,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use st0x_finance::UsdcConversionError;
-pub(crate) use st0x_finance::{
-    EmptySymbolError, FractionalShares, NotPositive, Positive, Symbol, Usd, Usdc,
-};
+pub(crate) use st0x_finance::{EmptySymbolError, FractionalShares, Positive, Symbol, Usd, Usdc};
 pub(crate) use st0x_float_serde::{
     deserialize_float_from_number_or_string, deserialize_option_float_from_number_or_string,
     format_float_with_fallback, serialize_float_as_string,
@@ -84,16 +82,6 @@ pub mod mock {
         MockWalletTransferSnapshot, OrderSide, OrderStatus, TEST_ACCOUNT_ID, TEST_API_KEY,
         TEST_API_SECRET, TransferDirection, TransferFlow, TransferStatus, WhitelistStatus,
     };
-}
-
-/// The rejected value carried by either [`NotPositive`] variant.
-///
-/// `st0x-finance` reports a failed zero comparison separately from a
-/// non-positive value; both mean the value cannot be used as positive.
-pub(crate) fn rejected_value<T>(error: NotPositive<T>) -> T {
-    match error {
-        NotPositive::Constraint { value } | NotPositive::Comparison { value, .. } => value,
-    }
 }
 
 /// Time-in-force specifies how long an order remains active before it expires.

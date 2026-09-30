@@ -35,7 +35,7 @@ Status values:
 | Mocks (st0x.liquidity e2e) | 2 servers | 2 | Inline ERC-20 interface instead of ABI environment variables. |
 | Shared auth and transport | - | - | Public auth internals made private; request paths confined to the configured origin; token URLs validated. |
 
-Tests: 647 pass with `--all-features` (plus 1 live-sandbox test ignored, as
+Tests: 662 pass with `--all-features` (plus 1 live-sandbox test ignored, as
 in the source). Every source test is ported except the consumer-side tests
 listed under Test parity.
 
@@ -124,7 +124,7 @@ compiled at that commit (the module is not declared) and is not ported.
 | Conversion polling: 300 s deadline, cancel, 30 s settle window, 500 ms reads, cancel/fill race, partial fills, `DoneForDay` waited on | `poll_crypto_order_until_filled`, `poll_crypto_order_to_terminal`, `cancel_and_settle` | `AlpacaBrokerApi::{convert_usdc_usd, poll_conversion_to_terminal}` | Same. |
 | `GET .../orders:by_client_order_id` for crypto | `get_crypto_order_by_client_order_id` | `AlpacaBrokerApi::find_conversion_order` | Same. |
 | `GET /v1/trading/accounts/{id}/positions` (equities, `USDCUSD` qty floored to 6 decimals) | `positions::fetch_inventory` | `AlpacaBrokerApi::fetch_inventory` -> `Inventory` | Moved: returns `Inventory` directly instead of `InventoryResult::Fetched`. |
-| `GET .../positions/{symbol}` mark (404 and missing/non-positive mark as `None`, returned-symbol check, encoded symbol) | `positions::fetch_position_mark` | `AlpacaBrokerApi::fetch_position_mark` | Same. |
+| `GET .../positions/{symbol}` mark (404 and missing/non-positive mark as `None`, a failed zero comparison as `FloatConversion`, returned-symbol check, encoded symbol) | `positions::fetch_position_mark` | `AlpacaBrokerApi::fetch_position_mark` | Same (comparison error per liquidity `07970f828`). |
 | `POST /v1/journals` (JNLS, `qty` string) | `client.create_journal` | `AlpacaBrokerApi::create_journal` | Same. |
 | `GET /v1/accounts/activities` (form-encoded query, 100 per page, 1000-page cap, repeated token check) | `activity::get_account_activities`, `AlpacaBrokerApiCtx::fetch_account_activities` | same | Same. |
 | `GET /v1/calendar?start&end` and session classification (regular, extended, overnight 20:00-04:00 ET, holidays, early closes, DST, next-session lookahead of 14 days, date mismatch) | `market_hours` | `AlpacaBrokerApi::{is_market_open, market_session, market_session_status}` | Same. `session_and_close_at` moved its bound-drift logging into `log_session_bound_drift` to meet the 100-line lint here (the source threshold is 200); behavior is unchanged. |
@@ -149,7 +149,7 @@ compiled at that commit (the module is not declared) and is not ported.
 | `Executor::parse_order_id` | `AlpacaBrokerApi::parse_order_id` | Moved (UUID check). |
 | `Inventory`, `EquityPosition` | `broker::{Inventory, EquityPosition}` | Same. |
 | `TimeInForce`, `AccountStatus`, `AssetStatus`, `AssetDetails`, `JournalResponse`, `JournalStatus`, `AccountActivity`, `AccountActivitiesQuery`, `AlpacaLimitOrder`, `AlpacaLimitPrice`, `ConversionOrder`, `ConversionDirection`, `CryptoOrderResponse`, `CryptoOrderOutcome`, `CryptoOrderFailureReason`, `DeadlineCancel`, `MissingOrderField`, `HTTP_REQUEST_TIMEOUT` | same | Same. |
-| st0x-finance `NotPositive { value }` (comparison failure treated as positive) | st0x-finance `v0.3.0` `NotPositive::{Constraint, Comparison}` | Changed by the dependency: a failed zero comparison now rejects the value instead of accepting it. `broker::rejected_value` reads the value from either variant where the source read `.value`. |
+| st0x-finance `NotPositive { value }` (comparison failure treated as positive) | st0x-finance `v0.3.0` `NotPositive::{Constraint, Comparison}` | Changed by the dependency: a failed zero comparison now rejects the value instead of accepting it. As in liquidity `07970f828`, `Constraint` keeps its domain behavior (`NonPositive*` errors, or `None` for a position mark), and `Comparison` surfaces as `AlpacaMarketDataError::Float` (Permanent, trades and quotes) or `AlpacaBrokerApiError::FloatConversion` (position mark). |
 
 ### Stays in the consumer (st0x.liquidity)
 
@@ -172,6 +172,8 @@ compiled at that commit (the module is not declared) and is not ported.
 | `POST /v1/accounts/{id}/wallets/transfers` (`Positive<Usdc>` amount as a string) | `transfer::request_withdrawal` | `AlpacaWalletService::initiate_withdrawal` | Same, including the whitelist check before the request. |
 | `GET .../wallets/transfers/{id}` (404 as `TransferNotFound`) and `GET .../wallets/transfers` (chain-neutral filter before strict parse) | `transfer.rs` | `AlpacaWalletService::{poll_transfer_until_complete, find_deposit_by_tx_hash, poll_deposit_by_tx_hash, list_all_transfers}` | Same. |
 | Polling: 10 s interval, 30 min deadline, 5xx exponential retry (10 attempts, 1-60 s), backwards-status detection | `status.rs`, `PollingConfig` | same | Same. |
+| One-shot `GET .../wallets/transfers/{id}` with optional `network_fee` and `fees`, `reported_fees()` checked USDC sum | liquidity `1ad78737c` `transfer.rs` | `AlpacaWalletService::get_transfer` -> `TransferWithFees` | Same, plus `ReportedFeesError` for a non-USDC asset instead of labelling its fees as USDC. `Transfer` keeps its shape. |
+| Completed-transfer tx-hash poll | liquidity `1ad78737c` `status::poll_transfer_tx_hash` | `AlpacaWalletService::poll_transfer_tx_hash` | Changed: each read is bounded by the remaining deadline, `Retry-After` is honored, a hash is returned only once the transfer is `Complete`, a `Failed` transfer returns `TransferFailed` or `FailedTransferHasTx`, and permanent read errors return at once. The source retried every read error until the deadline and returned any hash. `CompletedTransferMissingTx` is part of the error contract but is raised by the consumer. |
 | Beneficiary redaction in logs and `ApiError` messages, fail-closed | `client.rs` | same | Same. |
 | `AlpacaWalletClient` (public under `test-support`), `AlpacaWalletService::new_with_client` | `client.rs`, `mod.rs` | same | Same (`test-support` feature). |
 | `TransferDirection` (type of the public `Transfer.direction`, not re-exported) | `transfer.rs` | `wallet::TransferDirection` | Changed: re-exported so consumers can name it. |
