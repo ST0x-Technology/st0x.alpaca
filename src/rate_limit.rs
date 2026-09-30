@@ -9,6 +9,13 @@ use std::time::{Duration, SystemTime};
 use chrono::{DateTime, Utc};
 use reqwest::header::{HeaderMap, RETRY_AFTER};
 
+/// Longest client-wide hold a single `Retry-After` hint can impose. The
+/// header is server-supplied and unbounded (`86400`, a far HTTP-date), and
+/// a hold refuses every call without contacting the server, so nothing
+/// observes the quota reopening early; past this ceiling the next call
+/// tries again instead.
+pub(crate) const MAX_RETRY_AFTER_HOLD: Duration = Duration::from_mins(5);
+
 /// Parses an HTTP `Retry-After` header value into a [`Duration`] relative to
 /// `now`.
 ///

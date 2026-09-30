@@ -2163,6 +2163,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mint_callback_honors_http_retry_after_before_succeeding() {
+        let server = MockServer::start_async().await;
+        let mut limited = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/accounts/test-account/tokenization/callback/mint");
+            then.status(429)
+                .header("Retry-After", "2")
+                .body("rate limited");
+        });
+        let client = make_client(&server, "test-account", "test-key", "test-secret");
+        let started = tokio::time::Instant::now();
+        let call =
+            tokio::spawn(async move { client.send_mint_callback(create_test_request()).await });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while limited.calls() == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        limited.assert_calls(1);
+        limited.delete();
+        let success = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/accounts/test-account/tokenization/callback/mint");
+            then.status(200);
+        });
+        tokio::time::timeout(Duration::from_secs(5), call)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(started.elapsed() >= Duration::from_secs(2));
+        success.assert_calls(1);
+    }
+
+    #[tokio::test]
     async fn test_call_redeem_endpoint_retries_transient_server_errors() {
         let server = MockServer::start();
 

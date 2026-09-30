@@ -4,9 +4,13 @@
 //! and wire types shared across surface modules.
 
 #[cfg(feature = "issuer")]
-use backon::{ExponentialBuilder, Retryable};
+use backon::{BackoffBuilder, ExponentialBuilder};
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "issuer")]
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
+#[cfg(feature = "issuer")]
+use tokio::time::Instant;
 #[cfg(feature = "issuer")]
 use url::Url;
 
@@ -16,6 +20,8 @@ use crate::auth::AuthRuntime;
 use crate::auth::KmsJwtError;
 #[cfg(feature = "issuer")]
 use crate::endpoint::{EndpointError, EndpointRole, resolve_segments, validate_origin};
+#[cfg(feature = "issuer")]
+use crate::rate_limit::MAX_RETRY_AFTER_HOLD;
 
 /// Alpaca API credentials applied to every request.
 #[derive(Clone, Deserialize)]
@@ -60,6 +66,19 @@ impl std::fmt::Debug for AlpacaAuth {
     }
 }
 
+/// Longest total time one [`AlpacaClient::with_retry`] call waits on
+/// `Retry-After` deadlines. A longer hint returns the rate-limit error at
+/// once, so the caller's own retry cadence (a job re-fetch, a poll tick)
+/// takes over instead of one call parking for minutes.
+#[cfg(feature = "issuer")]
+const RETRY_AFTER_BUDGET: Duration = Duration::from_secs(30);
+
+/// Upper bound, in milliseconds, of the random delay each caller adds after
+/// a shared `Retry-After` deadline, so callers parked on one deadline do not
+/// all send at the same instant when it passes.
+#[cfg(feature = "issuer")]
+const RETRY_AFTER_JITTER_MS: u64 = 1_000;
+
 /// HTTP client for Alpaca's issuer APIs.
 ///
 /// Carries the configured base URL, account id, credentials, and retry
@@ -75,6 +94,9 @@ pub struct AlpacaClient {
     account_id: String,
     auth: AuthRuntime,
     max_retries: usize,
+    /// Shared by every clone: no request leaves this client before the
+    /// latest `Retry-After` deadline any caller observed.
+    not_before: Arc<StdMutex<Option<(Instant, Duration)>>>,
 }
 
 #[cfg(feature = "issuer")]
@@ -151,6 +173,7 @@ impl AlpacaClient {
             account_id,
             auth: AuthRuntime::build(auth, token_url)?,
             max_retries: 5,
+            not_before: Arc::new(StdMutex::new(None)),
         })
     }
 
@@ -209,27 +232,108 @@ impl AlpacaClient {
     /// with jitter, up to `max_retries` retries, retrying only errors that
     /// [`AlpacaError::is_retryable`] classifies as transient.
     ///
+    /// A `Retry-After` hint on any error (an API 429 or a rate-limited token
+    /// mint) sets a deadline shared by every clone of this client, capped at
+    /// five minutes. No attempt is sent before it. The call waits for the
+    /// deadline, plus up to a second of jitter, while its
+    /// total `Retry-After` wait stays within a 30-second budget; past that it
+    /// returns the error at once. A call that starts inside a deadline longer
+    /// than its budget returns [`AlpacaError::RateLimited`] without sending
+    /// anything.
+    ///
     /// # Errors
     ///
     /// Returns the final [`AlpacaError`] produced by `operation` once the
-    /// error is non-retryable or the retry budget is exhausted.
+    /// error is non-retryable, the retry budget is exhausted, or a
+    /// `Retry-After` deadline exceeds the wait budget.
     pub async fn with_retry<Value, Fut, Operation>(
         &self,
-        operation: Operation,
+        mut operation: Operation,
     ) -> Result<Value, AlpacaError>
     where
         Operation: FnMut() -> Fut,
         Fut: Future<Output = Result<Value, AlpacaError>>,
     {
-        operation
-            .retry(
-                ExponentialBuilder::default()
-                    .with_max_times(self.max_retries)
-                    .with_jitter(),
-            )
-            .when(AlpacaError::is_retryable)
-            .await
+        let mut delays = ExponentialBuilder::default()
+            .with_max_times(self.max_retries)
+            .with_jitter()
+            .build();
+        let mut budget = RETRY_AFTER_BUDGET;
+
+        loop {
+            // A different caller may extend the deadline while we sleep.
+            while let Some(wait) = self.backpressure_wait() {
+                if wait > budget {
+                    return Err(AlpacaError::RateLimited {
+                        body: "client is inside an earlier Retry-After deadline".to_string(),
+                        retry_after: Some(wait),
+                    });
+                }
+                let wait = (wait + retry_after_jitter()).min(budget);
+                budget -= wait;
+                tokio::time::sleep(wait).await;
+            }
+            let error = match operation().await {
+                Ok(value) => return Ok(value),
+                Err(error) => error,
+            };
+
+            if let Some(retry_after) = error.backpressure().and_then(|hint| hint.retry_after) {
+                self.hold_for(retry_after);
+            }
+
+            if !error.is_retryable() {
+                return Err(error);
+            }
+            let Some(delay) = delays.next() else {
+                return Err(error);
+            };
+
+            let wait = self.backpressure_wait().unwrap_or_default();
+            if wait > budget {
+                return Err(error);
+            }
+            tokio::time::sleep(delay).await;
+        }
     }
+
+    /// Time left until the shared `Retry-After` deadline, if one is ahead.
+    fn backpressure_wait(&self) -> Option<Duration> {
+        let not_before = *self
+            .not_before
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        not_before
+            .map(|(started, delay)| delay.saturating_sub(started.elapsed()))
+            .filter(|wait| !wait.is_zero())
+    }
+
+    /// Extends the shared hold when `delay` exceeds the remaining wait.
+    /// `delay` is capped at [`MAX_RETRY_AFTER_HOLD`]: while the hold runs no
+    /// call reaches the server, so no success can shorten it.
+    fn hold_for(&self, delay: Duration) {
+        let delay = delay.min(MAX_RETRY_AFTER_HOLD);
+        let mut not_before = self
+            .not_before
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if not_before
+            .is_none_or(|(started, current)| current.saturating_sub(started.elapsed()) < delay)
+        {
+            *not_before = Some((Instant::now(), delay));
+        }
+    }
+}
+
+/// Random delay in `[0, RETRY_AFTER_JITTER_MS)` milliseconds. Each
+/// `RandomState` gets fresh keys, so hashing a constant through one is a
+/// dependency-free random source; spreading callers needs no more than that.
+#[cfg(feature = "issuer")]
+fn retry_after_jitter() -> Duration {
+    use std::hash::BuildHasher;
+
+    let random = std::collections::hash_map::RandomState::new().hash_one(());
+    Duration::from_millis(random % RETRY_AFTER_JITTER_MS)
 }
 
 /// Errors that can occur during Alpaca API operations.
@@ -576,5 +680,98 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), reqwest::StatusCode::FOUND);
         redirect.assert();
+    }
+    #[cfg(feature = "issuer")]
+    fn retry_client() -> AlpacaClient {
+        AlpacaClient::new(
+            "http://localhost",
+            "account".into(),
+            "key".into(),
+            "secret".into(),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        )
+        .unwrap()
+    }
+
+    #[cfg(feature = "issuer")]
+    #[tokio::test]
+    async fn retry_after_delays_the_next_attempt() {
+        let client = retry_client();
+        let started = Instant::now();
+        let mut attempts = 0;
+        client
+            .with_retry(|| {
+                attempts += 1;
+                std::future::ready(if attempts == 1 {
+                    Err(AlpacaError::RateLimited {
+                        body: String::new(),
+                        retry_after: Some(Duration::from_secs(2)),
+                    })
+                } else {
+                    Ok(())
+                })
+            })
+            .await
+            .unwrap();
+        assert_eq!(attempts, 2);
+        assert!(started.elapsed() >= Duration::from_secs(2));
+    }
+
+    #[cfg(feature = "issuer")]
+    #[tokio::test]
+    async fn long_retry_after_blocks_clones_without_an_attempt() {
+        let client = retry_client();
+        let started = Instant::now();
+        let error = client
+            .with_retry(|| async {
+                Err::<(), _>(AlpacaError::RateLimited {
+                    body: String::new(),
+                    retry_after: Some(Duration::from_secs(300)),
+                })
+            })
+            .await
+            .unwrap_err();
+        assert!(error.is_retryable());
+        let mut attempts = 0;
+        let error = client
+            .clone()
+            .with_retry(|| {
+                attempts += 1;
+                std::future::ready(Ok(()))
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AlpacaError::RateLimited { .. }));
+        assert_eq!(attempts, 0);
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+    #[cfg(feature = "issuer")]
+    #[tokio::test]
+    async fn concurrent_deadline_extension_is_rechecked_before_attempting() {
+        let client = retry_client();
+        client.hold_for(Duration::from_millis(100));
+        let other = client.clone();
+        let extend = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            other.hold_for(Duration::from_millis(250));
+        });
+        let started = Instant::now();
+        client
+            .with_retry(|| std::future::ready(Ok(())))
+            .await
+            .unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(300));
+        extend.await.unwrap();
+    }
+
+    #[cfg(feature = "issuer")]
+    #[test]
+    fn retry_after_hold_is_capped() {
+        let client = retry_client();
+        client.hold_for(Duration::from_hours(24));
+        let wait = client.backpressure_wait().unwrap();
+        assert!(wait <= MAX_RETRY_AFTER_HOLD);
+        assert!(wait + Duration::from_secs(1) > MAX_RETRY_AFTER_HOLD);
     }
 }
