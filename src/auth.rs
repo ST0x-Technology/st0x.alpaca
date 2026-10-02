@@ -42,7 +42,7 @@ use tracing::{info, warn};
 
 use crate::core::AlpacaAuth;
 use crate::endpoint::{EndpointError, EndpointRole, validate_origin};
-use crate::rate_limit::retry_after_from_response_headers;
+use crate::rate_limit::{MAX_RETRY_AFTER_HOLD, retry_after_from_response_headers};
 
 /// Alpaca's token endpoint for live broker partners. Doubles as the
 /// assertion audience, per RFC 7523.
@@ -205,6 +205,7 @@ pub(crate) struct KmsJwtAuth {
     /// Serializes mints so concurrent stale callers cannot stampede the
     /// token endpoint.
     mint_lock: Mutex<()>,
+    mint_not_before: StdMutex<Option<(Instant, Duration)>>,
 }
 
 /// Where the ES256 signature over a client assertion comes from.
@@ -316,6 +317,7 @@ impl KmsJwtAuth {
             http,
             cached: StdMutex::new(None),
             mint_lock: Mutex::new(()),
+            mint_not_before: StdMutex::new(None),
         }
     }
 
@@ -372,6 +374,7 @@ impl KmsJwtAuth {
             http,
             cached: StdMutex::new(None),
             mint_lock: Mutex::new(()),
+            mint_not_before: StdMutex::new(None),
         })
     }
 
@@ -417,15 +420,43 @@ impl KmsJwtAuth {
             return Ok(token);
         }
 
+        let wait = self
+            .mint_not_before
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .map(|(started, delay)| delay.saturating_sub(started.elapsed()))
+            .filter(|wait| !wait.is_zero());
+        if let Some(wait) = wait {
+            if let Some(token) = self.cached_before(|tok| tok.hard_expiry) {
+                return Ok(token);
+            }
+            return Err(KmsJwtError::TokenStatus {
+                status: 429,
+                body: "token mint is inside an earlier Retry-After deadline".into(),
+                retry_after: Some(wait),
+            });
+        }
+
         match self.mint().await {
             Ok(token) => Ok(token),
             Err(error) => {
+                if error.is_rate_limited() {
+                    let delay = error
+                        .retry_after()
+                        .unwrap_or_default()
+                        .clamp(FAILED_MINT_BACKOFF, MAX_RETRY_AFTER_HOLD);
+                    *self
+                        .mint_not_before
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                        Some((Instant::now(), delay));
+                }
                 if let Some(token) = self.cached_before(|tok| tok.hard_expiry) {
                     warn!(
                         %error,
                         "Alpaca token refresh failed; riding the still-valid cached token"
                     );
-                    self.defer_next_refresh();
+                    self.defer_next_refresh(error.retry_after().unwrap_or_default());
                     return Ok(token);
                 }
                 Err(error)
@@ -434,15 +465,18 @@ impl KmsJwtAuth {
     }
 
     /// Push the soft refresh deadline forward after a failed mint, so
-    /// the next attempt waits [`FAILED_MINT_BACKOFF`] instead of firing
-    /// on the very next request (still clamped to the hard expiry).
-    fn defer_next_refresh(&self) {
+    /// the next attempt waits at least [`FAILED_MINT_BACKOFF`] and honors a
+    /// longer `Retry-After` hint (still clamped to the hard expiry).
+    fn defer_next_refresh(&self, retry_after: Duration) {
         let mut cached = self
             .cached
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(token) = cached.as_mut() {
-            token.refresh_after = (Instant::now() + FAILED_MINT_BACKOFF).min(token.hard_expiry);
+            token.refresh_after = Instant::now()
+                .checked_add(FAILED_MINT_BACKOFF.max(retry_after))
+                .unwrap_or(token.hard_expiry)
+                .min(token.hard_expiry);
         }
     }
 
@@ -1347,5 +1381,78 @@ mod tests {
             auth.access_token().await,
             Err(KmsJwtError::TokenStatus { status: 500, .. })
         ));
+    }
+    #[tokio::test]
+    async fn rate_limited_refresh_survives_cached_token_expiry() {
+        let server = MockServer::start_async().await;
+        mock_sign_chain(&server);
+        let exchange = server.mock(|when, then| {
+            when.method(httpmock::Method::POST).path("/token");
+            then.status(429).header("Retry-After", "300");
+        });
+        let auth = stub_auth(&server);
+        *auth.cached.lock().unwrap() = Some(CachedToken {
+            access_token: "seeded".into(),
+            refresh_after: Instant::now().checked_sub(Duration::from_secs(1)).unwrap(),
+            hard_expiry: Instant::now() + Duration::from_secs(110),
+        });
+        assert_eq!(auth.access_token().await.unwrap(), "seeded");
+        assert_eq!(auth.access_token().await.unwrap(), "seeded");
+        expire_cached_token(&auth);
+        let error = auth.access_token().await.unwrap_err();
+        assert!(error.is_rate_limited());
+        assert!(error.retry_after().unwrap() > Duration::from_secs(290));
+        exchange.assert_calls(1);
+    }
+    #[tokio::test]
+    async fn refresh_rate_limit_defers_refresh_while_serving_cache() {
+        let server = MockServer::start_async().await;
+        mock_sign_chain(&server);
+        let exchange = server.mock(|when, then| {
+            when.method(httpmock::Method::POST).path("/token");
+            then.status(429).header("Retry-After", "60");
+        });
+        let auth = stub_auth(&server);
+        *auth.cached.lock().unwrap() = Some(CachedToken {
+            access_token: "seeded".into(),
+            refresh_after: Instant::now().checked_sub(Duration::from_secs(1)).unwrap(),
+            hard_expiry: Instant::now() + Duration::from_secs(110),
+        });
+        assert_eq!(auth.access_token().await.unwrap(), "seeded");
+        assert!(
+            auth.cached.lock().unwrap().as_ref().unwrap().refresh_after
+                >= Instant::now() + Duration::from_secs(59)
+        );
+        assert_eq!(auth.access_token().await.unwrap(), "seeded");
+        exchange.assert_calls(1);
+    }
+    #[tokio::test]
+    async fn token_retry_after_blocks_signing_and_exchange() {
+        let server = MockServer::start_async().await;
+        mock_sign_chain(&server);
+        let exchange = server.mock(|when, then| {
+            when.method(httpmock::Method::POST).path("/token");
+            then.status(429).header("Retry-After", "2");
+        });
+        let auth = stub_auth(&server);
+        assert!(auth.access_token().await.unwrap_err().is_rate_limited());
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let error = auth.access_token().await.unwrap_err();
+        assert!(error.retry_after().unwrap() >= Duration::from_secs(12));
+        exchange.assert_calls(1);
+    }
+    #[tokio::test]
+    async fn token_retry_after_hold_is_capped() {
+        let server = MockServer::start_async().await;
+        mock_sign_chain(&server);
+        let exchange = server.mock(|when, then| {
+            when.method(httpmock::Method::POST).path("/token");
+            then.status(429).header("Retry-After", "86400");
+        });
+        let auth = stub_auth(&server);
+        assert!(auth.access_token().await.unwrap_err().is_rate_limited());
+        let error = auth.access_token().await.unwrap_err();
+        assert!(error.retry_after().unwrap() <= MAX_RETRY_AFTER_HOLD);
+        exchange.assert_calls(1);
     }
 }
