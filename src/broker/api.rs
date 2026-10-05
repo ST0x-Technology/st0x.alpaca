@@ -141,6 +141,7 @@ pub struct AlpacaBrokerApi {
     asset_cache: Arc<RwLock<HashMap<String, CachedAsset>>>,
     asset_cache_ttl: Duration,
     time_in_force: TimeInForce,
+    account_number: Option<Arc<str>>,
 }
 
 impl Clone for AlpacaBrokerApi {
@@ -150,6 +151,7 @@ impl Clone for AlpacaBrokerApi {
             asset_cache: Arc::clone(&self.asset_cache),
             asset_cache_ttl: self.asset_cache_ttl,
             time_in_force: self.time_in_force,
+            account_number: self.account_number.clone(),
         }
     }
 }
@@ -196,7 +198,16 @@ impl AlpacaBrokerApi {
             asset_cache: Arc::new(RwLock::new(HashMap::new())),
             asset_cache_ttl: ctx.asset_cache_ttl,
             time_in_force: ctx.time_in_force,
+            account_number: account.account_number.map(Arc::from),
         })
+    }
+
+    /// Account number Alpaca reported when the account was verified at
+    /// construction, so a caller can check it is bound to the account it
+    /// expects. `None` when Alpaca omitted it.
+    #[must_use]
+    pub fn account_number(&self) -> Option<&str> {
+        self.account_number.as_deref()
     }
 
     /// Whether the regular equity session is open now.
@@ -591,8 +602,7 @@ impl AlpacaBrokerApi {
         conversion: ConversionOrder,
         client_order_id: &ClientOrderId,
     ) -> Result<CryptoOrderResponse, AlpacaBrokerApiError> {
-        let order =
-            super::order::convert_usdc_usd(&self.client, conversion, client_order_id).await?;
+        let order = self.submit_conversion(conversion, client_order_id).await?;
 
         info!(
             order_id = %order.id,
@@ -606,6 +616,37 @@ impl AlpacaBrokerApi {
             super::order::ConversionPollDeadlines::PRODUCTION,
         )
         .await
+    }
+
+    /// Places a USDC/USD conversion order and returns as soon as Alpaca
+    /// accepts it, without waiting for a fill. [`Self::convert_usdc_usd`]
+    /// is this placement followed by the poll; a caller that polls on its
+    /// own (the gateway's callers) uses this and
+    /// [`Self::get_conversion_order`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the precision, HTTP, or parse error, or
+    /// [`AlpacaBrokerApiError::UsdConversionInsufficientBalance`] for a USD
+    /// notional rejected for insufficient balance.
+    pub async fn submit_conversion(
+        &self,
+        conversion: ConversionOrder,
+        client_order_id: &ClientOrderId,
+    ) -> Result<CryptoOrderResponse, AlpacaBrokerApiError> {
+        super::order::convert_usdc_usd(&self.client, conversion, client_order_id).await
+    }
+
+    /// Reads one conversion order by its Alpaca order id.
+    ///
+    /// # Errors
+    ///
+    /// Returns the HTTP or parse error.
+    pub async fn get_conversion_order(
+        &self,
+        order_id: Uuid,
+    ) -> Result<CryptoOrderResponse, AlpacaBrokerApiError> {
+        self.client.get_crypto_order(order_id).await
     }
 
     /// Looks up a previously-placed conversion order by its `client_order_id`

@@ -1,0 +1,32 @@
+[package]
+name = "st0x-alpaca-gateway-api"
+version = "0.1.0"
+edition = "2024"
+description = "Wire contract and typed client for the account bound Alpaca gateway"
+license = "LicenseRef-Proprietary"
+publish = false
+
+[features]
+default = []
+# Typed HTTP client for bots and the operator CLI.
+client = ["dep:reqwest", "dep:url"]
+
+[dependencies]
+alloy-primitives = { version = "1", features = ["serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+rain-math-float = { git = "https://github.com/rainlanguage/rain.math.float", rev = "e226e5a27125e75208e3e709e1c5eee128bd8b3b" }
+reqwest = { version = "0.13", default-features = false, features = [
+  "json",
+  "query",
+  "rustls",
+], optional = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+st0x-alpaca = { path = "../..", features = ["tokenization"] }
+st0x-float-serde = { git = "https://github.com/ST0x-Technology/st0x.finance", version = "0.3.0", tag = "v0.3.0" }
+thiserror = "2"
+url = { version = "2", optional = true }
+uuid = { version = "1", features = ["serde", "v4"] }
+
+[lints]
+workspace = true

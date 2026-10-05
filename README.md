@@ -44,13 +44,22 @@ st0x-alpaca = { git = "ssh://git@github.com/ST0x-Technology/st0x.alpaca", featur
   `tracing` events as the code they replace. The crate installs no
   subscriber. The issuer surface emits no events.
 
+## Gateway
+
+The workspace also holds the account bound Alpaca gateway (`t0-alpaca`), which runs these clients on behalf of bots and operators so that only the gateway holds Alpaca credentials:
+
+- `crates/gateway-api` (`st0x-alpaca-gateway-api`): the wire contract (tiers, operation catalog and capability matrix, bodies, error body, audit event) and, with feature `client`, a typed client.
+- `crates/gateway` (`st0x-alpaca-gateway`): the service, packaged as the `gateway-oci` flake output.
+
+Running and rolling it back: [docs/gateway.md](docs/gateway.md).
+
 ## Development
 
 ```bash
 nix develop
 cargo check --all-features
-cargo test --all-features
-cargo clippy --all-targets --all-features -- -D warnings
+cargo test --workspace --all-features
+cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo fmt --all -- --check
 ```
 

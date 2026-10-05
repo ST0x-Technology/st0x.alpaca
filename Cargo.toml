@@ -121,3 +121,15 @@ all = "deny"
 pedantic = "deny"
 unwrap_used = "deny"
 expect_used = "deny"
+
+[workspace]
+members = ["crates/gateway-api", "crates/gateway"]
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = "deny"
+pedantic = "deny"
+unwrap_used = "deny"
+expect_used = "deny"
