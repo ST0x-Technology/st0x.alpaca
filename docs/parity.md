@@ -29,13 +29,13 @@ Status values:
 | --- | ---: | ---: | --- |
 | Issuer (st0x.issuance) | 3 | 3 | `Fees` and response qty on Rain Float; 429 as `RateLimited`; typed `InvalidUrl`; percent-encoded path segments; no log events. |
 | Corporate-action stream (st0x.issuance) | 1 | 1 | Errors split into endpoint and stream errors; JWT modes send a bearer token; no log events. Projection, cursor, and reconnect loop stay in issuance. |
-| Broker and Market Data (st0x.liquidity) | 13 | 13 | Preflight policy fields and errors stay in the consumer; trait mappings became inherent methods; redirects disabled and mode URLs validated. |
+| Broker and Market Data (st0x.liquidity) | 13 | 13 | Preflight policy fields and errors stay in the consumer; trait mappings became inherent methods; redirects disabled and mode URLs validated; a USDC conversion 403 `40310000` is insufficient balance only when its message says so. |
 | Wallet (st0x.liquidity) | 8 | 8 | Redirects disabled and base URL validated. |
 | Tokenization (st0x.liquidity) | 2 | 2 | Non-generic service; onchain actions and their error variants stay in the consumer. |
 | Mocks (st0x.liquidity e2e) | 2 servers | 2 | Inline ERC-20 interface instead of ABI environment variables. |
 | Shared auth and transport | - | - | Public auth internals made private; request paths confined to the configured origin; token URLs validated. |
 
-Tests: 662 pass with `--all-features` (plus 1 live-sandbox test ignored, as
+Tests: 674 pass with `--all-features` (plus 1 live-sandbox test ignored, as
 in the source). Every source test is ported except the consumer-side tests
 listed under Test parity.
 
@@ -120,7 +120,7 @@ compiled at that commit (the module is not declared) and is not ported.
 | `GET .../orders/{id}` and status mapping (16 statuses, terminality, timestamp fallbacks, completeness checks) | `order::get_order_status`, `Executor::get_order_status` | `AlpacaBrokerApi::get_order_status` -> `OrderState` | Moved: the trait-impl mapping (IncompleteOrder, FilledQuantityMismatch) is now the inherent method. |
 | `GET .../orders:by_client_order_id?client_order_id=` (404 as `None`) | `client.get_order_by_client_order_id`, `recover_order_by_client_id` | `AlpacaBrokerApi::{get_order_by_client_order_id, recover_order_by_client_id}` | Same. |
 | `DELETE .../orders/{id}` (204 `Requested`, 404 `OrderNotFound`, 422 error) | `client.cancel_order` | `AlpacaBrokerApi::cancel_order` | Same. |
-| `POST .../orders` crypto `USDCUSD`: sell by `qty`, buy by whole-cent `notional`, `gtc`; 403 `40310000` as `UsdConversionInsufficientBalance` | `order::convert_usdc_usd` | `AlpacaBrokerApi::convert_usdc_usd` | Same. |
+| `POST .../orders` crypto `USDCUSD`: sell by `qty`, buy by whole-cent `notional`, `gtc`; a buy rejected with 403 `40310000` and an "insufficient balance" message as `UsdConversionInsufficientBalance`; any other rejection (including "no available quote") passes through as `ApiError` | `order::convert_usdc_usd` | `AlpacaBrokerApi::convert_usdc_usd` | Changed: the source classified every buy 403 `40310000` as `UsdConversionInsufficientBalance`. Alpaca reuses that code for "no available quote for symbol", which resizing cannot fix, so the message must also say "insufficient balance" (any case). |
 | Conversion polling: 300 s deadline, cancel, 30 s settle window, 500 ms reads, cancel/fill race, partial fills, `DoneForDay` waited on | `poll_crypto_order_until_filled`, `poll_crypto_order_to_terminal`, `cancel_and_settle` | `AlpacaBrokerApi::{convert_usdc_usd, poll_conversion_to_terminal}` | Same. |
 | `GET .../orders:by_client_order_id` for crypto | `get_crypto_order_by_client_order_id` | `AlpacaBrokerApi::find_conversion_order` | Same. |
 | `GET /v1/trading/accounts/{id}/positions` (equities, `USDCUSD` qty floored to 6 decimals) | `positions::fetch_inventory` | `AlpacaBrokerApi::fetch_inventory` -> `Inventory` | Moved: returns `Inventory` directly instead of `InventoryResult::Fetched`. |
