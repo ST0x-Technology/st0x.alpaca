@@ -10,6 +10,11 @@ publish = false
 name = "st0x-alpaca-gateway"
 path = "src/main.rs"
 
+[features]
+# Test only hooks for this crate's own integration tests: per test
+# deadlines and the in memory audit sink.
+test-support = []
+
 [dependencies]
 alloy-primitives = { version = "1", features = ["serde"] }
 axum = { version = "0.8", features = ["json", "query", "tokio", "http1"] }
@@ -46,9 +51,9 @@ httpmock = "0.8"
 p256 = { version = "0.13", features = ["ecdsa", "pkcs8", "pem"] }
 rsa = { version = "0.9", features = ["pem"] }
 st0x-alpaca = { path = "../..", features = ["tokenization", "mock"] }
+st0x-alpaca-gateway = { path = ".", features = ["test-support"] }
 st0x-alpaca-gateway-api = { path = "../gateway-api", features = ["client"] }
 tower = { version = "0.5", features = ["util"] }
-tracing-test = { version = "0.2", features = ["no-env-filter"] }
 
 [lints]
 workspace = true

@@ -9,7 +9,7 @@ publish = false
 [features]
 default = []
 # Typed HTTP client for bots and the operator CLI.
-client = ["dep:reqwest", "dep:url"]
+client = ["dep:reqwest", "dep:tokio", "dep:url"]
 
 [dependencies]
 alloy-primitives = { version = "1", features = ["serde"] }
@@ -25,8 +25,13 @@ serde_json = "1"
 st0x-alpaca = { path = "../..", features = ["tokenization"] }
 st0x-float-serde = { git = "https://github.com/ST0x-Technology/st0x.finance", version = "0.3.0", tag = "v0.3.0" }
 thiserror = "2"
+tokio = { version = "1", features = ["time"], optional = true }
 url = { version = "2", optional = true }
 uuid = { version = "1", features = ["serde", "v4"] }
+
+[dev-dependencies]
+httpmock = "0.8"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util", "time"] }
 
 [lints]
 workspace = true

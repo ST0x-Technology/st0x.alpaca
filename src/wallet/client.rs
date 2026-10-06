@@ -12,7 +12,7 @@ use super::transfer::{AlpacaTransferId, Network, TokenSymbol, TransferStatus};
 use super::whitelist::{TravelRuleInfo, WhitelistEntry, WhitelistStatus};
 use crate::auth::{AuthRuntime, KmsJwtError};
 use crate::broker::{AlpacaAccountId, Backpressure};
-use crate::core::AlpacaAuth;
+use crate::core::{AlpacaAuth, GatewayHopError};
 use crate::endpoint::{EndpointError, EndpointRole, validate_origin};
 use crate::rate_limit::retry_after_from_response_headers;
 
@@ -86,14 +86,21 @@ pub enum AlpacaWalletError {
         previous: TransferStatus,
         next: TransferStatus,
     },
+    /// The hop to the Alpaca gateway failed or the gateway refused the call
+    /// without relaying an Alpaca answer. Backpressure only when the gateway
+    /// relayed a wait; the polls retry it only when the gateway classified it
+    /// as transient.
+    #[error(transparent)]
+    Gateway(#[from] GatewayHopError),
 }
 
 impl AlpacaWalletError {
-    /// Classifies this error as broker rate-limiting (HTTP 429), returning
-    /// its `Retry-After` hint when the broker sent one. Every other variant
-    /// returns `None` -- an exhaustive match so a new variant added later
-    /// forces a conscious decision here rather than silently classifying as
-    /// "not backpressure".
+    /// Classifies this error as rate limiting (a broker HTTP 429, a throttled
+    /// token mint, or a gateway hop that relayed a wait), returning the
+    /// `Retry-After` hint when one was sent. Every other variant returns
+    /// `None`: an exhaustive match so a new variant added later forces a
+    /// conscious decision here rather than silently classifying as "not
+    /// backpressure".
     #[must_use]
     pub fn backpressure(&self) -> Option<Backpressure> {
         match self {
@@ -110,6 +117,10 @@ impl AlpacaWalletError {
             Self::Auth(error) if error.is_rate_limited() => Some(Backpressure {
                 retry_after: error.retry_after(),
             }),
+
+            // The gateway relays a wait (a throttled credential mint behind
+            // it) as the hop's `retry_after`.
+            Self::Gateway(hop) => hop.backpressure(),
 
             Self::ApiError { .. }
             | Self::Reqwest(_)
@@ -186,7 +197,7 @@ impl AlpacaWalletClient {
         trace!(target: "wallet", "GET {url}");
 
         let request = self.auth.apply_wallet(self.client.get(&url)).await?;
-        let response = request.send().await?;
+        let response = crate::request_id::send(request).await?;
 
         read_response_body(Method::GET, response).await
     }
@@ -202,8 +213,12 @@ impl AlpacaWalletClient {
         // The legacy pair sends both Basic auth AND the APCA headers (the
         // wallet endpoints historically wanted both); keyless sends the
         // bearer token. AuthRuntime::apply_wallet owns that split.
-        let request = self.auth.apply_wallet(self.client.post(&url)).await?;
-        let response = request.json(body).send().await?;
+        let request = self
+            .auth
+            .apply_wallet(self.client.post(&url))
+            .await?
+            .json(body);
+        let response = crate::request_id::send(request).await?;
 
         read_response_body(Method::POST, response).await
     }
@@ -213,7 +228,7 @@ impl AlpacaWalletClient {
         trace!(target: "wallet", "DELETE {url}");
 
         let request = self.auth.apply_wallet(self.client.delete(&url)).await?;
-        let response = request.send().await?;
+        let response = crate::request_id::send(request).await?;
 
         read_response_body(Method::DELETE, response).await
     }
@@ -226,8 +241,12 @@ impl AlpacaWalletClient {
         let url = format!("{}{}", self.base_url, path);
         trace!(target: "wallet", "PATCH {url}");
 
-        let request = self.auth.apply_wallet(self.client.patch(&url)).await?;
-        let response = request.json(body).send().await?;
+        let request = self
+            .auth
+            .apply_wallet(self.client.patch(&url))
+            .await?
+            .json(body);
+        let response = crate::request_id::send(request).await?;
 
         read_response_body(Method::PATCH, response).await
     }
@@ -345,6 +364,7 @@ async fn read_response_body(
     response: Response,
 ) -> Result<String, AlpacaWalletError> {
     let status = response.status();
+    crate::request_id::record(status, response.headers());
     let url = response.url().clone();
     let retry_after = retry_after_from_response_headers(response.headers());
     // Read raw bytes and convert the success body with `String::from_utf8` so

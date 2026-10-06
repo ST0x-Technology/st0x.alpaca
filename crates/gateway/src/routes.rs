@@ -1,5 +1,7 @@
 //! The router: one prefix per tier, each operation mounted only on the tiers
 //! the profile's capability matrix allows, behind that tier's identity check.
+//! The check runs inside the operation's route, so it answers and audits a
+//! refusal as that operation.
 
 use std::sync::Arc;
 
@@ -8,10 +10,10 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Extension, Json, Router, middleware};
 use serde_json::json;
-use st0x_alpaca_gateway_api::{ErrorCode, Operation, Tier};
+use st0x_alpaca_gateway_api::{ErrorCode, Operation, Outcome, Tier};
 
 use crate::answer::Failure;
-use crate::auth::{self, TokenVerifier};
+use crate::auth::{self, Guard, TokenVerifier};
 use crate::handlers;
 use crate::state::AppState;
 
@@ -74,7 +76,7 @@ pub fn app(state: AppState, verifiers: &Verifiers) -> Router {
         .route("/readyz", get(readyz));
 
     for tier in Tier::ALL {
-        let mut tier_router = Router::new();
+        let guard = Guard::new(verifiers.for_tier(tier), state.clone());
         for operation in Operation::ALL {
             if !operation.allows(profile, tier) {
                 continue;
@@ -82,15 +84,15 @@ pub fn app(state: AppState, verifiers: &Verifiers) -> Router {
             let Some(handler) = handlers::route(operation) else {
                 continue;
             };
-            tier_router = tier_router.route(
+            // `route_layer`: a method the operation does not serve skips the
+            // check and answers `unknown_operation` like any unknown path.
+            router = router.route(
                 &format!("{}{}", tier.prefix(), operation.path()),
-                handler.layer(Extension(operation)),
+                handler
+                    .route_layer(middleware::from_fn_with_state(guard.clone(), auth::require))
+                    .layer(Extension(operation)),
             );
         }
-        router = router.merge(tier_router.route_layer(middleware::from_fn_with_state(
-            verifiers.for_tier(tier),
-            auth::require,
-        )));
     }
 
     router
@@ -115,10 +117,14 @@ async fn readyz(State(state): State<AppState>) -> Response {
     .into_response()
 }
 
+/// Nothing was done for a path no operation serves, whatever it named.
 async fn unknown_operation() -> Response {
-    Failure::new(
-        ErrorCode::UnknownOperation,
-        "no such operation for this deployment and tier",
-    )
+    Failure {
+        outcome: Some(Outcome::NotApplied),
+        ..Failure::new(
+            ErrorCode::UnknownOperation,
+            "no such operation for this deployment and tier",
+        )
+    }
     .into_response()
 }

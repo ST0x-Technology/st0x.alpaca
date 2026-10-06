@@ -9,14 +9,16 @@ use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+use super::activity::{AccountActivitiesQuery, AccountActivity};
 use super::auth::{AccountStatus, AlpacaAccountId, AlpacaBrokerApiCtx};
-use super::client::AlpacaBrokerApiClient;
+use super::client::{AlpacaBrokerApiClient, SymbolSegment};
 use super::journal::JournalResponse;
 use super::order::{
-    AlpacaLimitOrder, ConversionOrder, CryptoOrderResponse, OrderSide, parse_limit_price,
+    AlpacaLimitOrder, CONVERSION_POLL_INTERVAL, ConversionOrder, ConversionOrders,
+    CryptoOrderResponse, OrderSide, parse_limit_price,
 };
 use super::positions::{AccountFunds, Inventory};
-use super::{AlpacaBrokerApiError, AssetStatus, MissingOrderField, TimeInForce};
+use super::{AlpacaBrokerApiError, AssetStatus, MissingOrderField, PlacementError, TimeInForce};
 use crate::broker::{
     CancellationOutcome, ClientOrderId, Direction, ExecutorOrderId, FractionalShares,
     IndicativeQuote, LatestQuote, LimitOrder, MarketOrder, MarketSession, MarketSessionStatus,
@@ -232,11 +234,30 @@ impl AlpacaBrokerApi {
     /// validation error, or the placement error.
     pub async fn place_market_order(
         &self,
-        mut order: MarketOrder,
+        order: MarketOrder,
     ) -> Result<OrderPlacement<String>, AlpacaBrokerApiError> {
+        self.place_market_order_reporting(order)
+            .await
+            .map_err(|failure| failure.error)
+    }
+
+    /// [`Self::place_market_order`], reporting with a failure whether the
+    /// order request may have been written.
+    ///
+    /// # Errors
+    ///
+    /// The [`Self::place_market_order`] errors in a [`PlacementError`]:
+    /// unwritten for the asset read and precision checks and for a definite
+    /// rejection of the order request, written once the request may have
+    /// reached Alpaca.
+    pub async fn place_market_order_reporting(
+        &self,
+        mut order: MarketOrder,
+    ) -> Result<OrderPlacement<String>, PlacementError> {
         order.shares = self
             .prepare_order_shares_for_placement(&order.symbol, order.shares, false)
-            .await?;
+            .await
+            .map_err(PlacementError::unwritten)?;
 
         super::order::place_market_order(&self.client, order, self.time_in_force).await
     }
@@ -452,12 +473,13 @@ impl AlpacaBrokerApi {
     /// # Errors
     ///
     /// Returns [`AlpacaBrokerApiError::LatestTrade`] wrapping the market-data
-    /// error.
+    /// error, or [`AlpacaBrokerApiError::UnsafeSymbol`].
     pub async fn fetch_latest_trade_price(
         &self,
         symbol: &Symbol,
     ) -> Result<Positive<Usd>, AlpacaBrokerApiError> {
-        super::market_data::fetch_latest_trade_price(&self.client, symbol)
+        let segment = SymbolSegment::new(symbol)?;
+        super::market_data::fetch_latest_trade_price(&self.client, &segment)
             .await
             .map_err(|source| AlpacaBrokerApiError::LatestTrade(Box::new(source)))
     }
@@ -484,12 +506,13 @@ impl AlpacaBrokerApi {
     /// # Errors
     ///
     /// Returns [`AlpacaBrokerApiError::LatestQuote`] wrapping the market-data
-    /// error.
+    /// error, or [`AlpacaBrokerApiError::UnsafeSymbol`].
     pub async fn fetch_latest_quote(
         &self,
         symbol: &Symbol,
     ) -> Result<LatestQuote, AlpacaBrokerApiError> {
-        super::market_data::fetch_latest_quote(&self.client, symbol)
+        let segment = SymbolSegment::new(symbol)?;
+        super::market_data::fetch_latest_quote(&self.client, &segment)
             .await
             .map_err(|source| AlpacaBrokerApiError::LatestQuote(Box::new(source)))
     }
@@ -522,13 +545,33 @@ impl AlpacaBrokerApi {
     /// Returns a precision, asset validation, or placement error.
     pub async fn place_limit_order(
         &self,
-        mut order: LimitOrder,
+        order: LimitOrder,
     ) -> Result<OrderPlacement<String>, AlpacaBrokerApiError> {
+        self.place_limit_order_reporting(order)
+            .await
+            .map_err(|failure| failure.error)
+    }
+
+    /// [`Self::place_limit_order`], reporting with a failure whether the
+    /// order request may have been written.
+    ///
+    /// # Errors
+    ///
+    /// The [`Self::place_limit_order`] errors in a [`PlacementError`]:
+    /// unwritten for the asset read, precision and limit price checks and for
+    /// a definite rejection of the order request, written once the request
+    /// may have reached Alpaca.
+    pub async fn place_limit_order_reporting(
+        &self,
+        mut order: LimitOrder,
+    ) -> Result<OrderPlacement<String>, PlacementError> {
         order.shares = self
             .prepare_order_shares_for_placement(&order.symbol, order.shares, order.extended_hours)
-            .await?;
+            .await
+            .map_err(PlacementError::unwritten)?;
 
-        let alpaca_limit_price = super::order::AlpacaLimitPrice::try_new(order.limit_price)?;
+        let alpaca_limit_price = super::order::AlpacaLimitPrice::try_new(order.limit_price)
+            .map_err(PlacementError::unwritten)?;
 
         let alpaca_order = AlpacaLimitOrder {
             symbol: order.symbol,
@@ -556,6 +599,26 @@ impl AlpacaBrokerApi {
     ) -> Result<CancellationOutcome, AlpacaBrokerApiError> {
         let order_uuid = Uuid::parse_str(order_id)?;
         self.client.cancel_order(order_uuid).await
+    }
+
+    /// Fetches every account activity matching `query`, following page
+    /// tokens, on this instance's client and credential.
+    ///
+    /// At most `max_pages` pages of 100 rows are read, one Alpaca request
+    /// each, so a caller can bound what one call costs against the
+    /// credential's request budget.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AlpacaBrokerApiError::AccountActivitiesPageLimitExceeded`]
+    /// when more than `max_pages` pages match, or the HTTP, parse, URL, or
+    /// pagination error.
+    pub async fn fetch_account_activities(
+        &self,
+        query: &AccountActivitiesQuery,
+        max_pages: usize,
+    ) -> Result<Vec<AccountActivity>, AlpacaBrokerApiError> {
+        super::activity::get_account_activities(&self.client, query, max_pages).await
     }
 }
 
@@ -602,18 +665,11 @@ impl AlpacaBrokerApi {
         conversion: ConversionOrder,
         client_order_id: &ClientOrderId,
     ) -> Result<CryptoOrderResponse, AlpacaBrokerApiError> {
-        let order = self.submit_conversion(conversion, client_order_id).await?;
-
-        info!(
-            order_id = %order.id,
-            ?conversion,
-            "USDC/USD conversion order placed, polling for completion..."
-        );
-
-        super::order::poll_crypto_order_until_filled(
-            &self.client,
-            order.id,
-            super::order::ConversionPollDeadlines::PRODUCTION,
+        super::order::convert_usdc_usd_with(
+            self,
+            conversion,
+            client_order_id,
+            CONVERSION_POLL_INTERVAL,
         )
         .await
     }
@@ -684,12 +740,8 @@ impl AlpacaBrokerApi {
         &self,
         order_id: Uuid,
     ) -> Result<CryptoOrderResponse, AlpacaBrokerApiError> {
-        super::order::poll_crypto_order_to_terminal(
-            &self.client,
-            order_id,
-            super::order::ConversionPollDeadlines::PRODUCTION,
-        )
-        .await
+        super::order::poll_conversion_to_terminal_with(self, order_id, CONVERSION_POLL_INTERVAL)
+            .await
     }
 
     /// Journal (transfer) equities from the configured account to a
@@ -723,8 +775,29 @@ impl AlpacaBrokerApi {
         &self,
         order: AlpacaLimitOrder,
     ) -> Result<OrderPlacement<String>, AlpacaBrokerApiError> {
-        let asset = self.get_asset_cached(&order.symbol).await?;
-        Self::validate_asset(&order.symbol, &asset)?;
+        self.place_alpaca_limit_order_reporting(order)
+            .await
+            .map_err(|failure| failure.error)
+    }
+
+    /// [`Self::place_alpaca_limit_order`], reporting with a failure whether
+    /// the order request may have been written.
+    ///
+    /// # Errors
+    ///
+    /// The [`Self::place_alpaca_limit_order`] errors in a
+    /// [`PlacementError`]: unwritten for the asset read and validation and
+    /// for a definite rejection of the order request, written once the
+    /// request may have reached Alpaca.
+    pub async fn place_alpaca_limit_order_reporting(
+        &self,
+        order: AlpacaLimitOrder,
+    ) -> Result<OrderPlacement<String>, PlacementError> {
+        let asset = self
+            .get_asset_cached(&order.symbol)
+            .await
+            .map_err(PlacementError::unwritten)?;
+        Self::validate_asset(&order.symbol, &asset).map_err(PlacementError::unwritten)?;
 
         super::order::place_limit_order(&self.client, order).await
     }
@@ -763,12 +836,13 @@ impl AlpacaBrokerApi {
     /// # Errors
     ///
     /// Returns [`AlpacaBrokerApiError::LatestQuote`] wrapping the market-data
-    /// error.
+    /// error, or [`AlpacaBrokerApiError::UnsafeSymbol`].
     pub async fn fetch_latest_overnight_quote(
         &self,
         symbol: &Symbol,
     ) -> Result<IndicativeQuote, AlpacaBrokerApiError> {
-        crate::broker::market_data::fetch_latest_overnight_quote(&self.client, symbol)
+        let segment = SymbolSegment::new(symbol)?;
+        crate::broker::market_data::fetch_latest_overnight_quote(&self.client, &segment)
             .await
             .map_err(|source| AlpacaBrokerApiError::LatestQuote(Box::new(source)))
     }
@@ -895,6 +969,38 @@ impl AlpacaBrokerApi {
         };
 
         Ok(shares)
+    }
+}
+
+impl ConversionOrders for AlpacaBrokerApi {
+    fn submit_conversion(
+        &self,
+        conversion: ConversionOrder,
+        client_order_id: &ClientOrderId,
+    ) -> impl Future<Output = Result<CryptoOrderResponse, AlpacaBrokerApiError>> + Send {
+        Self::submit_conversion(self, conversion, client_order_id)
+    }
+
+    fn get_conversion_order(
+        &self,
+        order_id: Uuid,
+    ) -> impl Future<Output = Result<CryptoOrderResponse, AlpacaBrokerApiError>> + Send {
+        Self::get_conversion_order(self, order_id)
+    }
+
+    fn find_conversion_order(
+        &self,
+        client_order_id: &ClientOrderId,
+    ) -> impl Future<Output = Result<Option<CryptoOrderResponse>, AlpacaBrokerApiError>> + Send
+    {
+        Self::find_conversion_order(self, client_order_id)
+    }
+
+    fn cancel_order(
+        &self,
+        order_id: &str,
+    ) -> impl Future<Output = Result<CancellationOutcome, AlpacaBrokerApiError>> + Send {
+        Self::cancel_order(self, order_id)
     }
 }
 
@@ -2954,5 +3060,169 @@ mod tests {
                 .parse::<chrono::DateTime<chrono::Utc>>()
                 .unwrap()
         );
+    }
+
+    /// A symbol carrying URL syntax stays one literal path segment on every
+    /// symbol route, so it can neither name another Alpaca path nor add a
+    /// query.
+    #[tokio::test]
+    async fn symbols_reach_alpaca_as_one_encoded_path_segment() {
+        const SYMBOL: &str = "BRK/B?x=1#y";
+        const SEGMENT: &str = "BRK%2FB%3Fx%3D1%23y";
+
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+        create_account_mock(&server);
+        let asset = server.mock(|when, then| {
+            when.method(GET).path(format!("/v1/assets/{SEGMENT}"));
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": "904837e3-3b76-47ec-b432-046db621571b",
+                    "symbol": SYMBOL,
+                    "status": "active",
+                    "tradable": true
+                }));
+        });
+        let trade = server.mock(|when, then| {
+            when.method(GET)
+                .path(format!("/v2/stocks/{SEGMENT}/trades/latest"));
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({ "trade": { "p": "412.5" } }));
+        });
+        let quote = server.mock(|when, then| {
+            when.method(GET)
+                .path(format!("/v2/stocks/{SEGMENT}/quotes/latest"));
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "symbol": SYMBOL,
+                    "quote": { "bp": "412.4", "ap": "412.6" }
+                }));
+        });
+        let position = server.mock(|when, then| {
+            when.method(GET).path(format!(
+                "/v1/trading/accounts/{TEST_ACCOUNT_ID}/positions/{SEGMENT}"
+            ));
+            then.status(404)
+                .header("content-type", "application/json")
+                .json_body(json!({ "message": "position does not exist" }));
+        });
+        let executor = AlpacaBrokerApi::try_from_ctx(ctx).await.unwrap();
+        let symbol = Symbol::new(SYMBOL).unwrap();
+
+        executor.get_asset_details(&symbol).await.unwrap();
+        executor.fetch_latest_trade_price(&symbol).await.unwrap();
+        executor.fetch_latest_quote(&symbol).await.unwrap();
+        assert_eq!(executor.fetch_position_mark(&symbol).await.unwrap(), None);
+
+        asset.assert();
+        trade.assert();
+        quote.assert();
+        position.assert();
+    }
+
+    /// URL parsing resolves a dot segment into the parent path, so such a
+    /// symbol is refused on every symbol route before any request is sent.
+    #[tokio::test]
+    async fn dot_segment_symbols_are_refused_before_any_request() {
+        fn refused(error: &AlpacaBrokerApiError, symbol: &Symbol) -> bool {
+            matches!(error, AlpacaBrokerApiError::UnsafeSymbol { symbol: unsafe_symbol } if unsafe_symbol == symbol)
+        }
+
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+        create_account_mock(&server);
+        let executor = AlpacaBrokerApi::try_from_ctx(ctx).await.unwrap();
+        let any_request = server.mock(|_, then| {
+            then.status(500);
+        });
+
+        for raw in [".", ".."] {
+            let symbol = Symbol::new(raw).unwrap();
+
+            let asset = executor.get_asset_details(&symbol).await.unwrap_err();
+            let trade = executor
+                .fetch_latest_trade_price(&symbol)
+                .await
+                .unwrap_err();
+            let quote = executor.fetch_latest_quote(&symbol).await.unwrap_err();
+            let overnight = executor
+                .fetch_latest_overnight_quote(&symbol)
+                .await
+                .unwrap_err();
+            let mark = executor.fetch_position_mark(&symbol).await.unwrap_err();
+
+            for error in [asset, trade, quote, overnight, mark] {
+                assert!(refused(&error, &symbol), "{raw}: {error:?}");
+                assert_eq!(error.permanence(), Permanence::Permanent);
+            }
+        }
+
+        assert_eq!(any_request.calls(), 0);
+    }
+
+    /// The asset read runs before the order request, so its failure reports
+    /// nothing written and no order is sent, on all three placements.
+    #[tokio::test]
+    async fn placement_reports_an_asset_read_failure_as_unwritten() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+        create_account_mock(&server);
+        let asset = server.mock(|when, then| {
+            when.method(GET).path("/v1/assets/AAPL");
+            then.status(503)
+                .header("content-type", "application/json")
+                .json_body(json!({ "message": "unavailable" }));
+        });
+        let order = create_order_mock(&server);
+        let executor = AlpacaBrokerApi::try_from_ctx(ctx).await.unwrap();
+        let symbol = Symbol::new("AAPL").unwrap();
+        let shares = positive_shares("10");
+        let limit_price = Positive::new(Usd::new(float!(195.25))).unwrap();
+
+        let market = executor
+            .place_market_order_reporting(MarketOrder {
+                symbol: symbol.clone(),
+                shares,
+                direction: Direction::Buy,
+                client_order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
+            })
+            .await
+            .unwrap_err();
+        let limit = executor
+            .place_limit_order_reporting(LimitOrder {
+                symbol: symbol.clone(),
+                shares,
+                direction: Direction::Buy,
+                limit_price,
+                extended_hours: false,
+                client_order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
+            })
+            .await
+            .unwrap_err();
+        let alpaca_limit = executor
+            .place_alpaca_limit_order_reporting(AlpacaLimitOrder {
+                symbol,
+                shares,
+                direction: Direction::Buy,
+                limit_price: AlpacaLimitPrice::try_new(limit_price).unwrap(),
+                extended_hours: false,
+                client_order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
+            })
+            .await
+            .unwrap_err();
+
+        asset.assert_calls(3);
+        assert_eq!(order.calls(), 0);
+        for failure in [market, limit, alpaca_limit] {
+            assert!(!failure.written);
+            assert!(matches!(
+                failure.error,
+                AlpacaBrokerApiError::ApiError { status, .. }
+                    if status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+            ));
+        }
     }
 }

@@ -379,6 +379,61 @@ pub(super) async fn find_transfer_by_tx_hash(
     scan_transfer_list_by_tx_hash(client, tx_hash, None).await
 }
 
+/// The transfer reads the wallet polls make: one transfer by id, and one
+/// transfer by its onchain transaction hash.
+///
+/// [`AlpacaWalletService`](super::AlpacaWalletService) answers them from
+/// Alpaca directly; a gateway client answers them through the gateway. The
+/// poll functions ([`poll_transfer_until_complete_with`],
+/// [`poll_transfer_tx_hash_with`], [`poll_deposit_by_tx_hash_with`]) run over
+/// either.
+///
+/// [`poll_transfer_until_complete_with`]: super::poll_transfer_until_complete_with
+/// [`poll_transfer_tx_hash_with`]: super::poll_transfer_tx_hash_with
+/// [`poll_deposit_by_tx_hash_with`]: super::poll_deposit_by_tx_hash_with
+pub trait WalletTransfers {
+    /// One transfer by id, without its fee fields.
+    ///
+    /// # Errors
+    ///
+    /// `TransferNotFound`, or the transport, API or parse error.
+    fn get_transfer(
+        &self,
+        transfer_id: &AlpacaTransferId,
+    ) -> impl Future<Output = Result<Transfer, AlpacaWalletError>> + Send;
+
+    /// The first transfer on the account's transfer list, in either
+    /// direction, carrying `tx_hash`, or `None` when the list holds none.
+    /// Only the matched row may fail the lookup: every other row (one on
+    /// another chain, or one that does not parse as a [`Transfer`]) is
+    /// skipped, as the direct scan skips it.
+    ///
+    /// # Errors
+    ///
+    /// Returns the transport, API or parse error of the list read, or the
+    /// parse error of the matched row.
+    fn find_transfer_by_tx_hash(
+        &self,
+        tx_hash: &TxHash,
+    ) -> impl Future<Output = Result<Option<Transfer>, AlpacaWalletError>> + Send;
+}
+
+impl WalletTransfers for AlpacaWalletClient {
+    fn get_transfer(
+        &self,
+        transfer_id: &AlpacaTransferId,
+    ) -> impl Future<Output = Result<Transfer, AlpacaWalletError>> + Send {
+        get_transfer_status(self, transfer_id)
+    }
+
+    fn find_transfer_by_tx_hash(
+        &self,
+        tx_hash: &TxHash,
+    ) -> impl Future<Output = Result<Option<Transfer>, AlpacaWalletError>> + Send {
+        find_transfer_by_tx_hash(self, tx_hash)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use alloy_primitives::{address, fixed_bytes};
@@ -1545,5 +1600,26 @@ mod tests {
             .unwrap();
 
         assert_eq!(found.map(|transfer| transfer.id), None);
+    }
+
+    /// Only the matched row is parsed as a full transfer, and a parse failure
+    /// there is an error: answering `None` would claim no such transfer.
+    #[tokio::test]
+    async fn find_transfer_fails_on_an_unparsable_matched_row() {
+        let server = MockServer::start();
+        let mut broken = transfer_list_entry(DEPOSIT_TX, "INCOMING", "COMPLETE");
+        broken["amount"] = json!("not a number");
+        server.mock(|when, then| {
+            when.method(GET)
+                .path(format!("/v1/accounts/{TEST_ACCOUNT_ID}/wallets/transfers"));
+            then.status(200).json_body(json!([broken]));
+        });
+
+        let scanned = find_transfer_by_tx_hash(&test_wallet_client(&server), &DEPOSIT_TX).await;
+
+        assert!(
+            matches!(scanned, Err(AlpacaWalletError::ParseError(_))),
+            "{scanned:?}"
+        );
     }
 }

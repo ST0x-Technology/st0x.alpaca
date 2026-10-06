@@ -23,6 +23,7 @@ pub(crate) use st0x_float_serde::{
     format_float_with_fallback, serialize_float_as_string,
 };
 
+use crate::GatewayHopError;
 use crate::auth::KmsJwtError;
 pub(crate) use crate::core::{Backpressure, Permanence};
 
@@ -58,8 +59,10 @@ pub use lifecycle::{
 };
 pub use market_data::AlpacaMarketDataError;
 pub use order::{
-    AlpacaLimitOrder, AlpacaLimitPrice, ConversionDirection, ConversionOrder, CryptoOrderOutcome,
-    CryptoOrderResponse, ParseAlpacaLimitPriceError,
+    AlpacaLimitOrder, AlpacaLimitPrice, BrokerOrderStatus, CONVERSION_POLL_INTERVAL,
+    ConversionDirection, ConversionOrder, ConversionOrders, CryptoOrderOutcome,
+    CryptoOrderResponse, ParseAlpacaLimitPriceError, convert_usdc_usd_with,
+    poll_conversion_to_terminal_with,
 };
 pub use positions::{AccountFunds, EquityPosition, Inventory};
 pub use precision::{ALPACA_MAX_DECIMAL_PLACES, truncate_to_decimal_places};
@@ -428,6 +431,19 @@ pub enum AlpacaBrokerApiError {
     #[error("Asset {symbol} is not active (status: {status:?})")]
     AssetNotActive { symbol: Symbol, status: AssetStatus },
 
+    /// A symbol that cannot be one Alpaca URL path segment: empty, or a dot
+    /// segment (`.`, `..`) that URL parsing would resolve into another path.
+    /// Raised before any request is sent.
+    #[error("Symbol {:?} cannot be used as an Alpaca URL path segment", .symbol.as_str())]
+    UnsafeSymbol { symbol: Symbol },
+
+    /// The hop to the Alpaca gateway failed or the gateway refused the call
+    /// without relaying an Alpaca answer. Built only by a gateway client;
+    /// backpressure only when the gateway relayed a wait, and as permanent
+    /// as the gateway classified it.
+    #[error(transparent)]
+    Gateway(#[from] GatewayHopError),
+
     #[error("Asset {symbol} is not tradable on Alpaca")]
     AssetNotTradable { symbol: Symbol },
 
@@ -504,11 +520,12 @@ fn format_api_error(
 }
 
 impl AlpacaBrokerApiError {
-    /// Classifies this error as broker rate-limiting (HTTP 429), returning
-    /// its `Retry-After` hint when the broker sent one. Every other variant
-    /// returns `None` -- an exhaustive match so a new variant added later
-    /// forces a conscious decision here rather than silently classifying as
-    /// "not backpressure".
+    /// Classifies this error as rate limiting (a broker HTTP 429, a throttled
+    /// token mint, or a gateway hop that relayed a wait), returning the
+    /// `Retry-After` hint when one was sent. Every other variant returns
+    /// `None`: an exhaustive match so a new variant added later forces a
+    /// conscious decision here rather than silently classifying as "not
+    /// backpressure".
     ///
     /// The bare-429 assumption is not a guess: it is the classification a
     /// real production incident (a `PollOrderStatus` job's persisted
@@ -533,6 +550,10 @@ impl AlpacaBrokerApiError {
             Self::KmsJwt(error) if error.is_rate_limited() => Some(Backpressure {
                 retry_after: error.retry_after(),
             }),
+
+            // The gateway relays a wait (a throttled credential mint behind
+            // it) as the hop's `retry_after`.
+            Self::Gateway(hop) => hop.backpressure(),
 
             Self::ApiError { .. }
             | Self::UsdConversionInsufficientBalance { .. }
@@ -559,6 +580,7 @@ impl AlpacaBrokerApiError {
             | Self::AccountActivitiesPaginationInvariantViolation
             | Self::AccountActivitiesPageLimitExceeded { .. }
             | Self::AssetNotActive { .. }
+            | Self::UnsafeSymbol { .. }
             | Self::AssetNotTradable { .. }
             | Self::InvalidLimitPricePrecision { .. }
             | Self::UsdBalanceConversion(_)
@@ -605,6 +627,7 @@ impl AlpacaBrokerApiError {
             // Basic-auth 401/403; everything else about a mint is
             // network-shaped and retryable.
             Self::KmsJwt(error) if error.is_deterministic() => Permanence::Permanent,
+            Self::Gateway(hop) => hop.permanence(),
             Self::HttpClient(_) | Self::KmsJwt(_) | Self::PositionSymbolMismatch { .. } => {
                 Permanence::Transient
             }
@@ -630,6 +653,7 @@ impl AlpacaBrokerApiError {
             | Self::AccountActivitiesPaginationInvariantViolation
             | Self::AccountActivitiesPageLimitExceeded { .. }
             | Self::AssetNotActive { .. }
+            | Self::UnsafeSymbol { .. }
             | Self::AssetNotTradable { .. }
             | Self::InvalidLimitPricePrecision { .. }
             | Self::UsdBalanceConversion(_)
@@ -653,6 +677,46 @@ impl AlpacaBrokerApiError {
             | Self::ConversionOrderNotFound { .. } => Permanence::Permanent,
 
             Self::LatestTrade(source) | Self::LatestQuote(source) => source.permanence(),
+        }
+    }
+}
+
+/// A failed order placement, with whether the order request may have reached
+/// Alpaca.
+///
+/// The placement methods read the asset and check precision before they send
+/// the order, and after an accepted or duplicate key answer they read the
+/// order back. Only the caller that knows which of those steps failed can
+/// tell "no order exists" from "an order may exist", so the placement reports
+/// it instead of leaving the caller to guess from the final error.
+#[derive(Debug, Error)]
+#[error("{error}")]
+pub struct PlacementError {
+    /// `false` when no order request left this process, or Alpaca answered it
+    /// with a definite rejection (a 4xx other than 408 that is not the
+    /// duplicate key 422). `true` once the order request may have been
+    /// written: the send failed after the request could have gone out, the
+    /// answer was a 5xx or 408, or a read after an accepted or duplicate key
+    /// answer failed.
+    pub written: bool,
+    pub error: AlpacaBrokerApiError,
+}
+
+impl PlacementError {
+    /// A failure before the order request was sent, or a definite rejection
+    /// of it.
+    pub(crate) fn unwritten(error: AlpacaBrokerApiError) -> Self {
+        Self {
+            written: false,
+            error,
+        }
+    }
+
+    /// A failure after the order request may have been written.
+    pub(crate) fn maybe_written(error: AlpacaBrokerApiError) -> Self {
+        Self {
+            written: true,
+            error,
         }
     }
 }
@@ -814,6 +878,65 @@ mod tests {
             AlpacaBrokerApiError::MissingPositionQuantity.permanence(),
             Permanence::Permanent
         );
+    }
+
+    /// A gateway hop failure is as permanent as the gateway classified it:
+    /// no answer, or a call the gateway says may succeed later, is retried;
+    /// an unknown order outcome the gateway says is safe to resend with the
+    /// same client order id is retried like the direct transport's lost
+    /// answer; a definite refusal, or a keyless unknown outcome, is not.
+    #[test]
+    fn gateway_permanence_follows_the_gateway_classification() {
+        let refused = GatewayHopError {
+            retryable: false,
+            ..GatewayHopError::transport("forbidden")
+        };
+        let keyed_unknown = GatewayHopError {
+            outcome_unknown: true,
+            retryable_with_same_key: true,
+            ..refused.clone()
+        };
+        let keyless_unknown = GatewayHopError {
+            outcome_unknown: true,
+            ..refused.clone()
+        };
+
+        for (hop, expected) in [
+            (
+                GatewayHopError::transport("no answer"),
+                Permanence::Transient,
+            ),
+            (keyed_unknown, Permanence::Transient),
+            (refused, Permanence::Permanent),
+            (keyless_unknown, Permanence::Permanent),
+        ] {
+            let error = AlpacaBrokerApiError::Gateway(hop.clone());
+            assert_eq!(error.permanence(), expected, "{hop:?}");
+            assert_eq!(error.backpressure(), None, "{hop:?}");
+        }
+    }
+
+    /// A wait the gateway relays (a throttled credential mint behind it) is
+    /// backpressure with that wait, whatever the hop's permanence, so a
+    /// caller holds off as it would on Alpaca's own `Retry-After`.
+    #[test]
+    fn a_gateway_hop_that_relays_a_wait_is_backpressure() {
+        let wait = Duration::from_secs(11);
+
+        for retryable in [true, false] {
+            let error = AlpacaBrokerApiError::Gateway(GatewayHopError {
+                retryable,
+                retry_after: Some(wait),
+                ..GatewayHopError::transport("credential mint throttled")
+            });
+            assert_eq!(
+                error.backpressure(),
+                Some(Backpressure {
+                    retry_after: Some(wait)
+                }),
+                "{error:?}"
+            );
+        }
     }
 
     /// The real wrapping shape of a market-data failure: classification must

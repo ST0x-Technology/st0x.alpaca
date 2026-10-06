@@ -12,7 +12,7 @@ use st0x_alpaca_gateway_api::dto::orders::{
 };
 use st0x_alpaca_gateway_api::{Operation, Tier};
 
-use crate::answer::{Failure, Sent, broker};
+use crate::answer::{Failure, Sent, broker, placement};
 use crate::extract::{Body, Params};
 use crate::state::{AppState, Call, Done, Intent};
 
@@ -49,6 +49,19 @@ fn require_key_form(tier: Tier, key: &ClientOrderId) -> Result<(), Failure> {
     }
 }
 
+/// Refuses a human key on a bot lookup: the bot adopts the order it finds
+/// under a key as its own, so it may only look up the bare UUID keys it
+/// places with. Humans may look up any key.
+fn require_bot_lookup_key(tier: Tier, key: &ClientOrderId) -> Result<(), Failure> {
+    match (tier, key) {
+        (Tier::Bot, ClientOrderId::Cli(_)) => Err(Failure::invalid(format!(
+            "client order id {key} belongs to a human order; the bot may only look up bare UUID \
+             keys"
+        ))),
+        _ => Ok(()),
+    }
+}
+
 async fn place_market(
     State(state): State<AppState>,
     call: Call,
@@ -65,13 +78,13 @@ async fn place_market(
     state
         .mutate(call, intent, async move {
             require_key_form(tier, &request.client_order_id)?;
-            let placement = work_state
+            let placed = work_state
                 .broker
-                .place_market_order(request.into())
+                .place_market_order_reporting(request.into())
                 .await
-                .map_err(|error| broker(&error, Sent::Mutation))?;
-            let order_id = placement.order_id.clone();
-            Ok(Done::new(PlacementResponse::from(placement), &order_id))
+                .map_err(|failure| placement(&failure))?;
+            let order_id = placed.order_id.clone();
+            Ok(Done::new(PlacementResponse::from(placed), &order_id))
         })
         .await
 }
@@ -93,13 +106,13 @@ async fn place_limit(
     state
         .mutate(call, intent, async move {
             require_key_form(tier, &request.client_order_id)?;
-            let placement = work_state
+            let placed = work_state
                 .broker
-                .place_limit_order(request.into())
+                .place_limit_order_reporting(request.into())
                 .await
-                .map_err(|error| broker(&error, Sent::Mutation))?;
-            let order_id = placement.order_id.clone();
-            Ok(Done::new(PlacementResponse::from(placement), &order_id))
+                .map_err(|failure| placement(&failure))?;
+            let order_id = placed.order_id.clone();
+            Ok(Done::new(PlacementResponse::from(placed), &order_id))
         })
         .await
 }
@@ -121,15 +134,16 @@ async fn place_exact_limit(
     state
         .mutate(call, intent, async move {
             require_key_form(tier, &request.client_order_id)?;
-            let order = AlpacaLimitOrder::try_from(request)
-                .map_err(|error| broker(&error, Sent::Mutation))?;
-            let placement = work_state
+            // Nothing is sent when the limit price does not convert.
+            let order =
+                AlpacaLimitOrder::try_from(request).map_err(|error| broker(&error, Sent::Read))?;
+            let placed = work_state
                 .broker
-                .place_alpaca_limit_order(order)
+                .place_alpaca_limit_order_reporting(order)
                 .await
-                .map_err(|error| broker(&error, Sent::Mutation))?;
-            let order_id = placement.order_id.clone();
-            Ok(Done::new(PlacementResponse::from(placement), &order_id))
+                .map_err(|failure| placement(&failure))?;
+            let order_id = placed.order_id.clone();
+            Ok(Done::new(PlacementResponse::from(placed), &order_id))
         })
         .await
 }
@@ -139,8 +153,9 @@ async fn order(
     call: Call,
     Params(path): Params<OrderIdPath>,
 ) -> Response {
+    let intent = Intent::default().key(&path.order_id);
     state
-        .read(call, async {
+        .read(call, intent, async {
             state
                 .broker
                 .get_order_status(&path.order_id.to_string())
@@ -156,8 +171,11 @@ async fn find_order(
     call: Call,
     Params(path): Params<ClientOrderIdPath>,
 ) -> Response {
+    let tier = call.principal.tier;
+    let intent = Intent::default().key(&path.client_order_id);
     state
-        .read(call, async {
+        .read(call, intent, async {
+            require_bot_lookup_key(tier, &path.client_order_id)?;
             state
                 .broker
                 .get_order_by_client_order_id(&path.client_order_id)
@@ -175,8 +193,11 @@ async fn recover_order(
     call: Call,
     Body(request): Body<RecoverOrderRequest>,
 ) -> Response {
+    let tier = call.principal.tier;
+    let intent = Intent::default().key(&request.client_order_id);
     state
-        .read(call, async {
+        .read(call, intent, async {
+            require_bot_lookup_key(tier, &request.client_order_id)?;
             state
                 .broker
                 .recover_order_by_client_id(&request.into())
@@ -257,8 +278,9 @@ async fn conversion(
     call: Call,
     Params(path): Params<OrderIdPath>,
 ) -> Response {
+    let intent = Intent::default().key(&path.order_id);
     state
-        .read(call, async {
+        .read(call, intent, async {
             state
                 .broker
                 .get_conversion_order(path.order_id)
@@ -274,8 +296,11 @@ async fn find_conversion(
     call: Call,
     Params(path): Params<ClientOrderIdPath>,
 ) -> Response {
+    let tier = call.principal.tier;
+    let intent = Intent::default().key(&path.client_order_id);
     state
-        .read(call, async {
+        .read(call, intent, async {
+            require_bot_lookup_key(tier, &path.client_order_id)?;
             state
                 .broker
                 .find_conversion_order(&path.client_order_id)

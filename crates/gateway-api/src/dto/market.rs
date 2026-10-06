@@ -3,8 +3,8 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use st0x_alpaca::broker::{
-    AssetDetails, AssetStatus, IndicativeQuote, LatestQuote, MarketSession, MarketSessionStatus,
-    PostCloseGap, PreparedShares,
+    AssetDetails, AssetStatus, IndicativeQuote, LatestQuote, LatestQuoteError, MarketSession,
+    MarketSessionStatus, PostCloseGap, PreparedShares,
 };
 use st0x_alpaca::st0x_finance::{FractionalShares, Positive, Usd};
 
@@ -113,6 +113,16 @@ impl From<LatestQuote> for QuoteResponse {
     }
 }
 
+impl TryFrom<QuoteResponse> for LatestQuote {
+    type Error = LatestQuoteError;
+
+    /// Revalidates the quote as the direct path does: a crossed quote is
+    /// refused.
+    fn try_from(quote: QuoteResponse) -> Result<Self, Self::Error> {
+        Self::new(quote.bid, quote.ask)
+    }
+}
+
 /// `market.latest_overnight_quote`: indicative, with its broker timestamp.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -129,6 +139,19 @@ impl From<IndicativeQuote> for OvernightQuoteResponse {
             ask: quote.quote.ask(),
             at: quote.at,
         }
+    }
+}
+
+impl TryFrom<OvernightQuoteResponse> for IndicativeQuote {
+    type Error = LatestQuoteError;
+
+    /// Revalidates the quote as the direct path does: a crossed quote is
+    /// refused.
+    fn try_from(quote: OvernightQuoteResponse) -> Result<Self, Self::Error> {
+        Ok(Self {
+            quote: LatestQuote::new(quote.bid, quote.ask)?,
+            at: quote.at,
+        })
     }
 }
 
@@ -149,6 +172,15 @@ impl From<AssetStatus> for AssetState {
     }
 }
 
+impl From<AssetState> for AssetStatus {
+    fn from(state: AssetState) -> Self {
+        match state {
+            AssetState::Active => Self::Active,
+            AssetState::Inactive => Self::Inactive,
+        }
+    }
+}
+
 /// `assets.get`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -163,6 +195,19 @@ pub struct AssetResponse {
 
 impl From<AssetDetails> for AssetResponse {
     fn from(asset: AssetDetails) -> Self {
+        Self {
+            status: asset.status.into(),
+            tradable: asset.tradable,
+            fractionable: asset.fractionable,
+            fractional_eh_enabled: asset.fractional_eh_enabled,
+            overnight_tradable: asset.overnight_tradable,
+            overnight_halted: asset.overnight_halted,
+        }
+    }
+}
+
+impl From<AssetResponse> for AssetDetails {
+    fn from(asset: AssetResponse) -> Self {
         Self {
             status: asset.status.into(),
             tradable: asset.tradable,
@@ -199,5 +244,105 @@ impl From<PreparedShares> for CounterTradeSharesResponse {
             fractional_orders_supported: prepared.fractional_orders_supported,
             quantity_decimals: prepared.quantity_decimals,
         }
+    }
+}
+
+impl From<CounterTradeSharesResponse> for PreparedShares {
+    fn from(prepared: CounterTradeSharesResponse) -> Self {
+        Self {
+            shares: prepared.shares,
+            fractional_orders_supported: prepared.fractional_orders_supported,
+            quantity_decimals: prepared.quantity_decimals,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::super::through_wire;
+    use super::*;
+
+    #[test]
+    fn a_crossed_quote_is_refused_as_the_direct_path_refuses_it() {
+        let crossed: QuoteResponse =
+            serde_json::from_value(json!({ "bid": "101", "ask": "100" })).unwrap();
+        assert!(matches!(
+            LatestQuote::try_from(crossed),
+            Err(LatestQuoteError::Crossed { .. })
+        ));
+
+        let overnight: OvernightQuoteResponse = serde_json::from_value(
+            json!({ "bid": "101", "ask": "100", "at": "2026-10-06T02:00:00Z" }),
+        )
+        .unwrap();
+        assert!(matches!(
+            IndicativeQuote::try_from(overnight),
+            Err(LatestQuoteError::Crossed { .. })
+        ));
+    }
+
+    #[test]
+    fn quotes_come_back_from_the_wire_unchanged() {
+        let quote: QuoteResponse =
+            serde_json::from_value(json!({ "bid": "100.01", "ask": "100.02" })).unwrap();
+        let latest = LatestQuote::try_from(through_wire(&quote)).unwrap();
+        assert_eq!(QuoteResponse::from(latest), quote);
+
+        let overnight: OvernightQuoteResponse = serde_json::from_value(
+            json!({ "bid": "100", "ask": "100", "at": "2026-10-06T02:00:00Z" }),
+        )
+        .unwrap();
+        let indicative = IndicativeQuote::try_from(through_wire(&overnight)).unwrap();
+        assert_eq!(OvernightQuoteResponse::from(indicative), overnight);
+    }
+
+    #[test]
+    fn session_status_and_prepared_shares_come_back_unchanged() {
+        for gap in [
+            "ordinary_overnight",
+            "multi_day_closure",
+            "unknown",
+            "unavailable",
+        ] {
+            let status: SessionStatusResponse = serde_json::from_value(json!({
+                "session": "Extended",
+                "sessionOpensAt": "2026-10-06T08:00:00Z",
+                "regularSessionClosesAt": "2026-10-06T20:00:00Z",
+                "extendedSessionClosesAt": null,
+                "postCloseGap": gap
+            }))
+            .unwrap();
+            let relayed = MarketSessionStatus::from(through_wire(&status));
+            assert_eq!(SessionStatusResponse::from(relayed), status);
+        }
+
+        for shares in [json!("1.5"), json!(null)] {
+            let prepared: CounterTradeSharesResponse = serde_json::from_value(json!({
+                "shares": shares,
+                "fractionalOrdersSupported": false,
+                "quantityDecimals": 0
+            }))
+            .unwrap();
+            let relayed = PreparedShares::from(through_wire(&prepared));
+            assert_eq!(CounterTradeSharesResponse::from(relayed), prepared);
+        }
+    }
+
+    #[test]
+    fn asset_details_come_back_unchanged() {
+        let asset: AssetResponse = serde_json::from_value(json!({
+            "status": "inactive",
+            "tradable": true,
+            "fractionable": false,
+            "fractionalEhEnabled": true,
+            "overnightTradable": null,
+            "overnightHalted": false
+        }))
+        .unwrap();
+        let relayed = AssetDetails::from(through_wire(&asset));
+        assert_eq!(relayed.status, AssetStatus::Inactive);
+        assert_eq!(AssetResponse::from(relayed), asset);
     }
 }

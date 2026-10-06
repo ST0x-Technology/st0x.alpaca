@@ -10,7 +10,7 @@ use axum::Json;
 use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use st0x_alpaca::Permanence;
-use st0x_alpaca::broker::AlpacaBrokerApiError;
+use st0x_alpaca::broker::{AlpacaBrokerApiError, AlpacaMarketDataError, PlacementError};
 use st0x_alpaca::tokenization::AlpacaTokenizationError;
 use st0x_alpaca::wallet::AlpacaWalletError;
 use st0x_alpaca_gateway_api::{
@@ -28,6 +28,11 @@ pub struct Failure {
     pub retry_after: Option<Duration>,
     pub reason: Option<RejectionReason>,
     pub alpaca_status: Option<u16>,
+    /// The network Alpaca reported, set with `wrong_network`.
+    pub network: Option<String>,
+    /// The Alpaca objects the answer names: those a failed mutation already
+    /// changed, or the tokenization request a network refusal is about.
+    pub alpaca_object_ids: Vec<String>,
     pub message: String,
     pub request_id: Uuid,
 }
@@ -49,6 +54,8 @@ impl Failure {
             retry_after: None,
             reason: None,
             alpaca_status: None,
+            network: None,
+            alpaca_object_ids: Vec::new(),
             message: message.into(),
             request_id: Uuid::new_v4(),
         }
@@ -111,9 +118,11 @@ impl Failure {
             outcome: self.outcome,
             retryable: self.retryable,
             retryable_with_same_key: self.retryable_with_same_key,
-            retry_after_secs: self.retry_after.map(|after| after.as_secs().max(1)),
+            retry_after_secs: self.retry_after.map(whole_seconds),
             reason: self.reason,
             alpaca_status: self.alpaca_status,
+            network: self.network.clone(),
+            alpaca_object_ids: self.alpaca_object_ids.clone(),
             request_id: self.request_id,
             message: self.message.clone(),
         }
@@ -129,7 +138,7 @@ impl IntoResponse for Failure {
             response.headers_mut().insert(REQUEST_ID_HEADER, value);
         }
         if let Some(after) = self.retry_after
-            && let Ok(value) = HeaderValue::from_str(&after.as_secs().max(1).to_string())
+            && let Ok(value) = HeaderValue::from_str(&whole_seconds(after).to_string())
         {
             response
                 .headers_mut()
@@ -137,6 +146,15 @@ impl IntoResponse for Failure {
         }
         response
     }
+}
+
+/// A hold in the whole seconds `retryAfterSecs` and `Retry-After` carry,
+/// rounded up and at least one, so a caller that waits the advertised time
+/// never retries before the hold ends.
+fn whole_seconds(hold: Duration) -> u64 {
+    hold.as_secs()
+        .saturating_add(u64::from(hold.subsec_nanos() > 0))
+        .max(1)
 }
 
 /// Whether the failed call was a read or a mutation that may have been
@@ -159,19 +177,45 @@ fn untyped(sent: Sent, permanence: Permanence, message: String) -> Failure {
     }
 }
 
-fn api_rejection(status: reqwest::StatusCode, message: String) -> Option<Failure> {
+/// The answer for an Alpaca error status: a definite 4xx is `rejected`, a
+/// 408 or 5xx is [`untyped`]. Either keeps the status Alpaca answered.
+fn api_failure(
+    status: reqwest::StatusCode,
+    sent: Sent,
+    permanence: Permanence,
+    message: String,
+) -> Failure {
     let code = status.as_u16();
-    (status.is_client_error() && code != 408 && code != 429).then(|| Failure {
+    let failure = if status.is_client_error() && code != 408 && code != 429 {
+        Failure::rejected(RejectionReason::AlpacaApi, message)
+    } else {
+        untyped(sent, permanence, message)
+    };
+    Failure {
         alpaca_status: Some(code),
-        ..Failure::rejected(RejectionReason::AlpacaApi, message)
-    })
+        ..failure
+    }
 }
 
-fn backpressure(retry_after: Option<Duration>, message: String) -> Failure {
+/// The answer for a throttled call. Only a 429 Alpaca answered is
+/// `backpressure`; a throttled credential mint (KMS or the token endpoint)
+/// stopped before the request was sent, so it is `unavailable`, still
+/// carrying the wait.
+fn throttled(
+    retry_after: Option<Duration>,
+    alpaca_status: Option<reqwest::StatusCode>,
+    message: String,
+) -> Failure {
+    let failure = match alpaca_status {
+        Some(status) => Failure {
+            alpaca_status: Some(status.as_u16()),
+            ..Failure::new(ErrorCode::Backpressure, message)
+        },
+        None => Failure::new(ErrorCode::Unavailable, message),
+    };
     Failure {
         retry_after,
-        alpaca_status: Some(429),
-        ..Failure::new(ErrorCode::Backpressure, message)
+        ..failure
     }
 }
 
@@ -181,8 +225,15 @@ pub fn broker(error: &AlpacaBrokerApiError, sent: Sent) -> Failure {
     use AlpacaBrokerApiError as E;
 
     let message = error.to_string();
+    if let E::LatestTrade(source) | E::LatestQuote(source) = error {
+        return market_data(source, sent, error.permanence(), message);
+    }
     if let Some(pressure) = error.backpressure() {
-        return backpressure(pressure.retry_after, message);
+        let status = match error {
+            E::ApiError { status, .. } => Some(*status),
+            _ => None,
+        };
+        return throttled(pressure.retry_after, status, message);
     }
 
     match error {
@@ -200,15 +251,70 @@ pub fn broker(error: &AlpacaBrokerApiError, sent: Sent) -> Failure {
         | E::UsdcPrecisionExceeded { .. }
         | E::NotPositive(_)
         | E::NotPositiveLimitPrice(_)
+        | E::UnsafeSymbol { .. }
         | E::InvalidOrderId(_) => Failure::invalid(message),
+        E::AccountActivitiesPageLimitExceeded { pages } => Failure::invalid(format!(
+            "more than {pages} pages of account activities match; narrow the after and until \
+             window"
+        )),
+        // The request never left: no credential, no endpoint, no connection.
         E::KmsJwt(_) | E::InvalidEndpoint(_) | E::InvalidHeader(_) => {
             Failure::new(ErrorCode::Unavailable, message)
         }
-        E::ApiError {
-            status, message: _, ..
-        } => api_rejection(*status, message.clone())
-            .unwrap_or_else(|| untyped(sent, error.permanence(), message)),
+        E::HttpClient(source) if source.is_connect() => {
+            Failure::new(ErrorCode::Unavailable, message)
+        }
+        E::ApiError { status, .. } => api_failure(*status, sent, error.permanence(), message),
         _ => untyped(sent, error.permanence(), message),
+    }
+}
+
+/// Maps the market data failure inside `LatestTrade` or `LatestQuote`: an
+/// Alpaca status goes with the answer as it does for a broker `ApiError`, so
+/// a definite 4xx (a delisted symbol, a missing entitlement) is `rejected`.
+fn market_data(
+    error: &AlpacaMarketDataError,
+    sent: Sent,
+    permanence: Permanence,
+    message: String,
+) -> Failure {
+    use AlpacaMarketDataError as E;
+
+    let status = match error {
+        E::ApiError { status, .. } | E::Entitlement { status, .. } => Some(*status),
+        _ => None,
+    };
+    if let Some(pressure) = error.backpressure() {
+        return throttled(pressure.retry_after, status, message);
+    }
+
+    match error {
+        E::Auth(_) => Failure::new(ErrorCode::Unavailable, message),
+        E::Http(source) if source.is_connect() => Failure::new(ErrorCode::Unavailable, message),
+        _ => match status {
+            Some(status) => api_failure(status, sent, permanence, message),
+            None => untyped(sent, permanence, message),
+        },
+    }
+}
+
+/// Maps an order placement failure by whether the order request may have
+/// been written. Once it may have, every failure is `outcome_unknown`,
+/// whatever a later read answered, since an order may exist. Before that,
+/// and on a definite rejection of the request, it maps as a read: nothing
+/// was applied.
+#[must_use]
+pub fn placement(failure: &PlacementError) -> Failure {
+    if !failure.written {
+        return broker(&failure.error, Sent::Read);
+    }
+    let alpaca_status = match &failure.error {
+        AlpacaBrokerApiError::ApiError { status, .. } => Some(status.as_u16()),
+        _ => None,
+    };
+    Failure {
+        alpaca_status,
+        ..Failure::new(ErrorCode::OutcomeUnknown, failure.error.to_string())
     }
 }
 
@@ -219,20 +325,25 @@ pub fn wallet(error: &AlpacaWalletError, sent: Sent) -> Failure {
 
     let message = error.to_string();
     if let Some(pressure) = error.backpressure() {
-        return backpressure(pressure.retry_after, message);
+        let status = match error {
+            E::ApiError { status, .. } => Some(*status),
+            _ => None,
+        };
+        return throttled(pressure.retry_after, status, message);
     }
 
     match error {
         E::AddressNotWhitelisted { .. } | E::NoWhitelistEntries { .. } => {
             Failure::rejected(RejectionReason::AddressNotWhitelisted, message)
         }
+        // The request never left: no credential, no endpoint, no connection.
         E::Auth(_) | E::InvalidBaseUrl(_) => Failure::new(ErrorCode::Unavailable, message),
+        E::Reqwest(source) if source.is_connect() => Failure::new(ErrorCode::Unavailable, message),
         E::TransferNotFound { .. } => Failure {
             alpaca_status: Some(404),
-            ..Failure::rejected(RejectionReason::AlpacaApi, message)
+            ..Failure::rejected(RejectionReason::RequestNotFound, message)
         },
-        E::ApiError { status, .. } => api_rejection(*status, message.clone())
-            .unwrap_or_else(|| untyped(sent, Permanence::Transient, message)),
+        E::ApiError { status, .. } => api_failure(*status, sent, Permanence::Transient, message),
         _ => untyped(sent, Permanence::Transient, message),
     }
 }
@@ -244,7 +355,11 @@ pub fn tokenization(error: &AlpacaTokenizationError, sent: Sent) -> Failure {
 
     let message = error.to_string();
     if let Some(pressure) = error.backpressure() {
-        return backpressure(pressure.retry_after, message);
+        let status = match error {
+            E::ApiError { status, .. } => Some(*status),
+            _ => None,
+        };
+        return throttled(pressure.retry_after, status, message);
     }
 
     if error.is_definitive_mint_rejection() {
@@ -260,20 +375,151 @@ pub fn tokenization(error: &AlpacaTokenizationError, sent: Sent) -> Failure {
     }
 
     match error {
+        // The request never left: no credential, no endpoint, no connection.
         E::Auth(_) | E::InvalidBaseUrl(_) | E::PrivateKeyJwtUnsupported => {
             Failure::new(ErrorCode::Unavailable, message)
         }
-        E::RequestNotFound { .. } => Failure {
-            alpaca_status: Some(404),
-            ..Failure::rejected(RejectionReason::AlpacaApi, message)
-        },
-        // Asking again returns the same answer; on a mint the request was
-        // already written, so it stays `outcome_unknown`.
-        E::WrongNetwork { .. }
-        | E::NetworkMissing { .. }
-        | E::DuplicateMintIssuerRequestId { .. } => untyped(sent, Permanence::Permanent, message),
-        E::ApiError { status, .. } => api_rejection(*status, message.clone())
-            .unwrap_or_else(|| untyped(sent, Permanence::Transient, message)),
+        E::Reqwest(source) if source.is_connect() => Failure::new(ErrorCode::Unavailable, message),
+        // Raised after scanning a list Alpaca answered with 200, so no
+        // Alpaca status goes with it.
+        E::RequestNotFound { .. } => Failure::rejected(RejectionReason::RequestNotFound, message),
+        // Asking again returns the same answer.
+        E::WrongNetwork { id, actual, .. } => network_refusal(
+            sent,
+            RejectionReason::WrongNetwork,
+            Some(actual.to_string()),
+            id.to_string(),
+            message,
+        ),
+        E::NetworkMissing { id } => network_refusal(
+            sent,
+            RejectionReason::NetworkMissing,
+            None,
+            id.to_string(),
+            message,
+        ),
+        E::DuplicateMintIssuerRequestId { .. } => untyped(sent, Permanence::Permanent, message),
+        E::ApiError { status, .. } => api_failure(*status, sent, Permanence::Transient, message),
         _ => untyped(sent, Permanence::Transient, message),
+    }
+}
+
+/// A request Alpaca reported off the bound network, named by its id. A read
+/// is a definite rejection carrying the network Alpaca reported; on a mint
+/// the request was already written, so it stays `outcome_unknown`.
+fn network_refusal(
+    sent: Sent,
+    reason: RejectionReason,
+    network: Option<String>,
+    request_id: String,
+    message: String,
+) -> Failure {
+    let failure = match sent {
+        Sent::Read => Failure {
+            network,
+            ..Failure::rejected(reason, message)
+        },
+        Sent::Mutation => untyped(sent, Permanence::Permanent, message),
+    };
+    Failure {
+        alpaca_object_ids: vec![request_id],
+        ..failure
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use st0x_alpaca::KmsJwtError;
+
+    use super::*;
+
+    fn kms_throttled() -> KmsJwtError {
+        KmsJwtError::KmsStatus {
+            status: 429,
+            body: "signing quota exceeded".to_string(),
+            retry_after: Some(Duration::from_secs(30)),
+        }
+    }
+
+    /// A reqwest error from a port nothing listens on.
+    async fn connect_error() -> reqwest::Error {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let error = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .post(format!("http://{address}"))
+            .send()
+            .await
+            .unwrap_err();
+        assert!(error.is_connect(), "{error}");
+        error
+    }
+
+    #[test]
+    fn a_throttled_credential_mint_is_unavailable_without_an_alpaca_status() {
+        let failures = [
+            broker(
+                &AlpacaBrokerApiError::KmsJwt(kms_throttled()),
+                Sent::Mutation,
+            ),
+            broker(
+                &AlpacaBrokerApiError::LatestQuote(Box::new(AlpacaMarketDataError::Auth(
+                    kms_throttled(),
+                ))),
+                Sent::Read,
+            ),
+            wallet(&AlpacaWalletError::Auth(kms_throttled()), Sent::Mutation),
+            tokenization(
+                &AlpacaTokenizationError::Auth(kms_throttled()),
+                Sent::Mutation,
+            ),
+        ];
+
+        for failure in failures {
+            assert_eq!(failure.code, ErrorCode::Unavailable, "{failure:?}");
+            assert_eq!(failure.alpaca_status, None, "{failure:?}");
+            assert_eq!(
+                failure.retry_after,
+                Some(Duration::from_secs(30)),
+                "{failure:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_keyless_mutation_that_could_not_connect_was_not_applied() {
+        let withdrawal = wallet(
+            &AlpacaWalletError::Reqwest(connect_error().await),
+            Sent::Mutation,
+        )
+        .for_mutation(Operation::WalletWithdraw);
+        let mint = tokenization(
+            &AlpacaTokenizationError::Reqwest(connect_error().await),
+            Sent::Mutation,
+        )
+        .for_mutation(Operation::TokenizationMint);
+
+        for failure in [withdrawal, mint] {
+            assert_eq!(failure.code, ErrorCode::Unavailable, "{failure:?}");
+            assert_eq!(failure.outcome, Some(Outcome::NotApplied), "{failure:?}");
+        }
+    }
+
+    #[test]
+    fn a_fractional_hold_is_advertised_rounded_up() {
+        let failure = Failure {
+            retry_after: Some(Duration::from_millis(2100)),
+            ..Failure::new(ErrorCode::Backpressure, "human request budget spent")
+        };
+
+        assert_eq!(failure.body().retry_after_secs, Some(3));
+        let response = failure.into_response();
+        assert_eq!(
+            response.headers().get(axum::http::header::RETRY_AFTER),
+            Some(&HeaderValue::from_static("3"))
+        );
     }
 }

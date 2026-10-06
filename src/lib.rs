@@ -29,9 +29,11 @@
 mod auth;
 pub mod core;
 #[cfg(any(feature = "issuer", feature = "broker", feature = "corporate-actions"))]
-mod endpoint;
+pub mod endpoint;
 #[cfg(any(feature = "issuer", feature = "broker", feature = "corporate-actions"))]
 mod rate_limit;
+#[cfg(any(feature = "issuer", feature = "broker", feature = "corporate-actions"))]
+pub mod request_id;
 
 #[cfg(feature = "broker")]
 pub mod broker;
@@ -48,7 +50,7 @@ pub mod wallet;
 
 #[cfg(any(feature = "issuer", feature = "broker", feature = "corporate-actions"))]
 pub use auth::{ALPACA_SANDBOX_TOKEN_URL, ALPACA_TOKEN_URL, KmsJwtError};
-pub use core::{AlpacaAuth, Backpressure, Permanence};
+pub use core::{AlpacaAuth, Backpressure, GatewayHopError, Permanence};
 #[cfg(feature = "issuer")]
 pub use core::{AlpacaClient, AlpacaError};
 #[cfg(any(feature = "issuer", feature = "broker", feature = "corporate-actions"))]

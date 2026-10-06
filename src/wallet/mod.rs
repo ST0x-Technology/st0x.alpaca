@@ -19,7 +19,8 @@
 //! Transfers progress through states:
 //! Pending -> Processing -> Complete/Failed.
 //! Use `poll_transfer_until_complete()` to wait for a
-//! transfer to reach a terminal state.
+//! transfer to reach a terminal state, or
+//! [`poll_transfer_until_complete_with`] to poll any [`WalletTransfers`].
 
 mod asset;
 mod client;
@@ -40,10 +41,13 @@ pub use client::AlpacaWalletClient;
 #[cfg(not(any(test, feature = "test-support")))]
 use client::AlpacaWalletClient;
 pub use client::AlpacaWalletError;
-pub use status::PollingConfig;
+pub use status::{
+    PollingConfig, poll_deposit_by_tx_hash_with, poll_transfer_tx_hash_with,
+    poll_transfer_until_complete_with,
+};
 pub use transfer::{
     AlpacaTransferId, Network, ReportedFeesError, TokenSymbol, Transfer, TransferDirection,
-    TransferStatus, TransferWithFees,
+    TransferStatus, TransferWithFees, WalletTransfers,
 };
 pub use whitelist::{TravelRuleInfo, WhitelistEntry, WhitelistStatus};
 
@@ -86,7 +90,9 @@ impl AlpacaWalletService {
         }
     }
 
-    /// Initiates a withdrawal to a whitelisted address.
+    /// Initiates a withdrawal to a whitelisted address: the whitelist check
+    /// of [`check_withdrawal_whitelist`](Self::check_withdrawal_whitelist),
+    /// then the POST of [`submit_withdrawal`](Self::submit_withdrawal).
     ///
     /// The address must be whitelisted and approved before this call.
     ///
@@ -101,24 +107,58 @@ impl AlpacaWalletService {
         asset: &TokenSymbol,
         to_address: &Address,
     ) -> Result<Transfer, AlpacaWalletError> {
+        self.check_withdrawal_whitelist(asset, to_address).await?;
+        self.submit_withdrawal(amount, asset, to_address).await
+    }
+
+    /// Reads the whitelist once and checks that `to_address` holds an
+    /// approved entry for `asset`. Sends nothing that moves funds, so a
+    /// failure here means no withdrawal was requested.
+    ///
+    /// # Errors
+    ///
+    /// `AddressNotWhitelisted` when no approved entry matches, or the error
+    /// of the whitelist read.
+    pub async fn check_withdrawal_whitelist(
+        &self,
+        asset: &TokenSymbol,
+        to_address: &Address,
+    ) -> Result<(), AlpacaWalletError> {
         let network = Network::new("ethereum");
 
-        if !self
+        if self
             .client
             .is_address_whitelisted_and_approved(to_address, asset, &network)
             .await?
         {
-            return Err(AlpacaWalletError::AddressNotWhitelisted {
+            Ok(())
+        } else {
+            Err(AlpacaWalletError::AddressNotWhitelisted {
                 address: *to_address,
                 asset: asset.clone(),
                 network,
-            });
+            })
         }
+    }
 
+    /// Sends the withdrawal POST alone, without reading the whitelist first.
+    /// Alpaca does not deduplicate withdrawals, so a failure without a
+    /// definite 4xx answer may have left a withdrawal behind.
+    ///
+    /// # Errors
+    ///
+    /// Returns the HTTP or parse error.
+    pub async fn submit_withdrawal(
+        &self,
+        amount: Positive<Usdc>,
+        asset: &TokenSymbol,
+        to_address: &Address,
+    ) -> Result<Transfer, AlpacaWalletError> {
         transfer::initiate_withdrawal(&self.client, amount, asset, to_address).await
     }
 
     /// Polls a transfer until it reaches a terminal state (Complete or Failed).
+    /// See [`poll_transfer_until_complete_with`].
     ///
     /// This method will retry transient errors and timeout after the configured duration.
     ///
@@ -132,29 +172,20 @@ impl AlpacaWalletService {
         &self,
         transfer_id: &AlpacaTransferId,
     ) -> Result<Transfer, AlpacaWalletError> {
-        status::poll_transfer_status(&self.client, transfer_id, &self.polling_config).await
+        poll_transfer_until_complete_with(&*self.client, transfer_id, &self.polling_config).await
     }
 
-    /// Polls a transfer until it is `Complete` and Alpaca reports its
-    /// on-chain tx hash. A hash on a transfer that is not yet `Complete` is
-    /// ignored.
+    /// Polls a transfer until it is `Complete` and Alpaca reports its onchain
+    /// tx hash. See [`poll_transfer_tx_hash_with`].
     ///
     /// # Errors
     ///
-    /// - `TransferTimeout` if no completed hash is reported within the polling
-    ///   timeout. Transient read failures (5xx, 408, 429, transport errors,
-    ///   non-deterministic auth errors) are retried until then, honoring
-    ///   `Retry-After`.
-    /// - `TransferFailed` or `FailedTransferHasTx` as soon as the transfer is
-    ///   `Failed`.
-    /// - Permanent read errors, returned without retry: `TransferNotFound`,
-    ///   other non-retryable HTTP statuses, deterministic auth errors, and
-    ///   response decoding errors.
+    /// As [`poll_transfer_tx_hash_with`].
     pub async fn poll_transfer_tx_hash(
         &self,
         transfer_id: &AlpacaTransferId,
     ) -> Result<TxHash, AlpacaWalletError> {
-        status::poll_transfer_tx_hash(&self.client, transfer_id, &self.polling_config).await
+        poll_transfer_tx_hash_with(&*self.client, transfer_id, &self.polling_config).await
     }
 
     /// Reads a transfer's current state once, with no polling.
@@ -169,7 +200,8 @@ impl AlpacaWalletService {
         transfer::get_transfer_with_fees(&self.client, transfer_id).await
     }
 
-    /// Polls for an incoming deposit by its on-chain transaction hash.
+    /// Polls for an incoming deposit by its onchain transaction hash. See
+    /// [`poll_deposit_by_tx_hash_with`].
     ///
     /// Alpaca auto-detects incoming transfers to their funding wallet addresses.
     /// This method polls until the deposit is detected and reaches a terminal state.
@@ -183,7 +215,7 @@ impl AlpacaWalletService {
         &self,
         tx_hash: &TxHash,
     ) -> Result<Transfer, AlpacaWalletError> {
-        status::poll_deposit_by_tx_hash(&self.client, tx_hash, &self.polling_config).await
+        poll_deposit_by_tx_hash_with(&*self.client, tx_hash, &self.polling_config).await
     }
 
     /// Finds an incoming deposit by its on-chain transaction hash with a
@@ -234,10 +266,39 @@ impl AlpacaWalletService {
             .await
     }
 
-    /// Removes all whitelist entries matching the given address.
+    /// Deletes one whitelist entry by its Alpaca id.
+    ///
+    /// # Errors
+    ///
+    /// Returns the HTTP error.
+    pub async fn delete_whitelist_entry(
+        &self,
+        whitelist_id: &str,
+    ) -> Result<(), AlpacaWalletError> {
+        self.client.delete_whitelist_entry(whitelist_id).await
+    }
+
+    /// Sets the Travel Rule info of one whitelist entry by its Alpaca id.
+    ///
+    /// # Errors
+    ///
+    /// Returns the HTTP error.
+    pub async fn patch_whitelist_travel_rule(
+        &self,
+        whitelist_id: &str,
+        travel_rule_info: &TravelRuleInfo,
+    ) -> Result<(), AlpacaWalletError> {
+        self.client
+            .patch_whitelist_travel_rule(whitelist_id, travel_rule_info)
+            .await
+    }
+
+    /// Removes all whitelist entries matching the given address, one
+    /// [`delete_whitelist_entry`](Self::delete_whitelist_entry) per entry.
     ///
     /// Returns the entries that were deleted. Errors if no entries
-    /// match the address.
+    /// match the address. A failure stops at the first entry that fails, so
+    /// the entries before it stay deleted.
     ///
     /// # Errors
     ///
@@ -258,15 +319,18 @@ impl AlpacaWalletService {
         }
 
         for entry in &matching {
-            self.client.delete_whitelist_entry(&entry.id).await?;
+            self.delete_whitelist_entry(&entry.id).await?;
         }
 
         Ok(matching)
     }
 
-    /// Patches travel rule info on all existing whitelisted addresses.
+    /// Patches travel rule info on all existing whitelisted addresses, one
+    /// [`patch_whitelist_travel_rule`](Self::patch_whitelist_travel_rule) per
+    /// entry.
     ///
-    /// Returns all whitelist entries that were patched.
+    /// Returns all whitelist entries that were patched. A failure stops at
+    /// the first entry that fails, so the entries before it stay patched.
     ///
     /// # Errors
     ///
@@ -278,8 +342,7 @@ impl AlpacaWalletService {
         let entries = self.client.get_whitelisted_addresses().await?;
 
         for entry in &entries {
-            self.client
-                .patch_whitelist_travel_rule(&entry.id, travel_rule_info)
+            self.patch_whitelist_travel_rule(&entry.id, travel_rule_info)
                 .await
                 .inspect_err(|err| {
                     error!(
@@ -314,11 +377,46 @@ impl AlpacaWalletService {
     pub async fn list_all_transfers(&self) -> Result<Vec<Transfer>, AlpacaWalletError> {
         transfer::list_all_transfers(&self.client).await
     }
+
+    /// Finds a transfer in either direction by its onchain transaction hash
+    /// with a single scan of the account's transfer list, no polling. Only
+    /// the matched row is parsed as a full [`Transfer`]: a row on another
+    /// chain, a row without a direction, or an unparsable row carrying
+    /// another hash cannot fail the lookup. Returns `None` when no listed
+    /// transfer carries the hash.
+    ///
+    /// # Errors
+    ///
+    /// Returns the HTTP error, or the parse error of the list or of the
+    /// matched row.
+    pub async fn find_transfer_by_tx_hash(
+        &self,
+        tx_hash: &TxHash,
+    ) -> Result<Option<Transfer>, AlpacaWalletError> {
+        transfer::find_transfer_by_tx_hash(&self.client, tx_hash).await
+    }
+}
+
+/// Reads Alpaca directly through the service's own client.
+impl WalletTransfers for AlpacaWalletService {
+    fn get_transfer(
+        &self,
+        transfer_id: &AlpacaTransferId,
+    ) -> impl Future<Output = Result<Transfer, AlpacaWalletError>> + Send {
+        WalletTransfers::get_transfer(&*self.client, transfer_id)
+    }
+
+    fn find_transfer_by_tx_hash(
+        &self,
+        tx_hash: &TxHash,
+    ) -> impl Future<Output = Result<Option<Transfer>, AlpacaWalletError>> + Send {
+        transfer::find_transfer_by_tx_hash(&self.client, tx_hash)
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use alloy_primitives::address;
+    use alloy_primitives::{address, fixed_bytes};
     use httpmock::prelude::*;
     use serde_json::json;
     use std::time::Duration;
@@ -493,6 +591,44 @@ mod tests {
         assert_eq!(result.to, to_address);
         whitelist_mock.assert();
         transfer_mock.assert();
+    }
+
+    #[tokio::test]
+    async fn submit_withdrawal_sends_one_post_and_reads_no_whitelist() {
+        let server = MockServer::start();
+        let service = create_test_service(&server);
+        let to_address = address!("0x1234567890abcdef1234567890abcdef12345678");
+
+        let whitelist_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/accounts/904837e3-3b76-47ec-b432-046db621571b/wallets/whitelists");
+            then.status(200).json_body(json!([]));
+        });
+        let transfer_mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/accounts/904837e3-3b76-47ec-b432-046db621571b/wallets/transfers");
+            then.status(200).json_body(json!({
+                "id": "550e8400-e29b-41d4-a716-446655440000",
+                "direction": "OUTGOING", "amount": "100",
+                "chain": "ethereum", "asset": "USDC",
+                "from_address": "0x0000000000000000000000000000000000000001",
+                "to_address": to_address.to_string(),
+                "status": "PENDING", "created_at": "2024-01-01T00:00:00Z"
+            }));
+        });
+
+        let transfer = service
+            .submit_withdrawal(
+                Positive::new(Usdc::new(float!(100))).unwrap(),
+                &TokenSymbol::new("USDC"),
+                &to_address,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(transfer.to, to_address);
+        transfer_mock.assert_calls(1);
+        whitelist_mock.assert_calls(0);
     }
 
     #[tokio::test]
@@ -675,5 +811,125 @@ mod tests {
         list_mock.assert();
         delete_aaa.assert();
         delete_bbb.assert();
+    }
+
+    #[tokio::test]
+    async fn traffic_of_answered_and_failed_wallet_calls_is_collected() {
+        let server = MockServer::start();
+        let service = create_test_service(&server);
+        let target = address!("0x1234567890abcdef1234567890abcdef12345678");
+        let whitelists = "/v1/accounts/904837e3-3b76-47ec-b432-046db621571b/wallets/whitelists";
+
+        server.mock(|when, then| {
+            when.method(GET).path(whitelists);
+            then.status(200)
+                .header(crate::request_id::ALPACA_REQUEST_ID_HEADER, "req-list")
+                .json_body(json!([
+                    {
+                        "id": "wl-aaa", "address": target.to_string(), "asset": "USDC",
+                        "chain": "ethereum", "status": "APPROVED",
+                        "created_at": "2024-01-01T00:00:00Z"
+                    },
+                    {
+                        "id": "wl-bbb", "address": target.to_string(), "asset": "USDC",
+                        "chain": "ethereum", "status": "APPROVED",
+                        "created_at": "2024-01-01T00:00:00Z"
+                    }
+                ]));
+        });
+        server.mock(|when, then| {
+            when.method(DELETE).path(format!("{whitelists}/wl-aaa"));
+            then.status(204).header(
+                crate::request_id::ALPACA_REQUEST_ID_HEADER,
+                "req-delete-aaa",
+            );
+        });
+        server.mock(|when, then| {
+            when.method(DELETE).path(format!("{whitelists}/wl-bbb"));
+            then.status(404)
+                .header(
+                    crate::request_id::ALPACA_REQUEST_ID_HEADER,
+                    "req-delete-bbb",
+                )
+                .body("not found");
+        });
+
+        let (result, traffic) =
+            crate::request_id::collect(service.remove_whitelist_entries(&target)).await;
+
+        assert!(
+            matches!(
+                result,
+                Err(AlpacaWalletError::ApiError { status, .. })
+                    if status == reqwest::StatusCode::NOT_FOUND
+            ),
+            "{result:?}"
+        );
+        assert_eq!(
+            traffic.request_ids,
+            ["req-list", "req-delete-aaa", "req-delete-bbb"]
+        );
+        assert_eq!(traffic.requests_sent, 3);
+        assert_eq!(traffic.last_status, Some(404));
+    }
+
+    /// The service lookup is the tolerant scan: a row on another chain, a row
+    /// without a direction and an unparsable row carrying another EVM hash
+    /// are all invisible, so they cannot fail a lookup they do not match.
+    #[tokio::test]
+    async fn find_transfer_by_tx_hash_ignores_rows_it_does_not_match() {
+        let server = MockServer::start();
+        let service = create_test_service(&server);
+        let tx_hash =
+            fixed_bytes!("abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890");
+        let transfer_id = Uuid::new_v4();
+        let evm_row = |id: Uuid, hash: TxHash, amount: &str| {
+            json!({
+                "id": id, "direction": "OUTGOING", "amount": amount,
+                "chain": "ethereum", "asset": "USDC",
+                "from_address": "0x0000000000000000000000000000000000000001",
+                "to_address": "0x1234567890abcdef1234567890abcdef12345678",
+                "status": "COMPLETE", "tx_hash": hash,
+                "created_at": "2024-01-01T00:00:00Z"
+            })
+        };
+        let transfers = server.mock(|when, then| {
+            when.method(GET)
+                .path(format!("/v1/accounts/{TEST_ACCOUNT_ID}/wallets/transfers"));
+            then.status(200).json_body(json!([
+                {
+                    "id": Uuid::new_v4(), "direction": "INCOMING", "amount": "2.5",
+                    "chain": "solana", "asset": "SOL",
+                    "from_address": "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin",
+                    "to_address": "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d",
+                    "status": "COMPLETE",
+                    "tx_hash": "5wHu1qwD4kKKyN1EEPBLRZ8hUvmCwF9zPSNdPCVBLcNq",
+                    "created_at": "2024-01-01T00:00:00Z"
+                },
+                {
+                    "id": Uuid::new_v4(), "amount": "500", "chain": "ethereum",
+                    "asset": "USDC", "status": "COMPLETE", "tx_hash": tx_hash,
+                    "created_at": "2024-01-01T00:00:00Z"
+                },
+                evm_row(Uuid::new_v4(), TxHash::repeat_byte(0x11), "not a number"),
+                evm_row(transfer_id, tx_hash, "100"),
+            ]));
+        });
+
+        let found = service
+            .find_transfer_by_tx_hash(&tx_hash)
+            .await
+            .unwrap()
+            .expect("the matching transfer behind the rows it does not match");
+        let missing = service
+            .find_transfer_by_tx_hash(&TxHash::repeat_byte(0x22))
+            .await
+            .unwrap();
+
+        assert_eq!(found.id, transfer_id.into());
+        assert_eq!(found.tx, Some(tx_hash));
+        assert_eq!(found.direction, TransferDirection::Outgoing);
+        assert_eq!(missing.map(|transfer| transfer.id), None);
+        transfers.assert_calls(2);
     }
 }

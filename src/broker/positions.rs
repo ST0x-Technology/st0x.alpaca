@@ -3,14 +3,13 @@
 use rain_math_float::Float;
 use serde::Deserialize;
 use tracing::{debug, error, trace, warn};
-use urlencoding::encode;
 
 use st0x_finance::{HasZero, NotPositive, Usdc};
 use st0x_float_macro::float;
 use st0x_float_serde::{DebugFloat, DebugOptionFloat};
 
 use super::AlpacaBrokerApiError;
-use super::client::AlpacaBrokerApiClient;
+use super::client::{AlpacaBrokerApiClient, SymbolSegment};
 use crate::broker::{
     AlpacaAmount, FractionalShares, Positive, Symbol, Usd, deserialize_float_from_number_or_string,
     deserialize_option_float_from_number_or_string,
@@ -264,11 +263,11 @@ pub(super) async fn fetch_position_mark(
     client: &AlpacaBrokerApiClient,
     symbol: &Symbol,
 ) -> Result<Option<Positive<Usd>>, AlpacaBrokerApiError> {
+    let segment = SymbolSegment::new(symbol)?;
     let url = format!(
-        "{}/v1/trading/accounts/{}/positions/{}",
+        "{}/v1/trading/accounts/{}/positions/{segment}",
         client.base_url(),
         client.account_id(),
-        encode(symbol.as_str())
     );
 
     debug!(%symbol, "Fetching open broker position mark from {url}");
@@ -1237,7 +1236,7 @@ mod tests {
         let position_mock = server.mock(|when, then| {
             when.method(GET).path(format!(
                 "/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/positions/{}",
-                encode(symbol)
+                urlencoding::encode(symbol)
             ));
             match position {
                 Some(position) => {

@@ -75,7 +75,18 @@ pub enum RejectionReason {
     /// The request is outside a pinned destination, recipient or
     /// counterparty list.
     DestinationNotAllowed,
+    /// Alpaca answered for a request on another network than the one asked
+    /// for; `network` names the network Alpaca reported.
+    WrongNetwork,
+    /// Alpaca reported the request without a network, so it cannot be
+    /// proven to be on the network asked for.
+    NetworkMissing,
+    /// The deployment holds no client for the requested network. Decided by
+    /// the gateway; nothing was sent.
     UnsupportedNetwork,
+    /// A keyed read of an object Alpaca does not hold: a tokenization
+    /// request (`RequestNotFound`) or a wallet transfer (`TransferNotFound`).
+    RequestNotFound,
     /// Any other Alpaca 4xx; see `alpaca_status` and `message`.
     AlpacaApi,
 }
@@ -95,6 +106,14 @@ pub struct ErrorBody {
     pub retry_after_secs: Option<u64>,
     pub reason: Option<RejectionReason>,
     pub alpaca_status: Option<u16>,
+    /// The network Alpaca reported, set with `wrong_network`.
+    pub network: Option<String>,
+    /// The Alpaca objects the answer names: those a failed mutation already
+    /// changed (the whitelist entries written before a loop failed), or the
+    /// tokenization request a `wrong_network` or `network_missing` refusal
+    /// is about.
+    #[serde(default)]
+    pub alpaca_object_ids: Vec<String>,
     pub request_id: Uuid,
     pub message: String,
 }

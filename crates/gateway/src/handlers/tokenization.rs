@@ -92,7 +92,7 @@ async fn requests(
     Query(query): Query<RequestsQuery>,
 ) -> Response {
     state
-        .read(call, async {
+        .read(call, Intent::default(), async {
             let tokenizer = account_wide(&state)?;
             let listed = if query.pending_only.unwrap_or(false) {
                 tokenizer.list_pending_requests().await
@@ -115,8 +115,11 @@ async fn request(
     Params(path): Params<TokenizationRequestPath>,
     Query(query): Query<NetworkQuery>,
 ) -> Response {
+    let intent = Intent::default()
+        .key(&path.tokenization_request_id)
+        .note("network", &query.network);
     state
-        .read(call, async {
+        .read(call, intent, async {
             state
                 .tokenizer(query.network)?
                 .get_request(&path.tokenization_request_id)
@@ -132,8 +135,9 @@ async fn find_mint(
     call: Call,
     Params(path): Params<IssuerRequestIdPath>,
 ) -> Response {
+    let intent = Intent::default().key(&path.issuer_request_id);
     state
-        .read(call, async {
+        .read(call, intent, async {
             account_wide(&state)?
                 .find_mint_by_issuer_request_id(&path.issuer_request_id)
                 .await
@@ -151,8 +155,11 @@ async fn find_redemption(
     Params(path): Params<RedemptionTxPath>,
     Query(query): Query<NetworkQuery>,
 ) -> Response {
+    let intent = Intent::default()
+        .key(&path.tx_hash)
+        .note("network", &query.network);
     state
-        .read(call, async {
+        .read(call, intent, async {
             state
                 .tokenizer(query.network)?
                 .find_redemption_by_tx(&path.tx_hash)

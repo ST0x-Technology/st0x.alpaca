@@ -20,13 +20,17 @@ pub enum EndpointRole {
     BaseUrl,
     /// The authx token endpoint JWT credentials mint at.
     TokenUrl,
+    /// Any other URL a caller sends credentials to, checked with
+    /// [`validate_credential_origin`].
+    CredentialOrigin,
 }
 
 impl fmt::Display for EndpointRole {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
-            Self::BaseUrl => "base URL",
-            Self::TokenUrl => "token URL",
+            Self::BaseUrl => "Alpaca base URL",
+            Self::TokenUrl => "Alpaca token URL",
+            Self::CredentialOrigin => "credential bearing URL",
         })
     }
 }
@@ -34,24 +38,36 @@ impl fmt::Display for EndpointRole {
 /// A credential-bearing URL was rejected before any credential was attached.
 #[derive(Debug, thiserror::Error)]
 pub enum EndpointError {
-    #[error("Alpaca {role} is not a valid URL")]
+    #[error("{role} is not a valid URL")]
     Parse {
         role: EndpointRole,
         #[source]
         source: url::ParseError,
     },
-    #[error("Alpaca {role} must use HTTPS (plain HTTP is accepted only for loopback hosts)")]
+    #[error("{role} must use HTTPS (plain HTTP is accepted only for loopback hosts)")]
     InsecureScheme { role: EndpointRole },
-    #[error("Alpaca {role} has no host")]
+    #[error("{role} has no host")]
     MissingHost { role: EndpointRole },
-    #[error("Alpaca {role} must not embed credentials")]
+    #[error("{role} must not embed credentials")]
     EmbeddedCredentials { role: EndpointRole },
-    #[error("Alpaca {role} must not carry a query or fragment")]
+    #[error("{role} must not carry a query or fragment")]
     QueryOrFragment { role: EndpointRole },
     /// URL parsers resolve `.` and `..` (even percent-encoded) and collapse
     /// empty segments, so such a value could address another endpoint.
     #[error("request path segment {segment:?} is empty or a dot segment")]
     InvalidPathSegment { segment: String },
+}
+
+/// Parses and validates an origin that will receive credentials, with the
+/// rule every Alpaca client applies to its own: HTTPS, or plain HTTP only on
+/// a loopback host; a host; no embedded credentials, query or fragment.
+///
+/// # Errors
+///
+/// The [`EndpointError`] naming the broken rule, with role
+/// [`EndpointRole::CredentialOrigin`].
+pub fn validate_credential_origin(value: &str) -> Result<Url, EndpointError> {
+    validate_origin(value, EndpointRole::CredentialOrigin)
 }
 
 /// Parses and validates a configured credential-bearing origin.

@@ -33,6 +33,10 @@ jobs:
             command: cargo check --locked --no-default-features --features corporate-actions
           - name: mock
             command: cargo check --locked --no-default-features --features mock
+          - name: gateway
+            command: cargo check --locked -p st0x-alpaca-gateway -p st0x-alpaca-gateway-api
+          - name: gateway-api-client
+            command: cargo check --locked -p st0x-alpaca-gateway-api --features client
           - name: test
             command: cargo test --locked --workspace --all-features
           - name: clippy
@@ -49,3 +53,17 @@ jobs:
       - uses: DeterminateSystems/magic-nix-cache-action@5626df0a8b8f16cb060538f6d3041500a2d10cb0
       - name: ${{ matrix.name }}
         run: nix develop -c ${{ matrix.command }}
+  gateway-oci:
+    name: gateway-oci
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: DeterminateSystems/nix-installer-action@b6e4494ddccc51b56de1189099089a3514a69245
+        with:
+          extra-conf: |
+            accept-flake-config = true
+            fallback = true
+      - uses: DeterminateSystems/magic-nix-cache-action@5626df0a8b8f16cb060538f6d3041500a2d10cb0
+      - name: gateway-oci
+        run: nix build .#gateway-oci --no-link

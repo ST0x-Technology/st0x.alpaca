@@ -9,6 +9,7 @@
 
   outputs =
     {
+      self,
       flake-utils,
       rainix,
       crane,
@@ -33,11 +34,15 @@
         cargoArtifacts = craneLib.buildDepsOnly commonArgs;
 
         # The gateway binary. Tests run in CI through `cargo test`, not here.
+        # The commit goes into the version every audit record carries; only
+        # this derivation sees it, so the dependency build stays cached
+        # across commits.
         st0x-alpaca-gateway = craneLib.buildPackage (
           commonArgs
           // {
             inherit cargoArtifacts;
             doCheck = false;
+            ST0X_ALPACA_GATEWAY_REV = self.rev or self.dirtyRev or "unknown";
           }
         );
 
@@ -70,11 +75,17 @@
             User = "65534:65534";
           };
         };
+        isLinux = pkgs.stdenv.hostPlatform.isLinux;
       in
       {
-        packages = rainix.packages.${system} // {
-          inherit st0x-alpaca-gateway gateway-oci;
-        };
+        # The gateway exists only to ship in the Linux OCI image, and a native
+        # build on darwin would put a Mach O binary into it, so both outputs
+        # exist only on Linux systems. Darwin keeps the dev shell.
+        packages =
+          rainix.packages.${system}
+          // pkgs.lib.optionalAttrs isLinux {
+            inherit st0x-alpaca-gateway gateway-oci;
+          };
 
         devShells.default = pkgs.mkShell {
           packages = [

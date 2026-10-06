@@ -19,6 +19,7 @@ use st0x_alpaca::wallet::Network as IssuerNetwork;
 pub struct MintRequest {
     /// Idempotency key: Alpaca dedupes a mint sent again with the same id.
     pub issuer_request_id: IssuerRequestId,
+    #[serde(deserialize_with = "super::symbol")]
     pub symbol: Symbol,
     pub quantity: Positive<FractionalShares>,
     pub wallet_address: Address,
@@ -144,4 +145,40 @@ pub struct RedemptionTxPath {
 #[serde(rename_all = "camelCase")]
 pub struct LookupResponse {
     pub request: Option<TokenizationRequestResponse>,
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::super::through_wire;
+    use super::*;
+
+    #[test]
+    fn a_tokenization_request_comes_back_from_the_wire_unchanged() {
+        let wire: TokenizationRequestResponse = serde_json::from_value(json!({
+            "id": "tok_req_1",
+            "type": "redeem",
+            "status": "completed",
+            "underlyingSymbol": "AAPL",
+            "tokenSymbol": "tAAPL",
+            "quantity": "2.5",
+            "wallet": "0x2222222222222222222222222222222222222222",
+            "clientRequestId": "6b1d0a7e-3f2c-4c55-9a4e-2f1b9b2c7d10",
+            "network": "base",
+            "issuerRequestId": "6b1d0a7e-3f2c-4c55-9a4e-2f1b9b2c7d10",
+            "txHash": format!("0x{}", "cd".repeat(32)),
+            "fees": "0.015",
+            "createdAt": "2026-10-06T10:30:00Z"
+        }))
+        .unwrap();
+
+        let relayed =
+            TokenizationRequestResponse::from(TokenizationRequest::from(through_wire(&wire)));
+
+        assert_eq!(
+            serde_json::to_value(relayed).unwrap(),
+            serde_json::to_value(wire).unwrap()
+        );
+    }
 }

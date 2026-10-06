@@ -35,9 +35,10 @@ Status values:
 | Mocks (st0x.liquidity e2e) | 2 servers | 2 | Inline ERC-20 interface instead of ABI environment variables. |
 | Shared auth and transport | - | - | Public auth internals made private; request paths confined to the configured origin; token URLs validated. |
 
-Tests: 662 pass with `--all-features` (plus 1 live-sandbox test ignored, as
-in the source). Every source test is ported except the consumer-side tests
-listed under Test parity.
+CI runs every test with `cargo test --locked --workspace --all-features`
+(the `test` job in `.github/workflows/ci.yaml`); the one live sandbox test
+stays ignored, as in the source. Every source test is ported except the
+consumer side tests listed under Test parity.
 
 ## Shared transport and auth (`core`, `auth`, `endpoint`, `rate_limit`)
 
@@ -59,6 +60,8 @@ listed under Test parity.
 | Wallet HTTP client (`reqwest::Client::new()`: follows redirects; base URL unvalidated) | `wallet::client` | Changed: redirects disabled; base URL validated (`AlpacaWalletError::InvalidBaseUrl`). Still no connect or request timeout, as in the source: a timeout on the non-idempotent withdrawal POST would turn a hang into an ambiguous failure the consumer could retry into a second withdrawal. Adding one needs a consumer-side recovery path first. |
 | liquidity `rate_limit::retry_after_from_response_headers` re-exported from the crate root | crate-private | Changed: only the Alpaca clients used it, and they now live here. |
 | (none) | root `pub use st0x_finance` | New: every public amount, quantity, and symbol type is from `st0x-finance` `v0.3.0`; consumers must use that release (liquidity uses its in-repo copy today, see the `NotPositive` row below). |
+| (none) | `endpoint::validate_credential_origin` | New: the crate private `validate_origin` rule (HTTPS, HTTP only on a loopback host, a host, no embedded credentials, query, or fragment) made public with role `EndpointRole::CredentialOrigin`, so the gateway client and the gateway's key URL config check their URLs with the same rule as every library client. |
+| (none) | `core::GatewayHopError`, the `Gateway` variant of `AlpacaBrokerApiError`, `AlpacaWalletError`, and `AlpacaTokenizationError` | New: a failure on the hop to the Alpaca gateway (no answer, or a refusal the gateway decided itself). Only gateway clients raise it; the direct clients never do. It is Transient when the gateway marked it retryable or safe to resend with the same idempotency key, Permanent otherwise, and it is backpressure only when it carries the gateway's `retryAfterSecs` (`retry_after`). |
 
 ## Issuer surface (`issuer`, st0x.issuance)
 
@@ -138,7 +141,7 @@ compiled at that commit (the module is not declared) and is not ported.
 | Source item | st0x.alpaca item | Status |
 | --- | --- | --- |
 | `AlpacaBrokerApiCtx { auth, account_id, mode, asset_cache_ttl, time_in_force, counter_trade_slippage_bps, hedge_floor }` | `AlpacaBrokerApiCtx { auth, account_id, mode, asset_cache_ttl, time_in_force }` | Changed: slippage and hedge floor are consumer preflight policy. |
-| `AlpacaBrokerApiError` | same | Same, minus `BuyingPowerReservationOutOfRange`, `BuyingPowerReservationOverflow`, and `CounterTradeCost` (raised only by consumer preflight), plus `InvalidEndpoint`. |
+| `AlpacaBrokerApiError` | same | Same, minus `BuyingPowerReservationOutOfRange`, `BuyingPowerReservationOverflow`, and `CounterTradeCost` (raised only by consumer preflight), plus `InvalidEndpoint` and `Gateway` (see `GatewayHopError` above). |
 | `AlpacaMarketDataError` (public only under `test-support`) | public | Changed: it is reachable through the public `LatestTrade`/`LatestQuote` variants. |
 | `AlpacaAmount` (raw 9-decimal value for cash valuation, 6-decimal floored value for transfers) | `broker::AlpacaAmount` | Same. `Usdc::floor_to_6_decimals` is not in st0x-finance `v0.3.0`, so the same floor is a private function here with the source tests (4 unit tests and 1 proptest). |
 | `ClientOrderId`, `OrderState`, `OrderStatus`, `OrderUpdate`, `OrderPlacement`, `RecoveredOrderPlacement`, `CancellationOutcome`, `OrderFailureTerminality`, `MarketOrder`, `LimitOrder`, `ExecutorOrderId` | `broker::*` | Same. `OrderStatus` drops its `sqlx::Type` derive (persistence stays in the consumer). |
@@ -171,9 +174,9 @@ compiled at that commit (the module is not declared) and is not ported.
 | `GET/POST /v1/accounts/{id}/wallets/whitelists`, `DELETE .../{wl}`, `PATCH .../{wl}/travel-rule-info` | `client.rs`, `whitelist.rs` | `AlpacaWalletService::{get_whitelisted_addresses, create_whitelist_entry, remove_whitelist_entries, patch_all_whitelist_travel_rules}` | Same (EIP-55 addresses, required travel-rule info, approved-status check). |
 | `POST /v1/accounts/{id}/wallets/transfers` (`Positive<Usdc>` amount as a string) | `transfer::request_withdrawal` | `AlpacaWalletService::initiate_withdrawal` | Same, including the whitelist check before the request. |
 | `GET .../wallets/transfers/{id}` (404 as `TransferNotFound`) and `GET .../wallets/transfers` (chain-neutral filter before strict parse) | `transfer.rs` | `AlpacaWalletService::{poll_transfer_until_complete, find_deposit_by_tx_hash, poll_deposit_by_tx_hash, list_all_transfers}` | Same. |
-| Polling: 10 s interval, 30 min deadline, 5xx exponential retry (10 attempts, 1-60 s), backwards-status detection | `status.rs`, `PollingConfig` | same | Same. |
+| Polling: 10 s interval, 30 min deadline, 5xx exponential retry (10 attempts, 1-60 s), backwards-status detection | `status.rs`, `PollingConfig` | same | Same for Alpaca errors. A `Gateway` hop failure is retried like a 5xx when it is Transient. |
 | One-shot `GET .../wallets/transfers/{id}` with optional `network_fee` and `fees`, `reported_fees()` checked USDC sum | liquidity `1ad78737c` `transfer.rs` | `AlpacaWalletService::get_transfer` -> `TransferWithFees` | Same, plus `ReportedFeesError` for a non-USDC asset instead of labelling its fees as USDC. `Transfer` keeps its shape. |
-| Completed-transfer tx-hash poll | liquidity `1ad78737c` `status::poll_transfer_tx_hash` | `AlpacaWalletService::poll_transfer_tx_hash` | Changed: each read is bounded by the remaining deadline, `Retry-After` is honored, a hash is returned only once the transfer is `Complete`, a `Failed` transfer returns `TransferFailed` or `FailedTransferHasTx`, and permanent read errors return at once. The source retried every read error until the deadline and returned any hash. `CompletedTransferMissingTx` is part of the error contract but is raised by the consumer. |
+| Completed-transfer tx-hash poll | liquidity `1ad78737c` `status::poll_transfer_tx_hash` | `AlpacaWalletService::poll_transfer_tx_hash` | Changed: each read is bounded by the remaining deadline, `Retry-After` is honored, a hash is returned only once the transfer is `Complete`, a `Failed` transfer returns `TransferFailed` or `FailedTransferHasTx`, and permanent read errors return at once. The source retried every read error until the deadline and returned any hash. A Transient `Gateway` hop failure is retried, waiting for the gateway's relayed wait as for `Retry-After`. `CompletedTransferMissingTx` is part of the error contract but is raised by the consumer. |
 | Beneficiary redaction in logs and `ApiError` messages, fail-closed | `client.rs` | same | Same. |
 | `AlpacaWalletClient` (public under `test-support`), `AlpacaWalletService::new_with_client` | `client.rs`, `mod.rs` | same | Same (`test-support` feature). |
 | `TransferDirection` (type of the public `Transfer.direction`, not re-exported) | `transfer.rs` | `wallet::TransferDirection` | Changed: re-exported so consumers can name it. |
@@ -188,8 +191,8 @@ compiled at that commit (the module is not declared) and is not ported.
 | `GET /v1/accounts/{id}/tokenization/requests` with optional `type`/`status` filters, no pagination | `list_requests`, `fetch_requests_body` | `AlpacaTokenizationService::{list_requests, list_pending_requests}` | Moved: `list_pending_requests` was in the `Tokenizer` impl; the query, the non-pending filter, and its warning are unchanged. |
 | Keyed lookups by scanning the list: `get_request`, mint recovery by issuer request id (duplicate detection), redemption detection by tx hash | `get_request`, `find_mint_by_issuer_request_id`, `find_redemption_by_tx` | same names, now `pub` | Same. |
 | Network confirmation (a request on another network, or with no network, is refused on the mint response, `get_request`, and redemption lookups) | `confirm_network` | same | Changed: the bound network is `core::Network` instead of `st0x_evm::Chain`. The four shared wire names are identical (`base`, `ethereum`, `hyperevm`, `robinhood`); `core::Network` also has `BnbSmartChain` (`binance`), which `Chain` does not, so the client can be bound to it. As in the source, mint recovery by issuer request id (`find_mint_by_issuer_request_id`) does not confirm the network. |
-| Polling: `PollingConfig` interval (10 s) and timeout (30 min), `PollTimeout` | `poll_until_terminal`, `poll_for_redemption_detection` | `poll_mint_until_complete`, `poll_for_redemption`, `poll_redemption_until_complete` | Same. |
-| 429 `Retry-After` backpressure, `status_code()` | `AlpacaTokenizationError::backpressure` | same | Same. |
+| Polling: `PollingConfig` interval (10 s) and timeout (30 min), `PollTimeout` | `poll_until_terminal`, `poll_for_redemption_detection` | `poll_mint_until_complete`, `poll_for_redemption`, `poll_redemption_until_complete` | Same for Alpaca errors: the first lookup error ends the poll. Changed for a gateway client: a `Gateway` hop failure the gateway marked retryable logs a `warn` event and the poll continues, at the next interval or after the gateway's relayed wait when that is longer, never past the deadline. Any other hop failure ends the poll. |
+| 429 `Retry-After` backpressure, `status_code()` | `AlpacaTokenizationError::backpressure` | same | Same, plus the relayed wait of a `Gateway` hop failure. |
 | Credentialed base URL must be HTTPS or HTTP on a loopback IP; no redirects | `validate_credentialed_base_url`; `InvalidBaseUrl(url::ParseError)`, `InsecureBaseUrl` | `endpoint::validate_origin`; `InvalidBaseUrl(EndpointError)` | Changed: one validator for every client. It now also rejects embedded credentials, a query, or a fragment, and accepts `http://localhost` (a loopback host the source refused). The two error variants became one typed variant. |
 | `TokenizationRequest`, `TokenizationRequestStatus`, `TokenizationRequestType`, `ClientRequestId`, validated `TokenizationRequestId`, `IssuerRequestId`, `AlpacaApiErrorMessage` | `alpaca.rs`, `lib.rs` | `tokenization::*` | Same. `InvalidTokenizationParameters` is now re-exported (it is a public error field type). |
 | Generic `AlpacaTokenizationService<W: Wallet>` with `redemption_wallet` | same | non-generic `AlpacaTokenizationService` | Changed: no Alpaca method reads the wallet or the redemption wallet. |
@@ -204,6 +207,52 @@ compiled at that commit (the module is not declared) and is not ported.
 | `AlpacaTokenizationMock`, `TokenizationStatus`, `TokenizationRequestType`, `RedemptionOutcome`, `MockTokenizationRequestSnapshot`, `REDEMPTION_WALLET` | `tokenization_mock::*` | Same endpoints, idempotency replay, redemption watcher, and mint executor. |
 | `DeployableERC20` / `TestERC20` bindings from `ST0X_*_ABI` environment variables | inline `alloy::sol!` ERC-20 interface (`transfer`, `Transfer`) | Changed: this repository has no ABI artifacts; the mock calls only `transfer` and reads `Transfer` logs, so any deployed ERC-20 works. |
 | Request-parsing blocks inside the mock responders | extracted helpers | Changed shape only, to meet `too_many_lines`; the responses and status codes are the same and the 23 source tests pass unchanged. |
+
+## Gateway (`st0x-alpaca-gateway`)
+
+The gateway is a consumer of this library, not a port. Each operation's handler (`crates/gateway/src/handlers`) runs the calls below on one `AlpacaBrokerApi`, one `AlpacaWalletService`, and one `AlpacaTokenizationService` per configured network. The design ([RAI-1927](https://linear.app/makeitrain/issue/RAI-1927)) names one library method per operation. **Same** means the handler runs that method unchanged; **Changed** gives the deviation and its reason. Checks the gateway makes before it calls Alpaca (tier key forms, pinned destinations, symbol and query value rules, the human budget) are gateway policy, described in [docs/gateway.md](gateway.md).
+
+| Operation | `st0x-alpaca` call | Status |
+| --- | --- | --- |
+| `account.funds` | `AlpacaBrokerApi::account_funds` | Same. |
+| `account.withdrawable_cash` | `AlpacaBrokerApi::withdrawable_cash_cents` | Same. |
+| `account.inventory` | `AlpacaBrokerApi::fetch_inventory` | Same. |
+| `account.position_mark` | `AlpacaBrokerApi::fetch_position_mark` | Same. |
+| `activities.list` | `AlpacaBrokerApi::fetch_account_activities(query, max_pages)` | Changed: the design named `AlpacaBrokerApiCtx::fetch_account_activities`, which builds a new client for each call and reads up to 1000 pages. The instance method reuses the gateway's client and takes the page cap from the caller's tier: 1000 pages for a bot, and for a human the 10 units its admission reserved, so the human budget covers every page the call can send. More matching pages answer `AccountActivitiesPageLimitExceeded`. The account is the configured one; `types` is split on commas. |
+| `market.is_open` | `AlpacaBrokerApi::is_market_open` | Same. |
+| `market.session` | `AlpacaBrokerApi::market_session` | Same. |
+| `market.session_status` | `AlpacaBrokerApi::market_session_status` | Same. |
+| `market.latest_trade` | `AlpacaBrokerApi::fetch_latest_trade_price` | Same. |
+| `market.latest_quote` | `AlpacaBrokerApi::fetch_latest_quote` | Same. |
+| `market.latest_overnight_quote` | `AlpacaBrokerApi::fetch_latest_overnight_quote` | Same. |
+| `assets.get` | `AlpacaBrokerApi::get_asset_details` | Same. |
+| `assets.counter_trade_shares` | `AlpacaBrokerApi::prepare_counter_trade_shares` | Same. |
+| `orders.place_market` | `AlpacaBrokerApi::place_market_order_reporting` | Changed: the reporting form of `place_market_order`, with the same requests. Its `PlacementError::written` tells the handler whether the order POST may have been sent, so a failure before the POST, or a definite rejection of it, answers `not_applied`, and any later failure answers `outcome_unknown`. |
+| `orders.place_limit` | `AlpacaBrokerApi::place_limit_order_reporting` | Changed: the reporting form of `place_limit_order`, for the same reason. |
+| `orders.place_exact_limit` | `AlpacaLimitOrder::try_from`, then `AlpacaBrokerApi::place_alpaca_limit_order_reporting` | Changed: the reporting form of `place_alpaca_limit_order`, for the same reason. A limit price that does not convert is refused before anything is sent. |
+| `orders.get` | `AlpacaBrokerApi::get_order_status` | Same. |
+| `orders.find` | `AlpacaBrokerApi::get_order_by_client_order_id` | Same. |
+| `orders.recover` | `AlpacaBrokerApi::recover_order_by_client_id` | Same. |
+| `orders.cancel` | `AlpacaBrokerApi::cancel_order` | Same. |
+| `conversions.submit` | `AlpacaBrokerApi::submit_conversion` | Same. The library method is new: the conversion POST of `convert_usdc_usd` without its poll, which the caller runs through `conversions.get`. |
+| `conversions.get` | `AlpacaBrokerApi::get_conversion_order` | Same (new library method, one read). |
+| `conversions.find` | `AlpacaBrokerApi::find_conversion_order` | Same. |
+| `journals.create` | `AlpacaBrokerApi::create_journal` | Same, to the account of the configured counterparty the request names. |
+| `wallet.withdraw` | `AlpacaWalletService::check_withdrawal_whitelist`, then `AlpacaWalletService::submit_withdrawal` | Changed: the design named `initiate_withdrawal`, which is exactly these two calls in this order. The handler makes them separately so that a failed whitelist read or an address that is not approved answers `not_applied`, and only a failed POST can answer `outcome_unknown`. |
+| `wallet.transfer` | `AlpacaWalletService::get_transfer` | Same. The handler sums `reported_fees()`; a transfer in an asset other than USDC answers no fees. |
+| `wallet.transfers` | `AlpacaWalletService::list_all_transfers` | Same. |
+| `wallet.find_transfer` | `AlpacaWalletService::find_transfer_by_tx_hash` | Same. Not in the design table: the operation and the public method were added so a gateway client's tx hash lookup runs the scan the direct `WalletTransfers` lookup runs. |
+| `wallet.find_deposit` | `AlpacaWalletService::find_deposit_by_tx_hash` | Same. |
+| `wallet.deposit_address` | `AlpacaWalletService::get_wallet_address` | Same. |
+| `wallet.whitelist` | `AlpacaWalletService::get_whitelisted_addresses` | Same. |
+| `wallet.whitelist_create` | `AlpacaWalletService::create_whitelist_entry` | Same, on network `ethereum` with the configured Travel Rule beneficiary. |
+| `wallet.whitelist_remove` | `AlpacaWalletService::get_whitelisted_addresses`, then `AlpacaWalletService::delete_whitelist_entry` for each entry of the address | Changed: the design named `remove_whitelist_entries`. The handler runs the same list read, address filter, `NoWhitelistEntries` refusal, and one DELETE per entry itself, so it can reserve the human budget for every write after the list and name the entries already deleted (`alpacaObjectIds`) when a later write fails. |
+| `wallet.whitelist_patch_travel_rule` | `AlpacaWalletService::get_whitelisted_addresses`, then `AlpacaWalletService::patch_whitelist_travel_rule` for each entry | Changed: the design named `patch_all_whitelist_travel_rules`. The handler runs the same list read and one PATCH per entry with the configured Travel Rule beneficiary, for the same reasons as `wallet.whitelist_remove`. The library method's `error!` event for a failed entry is not emitted; the audit record names the entries already patched instead. |
+| `tokenization.mint` | `AlpacaTokenizationService::request_mint` on the client of the request's `network` | Same. |
+| `tokenization.requests` | `AlpacaTokenizationService::list_requests`, or `list_pending_requests` with `pendingOnly` | Same, on the client of the first configured network: the list is account wide and does not check the network. |
+| `tokenization.request` | `AlpacaTokenizationService::get_request` on the client of the query's `network` | Same. |
+| `tokenization.find_mint` | `AlpacaTokenizationService::find_mint_by_issuer_request_id` | Same, on the client of the first configured network: this lookup does not check the network. |
+| `tokenization.find_redemption` | `AlpacaTokenizationService::find_redemption_by_tx` on the client of the query's `network` | Same. |
 
 ## Same names, different types
 
@@ -226,9 +275,10 @@ They are not interchangeable:
 
 The broker, wallet, and tokenization surfaces emit the same `tracing`
 events as the source, with the same targets (`broker`, `wallet`,
-`tokenization`) and fields. `tracing` is a facade: the crate installs no
-subscriber and no exporter, so consumers keep full control of
-instrumentation. The issuer surface emits no events.
+`tokenization`) and fields, plus one `tokenization` `warn` event when a poll
+continues through a retryable gateway hop failure. `tracing` is a facade: the
+crate installs no subscriber and no exporter, so consumers keep full control
+of instrumentation. The issuer surface emits no events.
 
 ## Test parity
 

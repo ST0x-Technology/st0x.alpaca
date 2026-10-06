@@ -443,6 +443,69 @@ impl AlpacaError {
     }
 }
 
+/// A failure on the hop between a gateway client and the Alpaca gateway: no
+/// answer, a timeout, the gateway itself unavailable, or a refusal the
+/// gateway decided without relaying an Alpaca answer. Every error type a
+/// gateway client can produce carries it as a `Gateway` variant. It is
+/// backpressure only when the gateway asked for a wait
+/// ([`retry_after`](Self::retry_after)), and its
+/// [`permanence`](Self::permanence) follows the gateway's own classification,
+/// so a definite refusal is not retried as if a fresh call could repair it.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("Alpaca gateway: {message}")]
+pub struct GatewayHopError {
+    /// What failed, for logs.
+    pub message: String,
+    /// A later call can succeed: the gateway said so, or no answer came.
+    pub retryable: bool,
+    /// A mutation may have reached Alpaca: reconcile before acting on it.
+    pub outcome_unknown: bool,
+    /// Resending the same mutation with the same idempotency key is safe.
+    pub retryable_with_same_key: bool,
+    /// How long the gateway asked callers to hold off before the next call,
+    /// when it relayed a wait (a throttled credential mint, say).
+    pub retry_after: Option<Duration>,
+}
+
+impl GatewayHopError {
+    /// A hop that got no answer from the gateway. Retryable, with no wait;
+    /// whether a mutation's outcome is unknown, and whether a same key resend
+    /// is safe, is for the caller to set, since only it knows what it sent.
+    #[must_use]
+    pub fn transport(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            retryable: true,
+            outcome_unknown: false,
+            retryable_with_same_key: false,
+            retry_after: None,
+        }
+    }
+
+    /// Transient when a later call can succeed: the gateway said a fresh
+    /// call may, or said resending with the same idempotency key is safe
+    /// (an unknown outcome on a keyed mutation, which the direct transport
+    /// reports as a transient transport failure). Permanent otherwise.
+    #[must_use]
+    pub fn permanence(&self) -> Permanence {
+        if self.retryable || self.retryable_with_same_key {
+            Permanence::Transient
+        } else {
+            Permanence::Permanent
+        }
+    }
+
+    /// Backpressure carrying the gateway's wait, when it asked for one, so a
+    /// caller holds off as long as it would on Alpaca's own `Retry-After`.
+    /// `None` for a hop without a wait.
+    #[must_use]
+    pub fn backpressure(&self) -> Option<Backpressure> {
+        self.retry_after.map(|retry_after| Backpressure {
+            retry_after: Some(retry_after),
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Backpressure {
     pub retry_after: Option<Duration>,

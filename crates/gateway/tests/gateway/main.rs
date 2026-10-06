@@ -1,6 +1,7 @@
 //! Gateway integration tests: the router in process, Alpaca and Google key
 //! servers mocked.
 
+mod account;
 mod client;
 #[cfg(test)]
 mod common;

@@ -4815,6 +4815,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "st0x-alpaca",
+ "st0x-alpaca-gateway",
  "st0x-alpaca-gateway-api",
  "thiserror",
  "tokio",
@@ -4823,7 +4824,6 @@ dependencies = [
  "tower",
  "tracing",
  "tracing-subscriber 0.3.23",
- "tracing-test",
  "uuid",
 ]
 
@@ -4833,6 +4833,7 @@ version = "0.1.0"
 dependencies = [
  "alloy-primitives",
  "chrono",
+ "httpmock",
  "rain-math-float",
  "reqwest",
  "serde",
@@ -4840,6 +4841,7 @@ dependencies = [
  "st0x-alpaca",
  "st0x-float-serde",
  "thiserror",
+ "tokio",
  "url",
  "uuid",
 ]

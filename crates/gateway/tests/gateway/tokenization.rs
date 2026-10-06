@@ -258,8 +258,9 @@ async fn an_unconfigured_network_is_refused_before_anything_is_sent() {
             Some(mint_body(BOT_WALLET, "ethereum", None)),
         )
         .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-    assert_eq!(body["code"], "invalid_request");
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["code"], "rejected");
+    assert_eq!(body["reason"], "unsupported_network");
     assert_eq!(body["outcome"], "not_applied");
 
     let (status, body) = harness
@@ -270,8 +271,8 @@ async fn an_unconfigured_network_is_refused_before_anything_is_sent() {
             None,
         )
         .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-    assert_eq!(body["code"], "invalid_request");
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["reason"], "unsupported_network");
 
     mint.assert_calls(0);
     lookups.assert_calls(0);
@@ -409,6 +410,95 @@ async fn an_unknown_request_id_is_a_definite_not_found() {
         .await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
     assert_eq!(body["code"], "rejected");
-    assert_eq!(body["alpacaStatus"], 404);
+    assert_eq!(body["reason"], "request_not_found");
     assert_eq!(body["retryable"], false);
+    // Alpaca answered the list with 200; no Alpaca 404 is invented.
+    assert!(body["alpacaStatus"].is_null(), "{body}");
+}
+
+#[tokio::test]
+async fn a_lookup_alpaca_answers_off_the_bound_network_is_rejected_naming_the_request() {
+    let harness = Harness::start().await;
+    let mut foreign = alpaca_request("tok_req_1", "mint", "completed");
+    foreign["network"] = json!("ethereum");
+    let mut unnamed = alpaca_request("tok_req_2", "mint", "completed");
+    unnamed["network"] = Value::Null;
+    harness.alpaca.mock(|when, then| {
+        when.method(GET).path(requests_path());
+        then.status(200).json_body(json!([foreign, unnamed]));
+    });
+
+    let (status, body) = harness
+        .call(
+            Tier::Bot,
+            "GET",
+            "/tokenization/requests/tok_req_1?network=base",
+            None,
+        )
+        .await;
+
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["code"], "rejected");
+    assert_eq!(body["reason"], "wrong_network");
+    assert_eq!(body["network"], "ethereum");
+    assert_eq!(body["alpacaObjectIds"], json!(["tok_req_1"]));
+    assert_eq!(body["retryable"], false);
+
+    let (status, body) = harness
+        .call(
+            Tier::Bot,
+            "GET",
+            "/tokenization/requests/tok_req_2?network=base",
+            None,
+        )
+        .await;
+
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["reason"], "network_missing");
+    assert!(body["network"].is_null(), "{body}");
+    assert_eq!(body["alpacaObjectIds"], json!(["tok_req_2"]));
+
+    // Both refusals were decided after Alpaca answered 200, and the audit
+    // keeps that status.
+    let events = harness.audit_events();
+    let rejections: Vec<_> = events.iter().map(|event| event.rejection).collect();
+    assert_eq!(
+        rejections,
+        [
+            Some(RejectionReason::WrongNetwork),
+            Some(RejectionReason::NetworkMissing)
+        ]
+    );
+    for event in &events {
+        assert_eq!(event.alpaca_status, Some(200), "{event:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_mint_alpaca_answers_on_another_network_is_outcome_unknown() {
+    let harness = Harness::start().await;
+    let mut foreign = alpaca_request("tok_req_1", "mint", "pending");
+    foreign["network"] = json!("ethereum");
+    let mint = expect_mint(&harness, 200, foreign);
+
+    let (status, body) = harness
+        .call(
+            Tier::Bot,
+            "POST",
+            "/tokenization/mints",
+            Some(mint_body(BOT_WALLET, "base", None)),
+        )
+        .await;
+
+    // Alpaca accepted a mint; its answer naming another network cannot
+    // make that mint not exist, and the audit names it.
+    assert_eq!(status, StatusCode::GATEWAY_TIMEOUT, "{body}");
+    assert_eq!(body["code"], "outcome_unknown");
+    assert_eq!(body["outcome"], "unknown");
+    assert_eq!(body["alpacaObjectIds"], json!(["tok_req_1"]));
+    mint.assert_calls(1);
+    let event = &harness.audit_events()[0];
+    assert_eq!(event.outcome, Some(Outcome::Unknown));
+    assert_eq!(event.alpaca_object_id.as_deref(), Some("tok_req_1"));
+    assert_eq!(event.alpaca_status, Some(200));
 }

@@ -13,7 +13,7 @@ use st0x_alpaca_gateway_api::dto::market::{
 
 use crate::answer::{Sent, broker};
 use crate::extract::{Body, Params};
-use crate::state::{AppState, Call};
+use crate::state::{AppState, Call, Intent};
 
 pub(super) fn route(operation: Operation) -> Option<MethodRouter<AppState>> {
     Some(match operation {
@@ -31,7 +31,7 @@ pub(super) fn route(operation: Operation) -> Option<MethodRouter<AppState>> {
 
 async fn is_open(State(state): State<AppState>, call: Call) -> Response {
     state
-        .read(call, async {
+        .read(call, Intent::default(), async {
             state
                 .broker
                 .is_market_open()
@@ -44,7 +44,7 @@ async fn is_open(State(state): State<AppState>, call: Call) -> Response {
 
 async fn session(State(state): State<AppState>, call: Call) -> Response {
     state
-        .read(call, async {
+        .read(call, Intent::default(), async {
             state
                 .broker
                 .market_session()
@@ -57,7 +57,7 @@ async fn session(State(state): State<AppState>, call: Call) -> Response {
 
 async fn session_status(State(state): State<AppState>, call: Call) -> Response {
     state
-        .read(call, async {
+        .read(call, Intent::default(), async {
             state
                 .broker
                 .market_session_status()
@@ -73,8 +73,9 @@ async fn latest_trade(
     call: Call,
     Params(path): Params<SymbolPath>,
 ) -> Response {
+    let intent = Intent::default().key(&path.symbol);
     state
-        .read(call, async {
+        .read(call, intent, async {
             state
                 .broker
                 .fetch_latest_trade_price(&path.symbol)
@@ -90,8 +91,9 @@ async fn latest_quote(
     call: Call,
     Params(path): Params<SymbolPath>,
 ) -> Response {
+    let intent = Intent::default().key(&path.symbol);
     state
-        .read(call, async {
+        .read(call, intent, async {
             state
                 .broker
                 .fetch_latest_quote(&path.symbol)
@@ -107,8 +109,9 @@ async fn latest_overnight_quote(
     call: Call,
     Params(path): Params<SymbolPath>,
 ) -> Response {
+    let intent = Intent::default().key(&path.symbol);
     state
-        .read(call, async {
+        .read(call, intent, async {
             state
                 .broker
                 .fetch_latest_overnight_quote(&path.symbol)
@@ -124,8 +127,9 @@ async fn asset(
     call: Call,
     Params(path): Params<SymbolPath>,
 ) -> Response {
+    let intent = Intent::default().key(&path.symbol);
     state
-        .read(call, async {
+        .read(call, intent, async {
             state
                 .broker
                 .get_asset_details(&path.symbol)
@@ -142,8 +146,11 @@ async fn counter_trade_shares(
     Params(path): Params<SymbolPath>,
     Body(request): Body<CounterTradeSharesRequest>,
 ) -> Response {
+    let intent = Intent::default()
+        .key(&path.symbol)
+        .note("quantity", &request.shares);
     state
-        .read(call, async {
+        .read(call, intent, async {
             state
                 .broker
                 .prepare_counter_trade_shares(&path.symbol, request.shares, request.extended_hours)

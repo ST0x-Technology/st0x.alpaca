@@ -30,7 +30,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::time::Duration;
 use thiserror::Error;
-use tokio::time::{Instant, MissedTickBehavior};
+use tokio::time::{Instant, Interval, MissedTickBehavior};
 use tracing::{debug, error, info, trace, warn};
 
 use st0x_finance::{FractionalShares, Symbol};
@@ -38,7 +38,7 @@ use st0x_finance::{FractionalShares, Symbol};
 use super::{ClientRequestId, IssuerRequestId, TokenizationRequestId};
 use crate::auth::{ALPACA_TOKEN_URL, AuthRuntime, KmsJwtError};
 use crate::broker::AlpacaAccountId;
-use crate::core::{AlpacaAuth, Backpressure, Network as Chain};
+use crate::core::{AlpacaAuth, Backpressure, GatewayHopError, Network as Chain};
 use crate::endpoint::{EndpointError, EndpointRole, validate_origin};
 use crate::rate_limit::retry_after_from_response_headers;
 use crate::wallet::{Network, PollingConfig};
@@ -115,9 +115,7 @@ impl AlpacaTokenizationService {
         &self,
         id: &TokenizationRequestId,
     ) -> Result<TokenizationRequest, AlpacaTokenizationError> {
-        self.client
-            .poll_until_terminal(id, &self.polling_config)
-            .await
+        poll_mint_until_complete_with(self, id, &self.polling_config).await
     }
 
     /// Find a mint request by our stable internal issuer request id, matched
@@ -158,9 +156,7 @@ impl AlpacaTokenizationService {
         &self,
         tx_hash: &TxHash,
     ) -> Result<TokenizationRequest, AlpacaTokenizationError> {
-        self.client
-            .poll_for_redemption_detection(tx_hash, &self.polling_config)
-            .await
+        poll_for_redemption_with(self, tx_hash, &self.polling_config).await
     }
 
     /// Find a redemption request by its onchain token transfer transaction.
@@ -184,9 +180,7 @@ impl AlpacaTokenizationService {
         &self,
         id: &TokenizationRequestId,
     ) -> Result<TokenizationRequest, AlpacaTokenizationError> {
-        self.client
-            .poll_until_terminal(id, &self.polling_config)
-            .await
+        poll_redemption_until_complete_with(self, id, &self.polling_config).await
     }
 
     /// List all tokenization requests.
@@ -242,6 +236,198 @@ impl AlpacaTokenizationService {
             client,
             polling_config,
         }
+    }
+}
+
+/// The two tokenization reads the polls make. Both refuse a request the
+/// issuer reports on another network than the one the implementor is bound
+/// to, or with no network ([`AlpacaTokenizationError::WrongNetwork`],
+/// [`AlpacaTokenizationError::NetworkMissing`]).
+///
+/// [`AlpacaTokenizationService`] answers them from Alpaca directly; a gateway
+/// client answers them through the gateway. The poll functions
+/// ([`poll_mint_until_complete_with`], [`poll_for_redemption_with`],
+/// [`poll_redemption_until_complete_with`]) run over either.
+pub trait TokenizationLookups {
+    /// One tokenization request by id.
+    ///
+    /// # Errors
+    ///
+    /// `RequestNotFound`, `WrongNetwork`, `NetworkMissing`, or the transport,
+    /// API or parse error.
+    fn get_request(
+        &self,
+        id: &TokenizationRequestId,
+    ) -> impl Future<Output = Result<TokenizationRequest, AlpacaTokenizationError>> + Send;
+
+    /// The redemption request for an onchain token transfer, `None` while
+    /// the issuer has not detected the transfer yet.
+    ///
+    /// # Errors
+    ///
+    /// `WrongNetwork`, `NetworkMissing`, or the transport, API or parse error.
+    fn find_redemption_by_tx(
+        &self,
+        tx_hash: &TxHash,
+    ) -> impl Future<Output = Result<Option<TokenizationRequest>, AlpacaTokenizationError>> + Send;
+}
+
+impl TokenizationLookups for AlpacaTokenizationService {
+    fn get_request(
+        &self,
+        id: &TokenizationRequestId,
+    ) -> impl Future<Output = Result<TokenizationRequest, AlpacaTokenizationError>> + Send {
+        self.client.get_request(id)
+    }
+
+    fn find_redemption_by_tx(
+        &self,
+        tx_hash: &TxHash,
+    ) -> impl Future<Output = Result<Option<TokenizationRequest>, AlpacaTokenizationError>> + Send
+    {
+        self.client.find_redemption_by_tx(tx_hash)
+    }
+}
+
+/// Polls a mint request until it is completed or rejected.
+///
+/// # Errors
+///
+/// `PollTimeout` once `config.timeout` passes, or the first lookup error
+/// other than a gateway hop failure the gateway classified as retryable,
+/// which the poll retries.
+pub async fn poll_mint_until_complete_with(
+    lookups: &impl TokenizationLookups,
+    id: &TokenizationRequestId,
+    config: &PollingConfig,
+) -> Result<TokenizationRequest, AlpacaTokenizationError> {
+    poll_until_terminal(lookups, id, config).await
+}
+
+/// Polls a redemption request until it is completed or rejected.
+///
+/// # Errors
+///
+/// `PollTimeout` once `config.timeout` passes, or the first lookup error
+/// other than a gateway hop failure the gateway classified as retryable,
+/// which the poll retries.
+pub async fn poll_redemption_until_complete_with(
+    lookups: &impl TokenizationLookups,
+    id: &TokenizationRequestId,
+    config: &PollingConfig,
+) -> Result<TokenizationRequest, AlpacaTokenizationError> {
+    poll_until_terminal(lookups, id, config).await
+}
+
+/// Polls until the issuer detects the redemption transfer `tx_hash`.
+///
+/// # Errors
+///
+/// `PollTimeout` once `config.timeout` passes before detection, or the first
+/// lookup error other than a gateway hop failure the gateway classified as
+/// retryable, which the poll retries.
+pub async fn poll_for_redemption_with(
+    lookups: &impl TokenizationLookups,
+    tx_hash: &TxHash,
+    config: &PollingConfig,
+) -> Result<TokenizationRequest, AlpacaTokenizationError> {
+    let start = Instant::now();
+    let mut interval = tokio::time::interval(config.interval);
+    interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+    loop {
+        interval.tick().await;
+
+        if start.elapsed() >= config.timeout {
+            return Err(AlpacaTokenizationError::PollTimeout {
+                elapsed: start.elapsed(),
+            });
+        }
+
+        match lookups.find_redemption_by_tx(tx_hash).await {
+            Ok(Some(request)) => return Ok(request),
+            Ok(None) => {}
+            Err(error) => retry_gateway_hop(error, &mut interval, start, config)?,
+        }
+    }
+}
+
+/// Polls until a tokenization request reaches a terminal state (Completed or
+/// Rejected).
+async fn poll_until_terminal(
+    lookups: &impl TokenizationLookups,
+    id: &TokenizationRequestId,
+    config: &PollingConfig,
+) -> Result<TokenizationRequest, AlpacaTokenizationError> {
+    let start = Instant::now();
+    let mut interval = tokio::time::interval(config.interval);
+    interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+    loop {
+        interval.tick().await;
+
+        if start.elapsed() >= config.timeout {
+            return Err(AlpacaTokenizationError::PollTimeout {
+                elapsed: start.elapsed(),
+            });
+        }
+
+        let request = match lookups.get_request(id).await {
+            Ok(request) => request,
+            Err(error) => {
+                retry_gateway_hop(error, &mut interval, start, config)?;
+                continue;
+            }
+        };
+
+        match request.status {
+            TokenizationRequestStatus::Completed | TokenizationRequestStatus::Rejected => {
+                info!(
+                    target: "tokenization",
+                    request_id = %id.0,
+                    status = %request.status,
+                    "Tokenization request reached terminal state"
+                );
+                return Ok(request);
+            }
+            TokenizationRequestStatus::Pending => {
+                trace!(
+                    target: "tokenization",
+                    request_id = %id.0,
+                    elapsed = ?start.elapsed(),
+                    "Tokenization request still pending"
+                );
+            }
+        }
+    }
+}
+
+/// Keeps a poll running through a lookup that failed on the gateway hop when
+/// the gateway classified the failure as retryable: the next lookup runs at
+/// the next interval, or after the wait the gateway relayed when that is
+/// longer, never past the poll deadline. Every other lookup error ends the
+/// poll.
+fn retry_gateway_hop(
+    error: AlpacaTokenizationError,
+    interval: &mut Interval,
+    start: Instant,
+    config: &PollingConfig,
+) -> Result<(), AlpacaTokenizationError> {
+    match error {
+        AlpacaTokenizationError::Gateway(hop) if hop.retryable => {
+            warn!(
+                target: "tokenization",
+                error = %hop,
+                retry_after = ?hop.retry_after,
+                "Tokenization lookup failed at the gateway, polling again"
+            );
+            if let Some(wait) = hop.retry_after {
+                let remaining = config.timeout.saturating_sub(start.elapsed());
+                interval.reset_after(wait.max(config.interval).min(remaining));
+            }
+            Ok(())
+        }
+        error => Err(error),
     }
 }
 
@@ -486,6 +672,14 @@ pub enum AlpacaTokenizationError {
     /// cannot prove it is the one it is bound to; refused rather than assumed.
     #[error("tokenization request {id} reports no network")]
     NetworkMissing { id: TokenizationRequestId },
+
+    /// The hop to the Alpaca gateway failed or the gateway refused the call
+    /// without relaying an Alpaca answer. Backpressure only when the gateway
+    /// relayed a wait; the polls retry it only when the gateway classified it
+    /// as retryable. Never a definitive mint rejection: the mint may still
+    /// have reached Alpaca.
+    #[error(transparent)]
+    Gateway(#[from] GatewayHopError),
 }
 
 /// Opaque body text from an Alpaca tokenization API error response.
@@ -493,7 +687,10 @@ pub enum AlpacaTokenizationError {
 pub struct AlpacaApiErrorMessage(String);
 
 impl AlpacaApiErrorMessage {
-    pub(crate) fn from_response(message: String) -> Self {
+    /// Wraps an Alpaca error body; a gateway client rebuilds it from the
+    /// gateway's answer.
+    #[must_use]
+    pub fn from_response(message: String) -> Self {
         Self(message)
     }
 
@@ -505,11 +702,9 @@ impl AlpacaApiErrorMessage {
 
 #[cfg(any(test, feature = "test-support"))]
 impl AlpacaApiErrorMessage {
-    /// Test-only constructor so downstream crates can build a classified
-    /// `AlpacaTokenizationError::ApiError` (e.g. a consumer's `find_backpressure`
-    /// tests) without depending on the production `from_response` path, which
-    /// stays crate-private since it is only ever built from a real HTTP
-    /// response body.
+    /// Test only constructor so downstream crates can build a classified
+    /// `AlpacaTokenizationError::ApiError` (e.g. a consumer's
+    /// `find_backpressure` tests) with a short name.
     pub fn for_test(message: impl Into<String>) -> Self {
         Self(message.into())
     }
@@ -526,7 +721,10 @@ impl std::fmt::Display for AlpacaApiErrorMessage {
 pub struct InvalidTokenizationParameters(String);
 
 impl InvalidTokenizationParameters {
-    pub(crate) fn from_response(details: String) -> Self {
+    /// Wraps an Alpaca error body; a gateway client rebuilds it from the
+    /// gateway's answer.
+    #[must_use]
+    pub fn from_response(details: String) -> Self {
         Self(details)
     }
 
@@ -550,6 +748,7 @@ impl AlpacaTokenizationError {
             | Self::UnsupportedAccount
             | Self::InvalidParameters { .. } => true,
             Self::Reqwest(_)
+            | Self::Gateway(_)
             | Self::Auth(_)
             | Self::JsonParse(_)
             | Self::Utf8(_)
@@ -577,11 +776,12 @@ impl AlpacaTokenizationError {
         }
     }
 
-    /// Classifies this error as broker rate-limiting (HTTP 429), returning
-    /// its `Retry-After` hint when the broker sent one. Every other variant
-    /// returns `None` -- an exhaustive match so a new variant added later
-    /// forces a conscious decision here rather than silently classifying as
-    /// "not backpressure".
+    /// Classifies this error as rate limiting (a broker HTTP 429, a throttled
+    /// token mint, or a gateway hop that relayed a wait), returning the
+    /// `Retry-After` hint when one was sent. Every other variant returns
+    /// `None`: an exhaustive match so a new variant added later forces a
+    /// conscious decision here rather than silently classifying as "not
+    /// backpressure".
     #[must_use]
     pub fn backpressure(&self) -> Option<Backpressure> {
         match self {
@@ -598,6 +798,10 @@ impl AlpacaTokenizationError {
             Self::Auth(error) if error.is_rate_limited() => Some(Backpressure {
                 retry_after: error.retry_after(),
             }),
+
+            // The gateway relays a wait (a throttled credential mint behind
+            // it) as the hop's `retry_after`.
+            Self::Gateway(hop) => hop.backpressure(),
 
             Self::ApiError { .. }
             | Self::Reqwest(_)
@@ -776,16 +980,16 @@ impl AlpacaTokenizationClient {
             "Sending tokenization mint request"
         );
 
-        let response = self
+        let builder = self
             .auth
             .apply_apca(self.http_client.post(&url))
             .await?
             .header("Idempotency-Key", request.client_request_id.to_string())
-            .json(&request)
-            .send()
-            .await?;
-
+            .json(&request);
+        let response = crate::request_id::send(builder).await?;
         let status = response.status();
+        crate::request_id::record(status, response.headers());
+
         let retry_after = retry_after_from_response_headers(response.headers());
 
         if status.is_success() {
@@ -971,87 +1175,6 @@ impl AlpacaTokenizationClient {
         })
     }
 
-    /// Poll until a tokenization request reaches a terminal state (Completed or Rejected).
-    ///
-    /// # Errors
-    ///
-    /// - `PollTimeout` if the timeout is exceeded
-    /// - `RequestNotFound` if the request doesn't exist
-    /// - `ApiError` for API errors
-    /// - `Reqwest` for network errors
-    async fn poll_until_terminal(
-        &self,
-        id: &TokenizationRequestId,
-        config: &PollingConfig,
-    ) -> Result<TokenizationRequest, AlpacaTokenizationError> {
-        let start = Instant::now();
-        let mut interval = tokio::time::interval(config.interval);
-        interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
-
-        loop {
-            interval.tick().await;
-
-            if start.elapsed() >= config.timeout {
-                return Err(AlpacaTokenizationError::PollTimeout {
-                    elapsed: start.elapsed(),
-                });
-            }
-
-            let request = self.get_request(id).await?;
-
-            match request.status {
-                TokenizationRequestStatus::Completed | TokenizationRequestStatus::Rejected => {
-                    info!(
-                        target: "tokenization",
-                        request_id = %id.0,
-                        status = %request.status,
-                        "Tokenization request reached terminal state"
-                    );
-                    return Ok(request);
-                }
-                TokenizationRequestStatus::Pending => {
-                    trace!(
-                        target: "tokenization",
-                        request_id = %id.0,
-                        elapsed = ?start.elapsed(),
-                        "Tokenization request still pending"
-                    );
-                }
-            }
-        }
-    }
-
-    /// Poll until Alpaca detects a redemption transfer.
-    ///
-    /// # Errors
-    ///
-    /// - `PollTimeout` if the timeout is exceeded before detection
-    /// - `ApiError` for API errors
-    /// - `Reqwest` for network errors
-    async fn poll_for_redemption_detection(
-        &self,
-        tx_hash: &TxHash,
-        config: &PollingConfig,
-    ) -> Result<TokenizationRequest, AlpacaTokenizationError> {
-        let start = Instant::now();
-        let mut interval = tokio::time::interval(config.interval);
-        interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
-
-        loop {
-            interval.tick().await;
-
-            if start.elapsed() >= config.timeout {
-                return Err(AlpacaTokenizationError::PollTimeout {
-                    elapsed: start.elapsed(),
-                });
-            }
-
-            if let Some(request) = self.find_redemption_by_tx(tx_hash).await? {
-                return Ok(request);
-            }
-        }
-    }
-
     async fn fetch_requests_body(
         &self,
         params: &ListRequestsParams,
@@ -1075,9 +1198,10 @@ impl AlpacaTokenizationClient {
             request = request.query(&[("underlying_symbol", symbol.to_string())]);
         }
 
-        let response = request.send().await?;
-
+        let response = crate::request_id::send(request).await?;
         let status = response.status();
+        crate::request_id::record(status, response.headers());
+
         let retry_after = retry_after_from_response_headers(response.headers());
         // Read raw bytes; convert the success body with strict `String::from_utf8`
         // so invalid UTF-8 fails fast for the caller's parse. Lossy decoding is
@@ -1862,6 +1986,27 @@ mod tests {
         assert_eq!(error.backpressure(), None);
     }
 
+    #[test]
+    fn a_gateway_hop_is_backpressure_only_when_it_relays_a_wait() {
+        let wait = Duration::from_secs(9);
+
+        assert_eq!(
+            gateway_hop(true, Some(wait)).backpressure(),
+            Some(Backpressure {
+                retry_after: Some(wait)
+            })
+        );
+        assert_eq!(gateway_hop(true, None).backpressure(), None);
+    }
+
+    fn gateway_hop(retryable: bool, retry_after: Option<Duration>) -> AlpacaTokenizationError {
+        AlpacaTokenizationError::Gateway(GatewayHopError {
+            retryable,
+            retry_after,
+            ..GatewayHopError::transport("gateway unavailable")
+        })
+    }
+
     fn sample_tokenization_request_json(
         id: &str,
         request_type: &str,
@@ -2430,7 +2575,9 @@ mod tests {
         };
 
         let id = tokenization_request_id("req_1");
-        let result = client.poll_until_terminal(&id, &config).await.unwrap();
+        let result = poll_mint_until_complete_with(&create_test_service(client), &id, &config)
+            .await
+            .unwrap();
 
         assert_eq!(result.status, TokenizationRequestStatus::Completed);
         list_mock.assert();
@@ -2462,7 +2609,9 @@ mod tests {
         };
 
         let id = tokenization_request_id("req_target");
-        let result = client.poll_until_terminal(&id, &config).await.unwrap();
+        let result = poll_mint_until_complete_with(&create_test_service(client), &id, &config)
+            .await
+            .unwrap();
 
         assert_eq!(result.id, id);
         assert_eq!(result.status, TokenizationRequestStatus::Completed);
@@ -2491,7 +2640,10 @@ mod tests {
         };
 
         let id = tokenization_request_id("req_1");
-        let result = client.poll_until_terminal(&id, &config).await.unwrap();
+        let result =
+            poll_redemption_until_complete_with(&create_test_service(client), &id, &config)
+                .await
+                .unwrap();
 
         assert_eq!(result.status, TokenizationRequestStatus::Rejected);
         assert!(logs_contain(
@@ -2529,8 +2681,7 @@ mod tests {
             max_retry_delay: Duration::from_millis(100),
         };
 
-        let result = client
-            .poll_for_redemption_detection(&hash, &config)
+        let result = poll_for_redemption_with(&create_test_service(client), &hash, &config)
             .await
             .unwrap();
 
@@ -2560,7 +2711,8 @@ mod tests {
         };
 
         let id = tokenization_request_id("req_1");
-        let result = client.poll_until_terminal(&id, &config).await;
+        let result =
+            poll_mint_until_complete_with(&create_test_service(client), &id, &config).await;
 
         assert!(
             matches!(result, Err(AlpacaTokenizationError::PollTimeout { .. })),
@@ -2914,5 +3066,440 @@ mod tests {
         assert_eq!(result.len(), 1, "Should filter out non-pending requests");
         assert_eq!(result[0].id, tokenization_request_id("req_1"));
         pending_mock.assert();
+    }
+
+    #[tokio::test]
+    async fn traffic_of_a_read_and_a_rejected_mint_is_collected() {
+        let server = MockServer::start();
+        let service = create_test_service_from_mock(&server);
+
+        let read_mock = server.mock(|when, then| {
+            when.method(GET).path(tokenization_requests_path());
+            then.status(200)
+                .header("content-type", "application/json")
+                .header("X-Request-ID", "read-request-id")
+                .json_body(json!([sample_tokenization_request_json(
+                    "req_1", "mint", "AAPL"
+                )]));
+        });
+        let mint_mock = server.mock(|when, then| {
+            when.method(POST).path(tokenization_mint_path());
+            then.status(403)
+                .header("X-Request-ID", "mint-request-id")
+                .body("insufficient position");
+        });
+
+        let ((read, mint), traffic) = crate::request_id::collect(async {
+            let read = service.get_request(&tokenization_request_id("req_1")).await;
+            let mint = service
+                .request_mint(
+                    Symbol::new("AAPL").unwrap(),
+                    FractionalShares::new(float!(1)),
+                    address!("0x1234567890abcdef1234567890abcdef12345678"),
+                    issuer_request_id("collected-mint"),
+                )
+                .await;
+            (read, mint)
+        })
+        .await;
+
+        assert_eq!(read.unwrap().id, tokenization_request_id("req_1"));
+        assert!(matches!(
+            mint,
+            Err(AlpacaTokenizationError::InsufficientPosition { .. })
+        ));
+        assert_eq!(traffic.request_ids, ["read-request-id", "mint-request-id"]);
+        assert_eq!(traffic.requests_sent, 2);
+        assert_eq!(traffic.last_status, Some(403));
+        read_mock.assert();
+        mint_mock.assert();
+    }
+
+    type RequestAnswer =
+        Box<dyn Fn(usize) -> Result<TokenizationRequest, AlpacaTokenizationError> + Send + Sync>;
+    type RedemptionAnswer = Box<
+        dyn Fn(usize) -> Result<Option<TokenizationRequest>, AlpacaTokenizationError> + Send + Sync,
+    >;
+
+    /// [`TokenizationLookups`] answering each call from a script keyed by the
+    /// call's index, counting the calls.
+    struct ScriptedLookups {
+        calls: std::sync::atomic::AtomicUsize,
+        request: RequestAnswer,
+        redemption: RedemptionAnswer,
+    }
+
+    impl ScriptedLookups {
+        fn requests(
+            answer: impl Fn(usize) -> Result<TokenizationRequest, AlpacaTokenizationError>
+            + Send
+            + Sync
+            + 'static,
+        ) -> Self {
+            Self {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                request: Box::new(answer),
+                redemption: Box::new(|_| unreachable!("the request polls never look up by tx")),
+            }
+        }
+
+        fn redemptions(
+            answer: impl Fn(usize) -> Result<Option<TokenizationRequest>, AlpacaTokenizationError>
+            + Send
+            + Sync
+            + 'static,
+        ) -> Self {
+            Self {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                request: Box::new(|_| unreachable!("redemption detection never reads by id")),
+                redemption: Box::new(answer),
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn next_call(&self) -> usize {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl TokenizationLookups for ScriptedLookups {
+        fn get_request(
+            &self,
+            _id: &TokenizationRequestId,
+        ) -> impl Future<Output = Result<TokenizationRequest, AlpacaTokenizationError>> + Send
+        {
+            let answer = (self.request)(self.next_call());
+            async move { answer }
+        }
+
+        fn find_redemption_by_tx(
+            &self,
+            _tx_hash: &TxHash,
+        ) -> impl Future<Output = Result<Option<TokenizationRequest>, AlpacaTokenizationError>> + Send
+        {
+            let answer = (self.redemption)(self.next_call());
+            async move { answer }
+        }
+    }
+
+    fn fast_polling(timeout: Duration) -> PollingConfig {
+        PollingConfig {
+            interval: Duration::from_millis(5),
+            timeout,
+            max_retries: 3,
+            min_retry_delay: Duration::from_millis(5),
+            max_retry_delay: Duration::from_millis(10),
+        }
+    }
+
+    #[tokio::test]
+    async fn mint_poll_over_lookups_returns_the_request_once_it_completes() {
+        let lookups = ScriptedLookups::requests(|call| {
+            Ok(if call < 2 {
+                TokenizationRequest::mock(TokenizationRequestStatus::Pending)
+            } else {
+                TokenizationRequest::mock_completed()
+            })
+        });
+
+        let request = poll_mint_until_complete_with(
+            &lookups,
+            &tokenization_request_id("MOCK_REQ_ID"),
+            &fast_polling(Duration::from_secs(5)),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(request.status, TokenizationRequestStatus::Completed);
+        assert_eq!(request.tx_hash, Some(TxHash::ZERO));
+        assert_eq!(lookups.calls(), 3);
+    }
+
+    #[tokio::test]
+    async fn redemption_poll_over_lookups_returns_a_rejected_request() {
+        let lookups = ScriptedLookups::requests(|_| {
+            Ok(TokenizationRequest::mock(
+                TokenizationRequestStatus::Rejected,
+            ))
+        });
+
+        let request = poll_redemption_until_complete_with(
+            &lookups,
+            &tokenization_request_id("MOCK_REQ_ID"),
+            &fast_polling(Duration::from_secs(5)),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(request.status, TokenizationRequestStatus::Rejected);
+        assert_eq!(lookups.calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn request_poll_over_lookups_times_out_while_pending() {
+        let lookups = ScriptedLookups::requests(|_| {
+            Ok(TokenizationRequest::mock(
+                TokenizationRequestStatus::Pending,
+            ))
+        });
+
+        let error = poll_mint_until_complete_with(
+            &lookups,
+            &tokenization_request_id("MOCK_REQ_ID"),
+            &fast_polling(Duration::from_millis(40)),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(error, AlpacaTokenizationError::PollTimeout { .. }),
+            "expected PollTimeout, got {error:?}"
+        );
+        assert!(lookups.calls() > 1);
+    }
+
+    #[tokio::test]
+    async fn request_poll_over_lookups_stops_on_a_request_from_another_network() {
+        let lookups = ScriptedLookups::requests(|_| {
+            Err(AlpacaTokenizationError::WrongNetwork {
+                id: tokenization_request_id("MOCK_REQ_ID"),
+                expected: Chain::Base,
+                actual: Network::new("ethereum"),
+            })
+        });
+
+        let error = poll_redemption_until_complete_with(
+            &lookups,
+            &tokenization_request_id("MOCK_REQ_ID"),
+            &fast_polling(Duration::from_secs(5)),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(error, AlpacaTokenizationError::WrongNetwork { .. }),
+            "expected WrongNetwork, got {error:?}"
+        );
+        assert_eq!(lookups.calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn redemption_detection_over_lookups_waits_until_the_transfer_is_seen() {
+        let lookups = ScriptedLookups::redemptions(|call| {
+            Ok((call >= 2).then(|| TokenizationRequest::mock(TokenizationRequestStatus::Pending)))
+        });
+
+        let request = poll_for_redemption_with(
+            &lookups,
+            &TxHash::ZERO,
+            &fast_polling(Duration::from_secs(5)),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(request.status, TokenizationRequestStatus::Pending);
+        assert_eq!(lookups.calls(), 3);
+    }
+
+    #[tokio::test]
+    async fn redemption_detection_over_lookups_times_out_while_undetected() {
+        let lookups = ScriptedLookups::redemptions(|_| Ok(None));
+
+        let error = poll_for_redemption_with(
+            &lookups,
+            &TxHash::ZERO,
+            &fast_polling(Duration::from_millis(40)),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(error, AlpacaTokenizationError::PollTimeout { .. }),
+            "expected PollTimeout, got {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn redemption_detection_over_lookups_stops_on_a_request_without_a_network() {
+        let lookups = ScriptedLookups::redemptions(|_| {
+            Err(AlpacaTokenizationError::NetworkMissing {
+                id: tokenization_request_id("MOCK_REQ_ID"),
+            })
+        });
+
+        let error = poll_for_redemption_with(
+            &lookups,
+            &TxHash::ZERO,
+            &fast_polling(Duration::from_secs(5)),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(error, AlpacaTokenizationError::NetworkMissing { .. }),
+            "expected NetworkMissing, got {error:?}"
+        );
+        assert_eq!(lookups.calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn request_polls_over_lookups_retry_a_gateway_failure_the_gateway_calls_retryable() {
+        let lookups = ScriptedLookups::requests(|call| match call {
+            0 | 2 => Err(gateway_hop(true, None)),
+            1 => Ok(TokenizationRequest::mock(
+                TokenizationRequestStatus::Pending,
+            )),
+            _ => Ok(TokenizationRequest::mock_completed()),
+        });
+
+        let request = poll_mint_until_complete_with(
+            &lookups,
+            &tokenization_request_id("MOCK_REQ_ID"),
+            &fast_polling(Duration::from_secs(5)),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(request.status, TokenizationRequestStatus::Completed);
+        assert_eq!(lookups.calls(), 4);
+    }
+
+    #[tokio::test]
+    async fn redemption_detection_over_lookups_retries_a_gateway_failure_the_gateway_calls_retryable()
+     {
+        let lookups = ScriptedLookups::redemptions(|call| match call {
+            0 => Err(gateway_hop(true, None)),
+            1 => Ok(None),
+            _ => Ok(Some(TokenizationRequest::mock(
+                TokenizationRequestStatus::Pending,
+            ))),
+        });
+
+        let request = poll_for_redemption_with(
+            &lookups,
+            &TxHash::ZERO,
+            &fast_polling(Duration::from_secs(5)),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(request.status, TokenizationRequestStatus::Pending);
+        assert_eq!(lookups.calls(), 3);
+    }
+
+    /// A refusal the gateway decided itself cannot clear on a later poll,
+    /// so both polls return it from the first lookup.
+    #[tokio::test]
+    async fn polls_over_lookups_stop_on_a_gateway_refusal() {
+        let requests = ScriptedLookups::requests(|call| match call {
+            0 => Err(gateway_hop(false, None)),
+            _ => Ok(TokenizationRequest::mock_completed()),
+        });
+        let error = poll_redemption_until_complete_with(
+            &requests,
+            &tokenization_request_id("MOCK_REQ_ID"),
+            &fast_polling(Duration::from_secs(5)),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&error, AlpacaTokenizationError::Gateway(hop) if !hop.retryable),
+            "{error:?}"
+        );
+        assert_eq!(requests.calls(), 1);
+
+        let redemptions = ScriptedLookups::redemptions(|call| match call {
+            0 => Err(gateway_hop(false, None)),
+            _ => Ok(Some(TokenizationRequest::mock_completed())),
+        });
+        let error = poll_for_redemption_with(
+            &redemptions,
+            &TxHash::ZERO,
+            &fast_polling(Duration::from_secs(5)),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&error, AlpacaTokenizationError::Gateway(hop) if !hop.retryable),
+            "{error:?}"
+        );
+        assert_eq!(redemptions.calls(), 1);
+    }
+
+    /// Only the gateway hop is retried: an Alpaca 5xx on the direct path
+    /// ends the poll as it always has.
+    #[tokio::test]
+    async fn request_poll_over_lookups_stops_on_an_alpaca_server_error() {
+        let lookups = ScriptedLookups::requests(|call| match call {
+            0 => Err(AlpacaTokenizationError::ApiError {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                message: AlpacaApiErrorMessage::from_response("unavailable".to_string()),
+                retry_after: None,
+            }),
+            _ => Ok(TokenizationRequest::mock_completed()),
+        });
+
+        let error = poll_mint_until_complete_with(
+            &lookups,
+            &tokenization_request_id("MOCK_REQ_ID"),
+            &fast_polling(Duration::from_secs(5)),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(&error, AlpacaTokenizationError::ApiError { status, .. } if *status == StatusCode::SERVICE_UNAVAILABLE),
+            "{error:?}"
+        );
+        assert_eq!(lookups.calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn request_poll_over_lookups_holds_off_for_the_wait_a_gateway_hop_relays() {
+        let wait = Duration::from_millis(200);
+        let lookups = ScriptedLookups::requests(move |call| match call {
+            0 => Err(gateway_hop(true, Some(wait))),
+            _ => Ok(TokenizationRequest::mock_completed()),
+        });
+
+        let started = Instant::now();
+        poll_mint_until_complete_with(
+            &lookups,
+            &tokenization_request_id("MOCK_REQ_ID"),
+            &fast_polling(Duration::from_secs(5)),
+        )
+        .await
+        .unwrap();
+
+        assert!(started.elapsed() >= wait, "{:?}", started.elapsed());
+        assert_eq!(lookups.calls(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_relayed_wait_never_holds_a_poll_past_its_deadline() {
+        let lookups =
+            ScriptedLookups::requests(|_| Err(gateway_hop(true, Some(Duration::from_secs(60)))));
+
+        let started = Instant::now();
+        let error = poll_mint_until_complete_with(
+            &lookups,
+            &tokenization_request_id("MOCK_REQ_ID"),
+            &fast_polling(Duration::from_millis(50)),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(error, AlpacaTokenizationError::PollTimeout { .. }),
+            "expected PollTimeout, got {error:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
     }
 }

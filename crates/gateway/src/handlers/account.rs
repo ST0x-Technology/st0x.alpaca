@@ -13,7 +13,7 @@ use st0x_alpaca_gateway_api::dto::account::{
 
 use crate::answer::{Sent, broker};
 use crate::extract::{Params, Query};
-use crate::state::{AppState, Call};
+use crate::state::{AppState, Call, Intent};
 
 pub(super) fn route(operation: Operation) -> Option<MethodRouter<AppState>> {
     Some(match operation {
@@ -28,7 +28,7 @@ pub(super) fn route(operation: Operation) -> Option<MethodRouter<AppState>> {
 
 async fn funds(State(state): State<AppState>, call: Call) -> Response {
     state
-        .read(call, async {
+        .read(call, Intent::default(), async {
             state
                 .broker
                 .account_funds()
@@ -41,7 +41,7 @@ async fn funds(State(state): State<AppState>, call: Call) -> Response {
 
 async fn withdrawable_cash(State(state): State<AppState>, call: Call) -> Response {
     state
-        .read(call, async {
+        .read(call, Intent::default(), async {
             state
                 .broker
                 .withdrawable_cash_cents()
@@ -54,7 +54,7 @@ async fn withdrawable_cash(State(state): State<AppState>, call: Call) -> Respons
 
 async fn inventory(State(state): State<AppState>, call: Call) -> Response {
     state
-        .read(call, async {
+        .read(call, Intent::default(), async {
             state
                 .broker
                 .fetch_inventory()
@@ -70,8 +70,9 @@ async fn position_mark(
     call: Call,
     Params(path): Params<SymbolPath>,
 ) -> Response {
+    let intent = Intent::default().key(&path.symbol);
     state
-        .read(call, async {
+        .read(call, intent, async {
             state
                 .broker
                 .fetch_position_mark(&path.symbol)
@@ -82,33 +83,49 @@ async fn position_mark(
         .await
 }
 
+/// Page cap of a bot `activities.list`, the direct context method's cap.
+const BOT_ACTIVITY_PAGES: usize = 1000;
+
+/// Pages `activities.list` may read for `call`. A human call reads at most
+/// the units its admission charged, one per Alpaca request, so the shared
+/// human budget counts every page it can send.
+fn activity_pages(call: &Call) -> usize {
+    if call.principal.tier.is_human() {
+        usize::try_from(call.operation.human_budget_cost()).unwrap_or(0)
+    } else {
+        BOT_ACTIVITY_PAGES
+    }
+}
+
 async fn activities(
     State(state): State<AppState>,
     call: Call,
     Query(query): Query<ActivitiesQuery>,
 ) -> Response {
-    let activity_types = query
-        .types
-        .split(',')
-        .map(str::trim)
-        .filter(|kind| !kind.is_empty())
-        .map(str::to_string)
-        .collect();
+    // The account filter is the deployment's own: the broker carries the
+    // configured account id and no request field can change it.
+    let query = AccountActivitiesQuery {
+        activity_types: query
+            .types
+            .split(',')
+            .map(str::trim)
+            .filter(|kind| !kind.is_empty())
+            .map(str::to_string)
+            .collect(),
+        after: query.after,
+        until: query.until,
+    };
+    let max_pages = activity_pages(&call);
 
     state
-        .read(call, async {
-            // The account filter is the deployment's own: the context carries
-            // the configured account id and no request field can change it.
+        .read(call, Intent::default(), async {
             state
-                .config
                 .broker
-                .fetch_account_activities(&AccountActivitiesQuery {
-                    activity_types,
-                    after: query.after,
-                    until: query.until,
-                })
+                .fetch_account_activities(&query, max_pages)
                 .await
-                .map(|activities| ActivitiesResponse { activities })
+                .map(|activities| ActivitiesResponse {
+                    activities: activities.into_iter().map(Into::into).collect(),
+                })
                 .map_err(|error| broker(&error, Sent::Read))
         })
         .await

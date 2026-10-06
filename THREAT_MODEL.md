@@ -1,25 +1,17 @@
 # Threat model
 
-This library is the typed boundary between st0x services and Alpaca. It does
-not own balances or run business workflows, but a wrong wire value can place
-an order, conversion, journal, withdrawal, mint, or redemption with the wrong
-asset or amount, and a leaked credential can do the same directly.
+This repository holds the `st0x-alpaca` library, the typed boundary between st0x services and Alpaca, and the `t0-alpaca` gateway, a service that runs the library with one Alpaca credential on behalf of bots and operators. Neither owns balances or runs business workflows, but a wrong wire value can place an order, conversion, journal, withdrawal, mint, or redemption with the wrong asset or amount, and a leaked credential can do the same directly.
 
-## Trust boundaries and assets
+## Library trust boundaries and assets
 
 - Consumer domain values cross into JSON requests sent to Alpaca.
 - Alpaca JSON responses cross into validated Rust types.
-- Credentials (Basic key pair, KMS-signed or locally signed JWT assertions,
-  bearer tokens) cross into HTTP headers.
-- The `mock` feature runs local HTTP servers and, for the tokenization mock,
-  sends onchain ERC-20 transfers from a test wallet. It is for test suites
-  only.
+- Credentials (Basic key pair, KMS signed or locally signed JWT assertions, bearer tokens) cross into HTTP headers.
+- The `mock` feature runs local HTTP servers and, for the tokenization mock, sends onchain ERC-20 transfers from a test wallet. It is for test suites only.
 
-The protected assets are equity quantities, USD cash and prices, USDC
-conversion and transfer amounts, symbol and network routing, idempotency
-keys, Travel Rule beneficiary identity, and API credentials.
+The protected assets are equity quantities, USD cash and prices, USDC conversion and transfer amounts, symbol and network routing, idempotency keys, Travel Rule beneficiary identity, and API credentials.
 
-## Threats and controls
+## Library threats and controls
 
 | Threat | Concrete risk | Control (where) |
 | --- | --- | --- |
@@ -28,16 +20,39 @@ keys, Travel Rule beneficiary identity, and API credentials.
 | Repudiation | A retried mutation cannot be reconciled with what Alpaca executed. | Caller-supplied idempotency keys are sent unchanged: `client_order_id` for orders and conversions, `Idempotency-Key` and `client_request_id` for mints. A duplicate `client_order_id` adopts the existing order; keyed lookups (`orders:by_client_order_id`, mint recovery by issuer request id, redemption by tx hash) recover a lost response. A stalled conversion reports how the cancel was answered instead of claiming a result. |
 | Information disclosure | Credentials, tokens, private keys, or Travel Rule identity appear in logs or errors. | `Debug` for `AlpacaAuth`, `AlpacaBrokerApiCtx`, the clients, the token cache, and the signer redacts secrets; credential header values are marked sensitive. Wallet response bodies have `beneficiary_entity_name` redacted in trace logs and `ApiError` messages, and a body that cannot be redacted is omitted (fail closed). Error bodies from KMS and the token endpoint are truncated to 512 bytes; a successful mint's token is never put in an error or log. Note: trace-level logs include full broker and market-data response bodies, which contain account balances; consumers must treat trace logs as sensitive. |
 | Denial of service | A malformed value panics, or a retry or poll never ends. | No `unwrap` or `expect` outside tests (Clippy denies them). Retries are limited to classified transient errors: the issuer policy retries at most 5 times with jittered backoff; wallet status polling retries 5xx at most 10 times, and the tx-hash poll retries transient reads (5xx, 408, 429, transport, non-deterministic auth), honoring `Retry-After`, only until its deadline. The SSE decoder caps a frame at 64 KiB and releases the buffer on a poison frame. Every poll loop is bounded: conversion orders (300 s, then cancel and a 30 s settle window), wallet transfers (30 min), tokenization requests (`PollingConfig` timeout), account activities (1000 pages and a repeated-token check). Broker, market-data, tokenization, issuer, and token-mint requests have connect and request timeouts. Known gap: wallet HTTP requests have no timeout (unchanged from the source, see `docs/parity.md`), so one hung wallet request can stall its caller past the poll deadline. Rate limits from the broker, market-data, wallet, tokenization, and issuer clients surface as `Backpressure` with the `Retry-After` hint so the consumer can back off; the corporate-action stream reports a 429 as `HttpStatus` and the consumer reconnect loop backs off, as in issuance. |
-| Elevation of privilege | A feature surface gains access to unrelated integrations. | Features are additive and each compiles alone. The crate exposes no account administration, and the wallet surface can only withdraw to an address that Alpaca reports as an approved whitelist entry for the asset. |
+| Elevation of privilege | A feature surface gains access to unrelated integrations, or a caller withdraws to an address that is not an approved whitelist entry. | Features are additive and each compiles alone. The `wallet` feature includes account administration: `create_whitelist_entry`, `delete_whitelist_entry`, `patch_whitelist_travel_rule`, `remove_whitelist_entries`, and `patch_all_whitelist_travel_rules` change the account's withdrawal whitelist, so any consumer built with `wallet` can add, remove, or change withdrawal destinations. `initiate_withdrawal` withdraws only to an address that Alpaca reports as an approved whitelist entry for the asset (`check_withdrawal_whitelist`), so a new entry cannot receive funds before Alpaca approves it. `submit_withdrawal` is the raw withdrawal POST without that check: its caller must run `check_withdrawal_whitelist`, and any destination rule of its own, before calling it, as the gateway's `wallet.withdraw` does. |
+
+## Gateway
+
+The gateway (`crates/gateway`, built to run as Cloud Run service `t0-alpaca`, see [docs/gateway.md](docs/gateway.md)) adds one trust boundary: callers to the gateway. Bot runtimes are to call it on Cloud Run with a Google ID token; humans call it through IAP on a load balancer. Everything a caller sends (token, path, query, body, `X-On-Behalf-Of`) is untrusted until the gateway has checked it. Behind the gateway, the library boundaries above apply unchanged. The gateway adds these protected assets: the broker credential it signs with, the binding to one account, the pinned destinations, and the audit stream.
+
+The gateway is the target credential boundary, not the current one. The controls below hold for traffic that goes through the gateway. Until the bots switch their transport to the gateway ([RAI-1935](https://linear.app/makeitrain/issue/RAI-1935)) and their direct credentials are removed ([RAI-1938](https://linear.app/makeitrain/issue/RAI-1938)), the bots keep calling Alpaca directly with their own credentials, outside every gateway control, and the Cloud Run, IAP, KMS key, and audit sink setup named below exists only once the t0.devops infrastructure for `t0-alpaca` is deployed.
+
+| Threat | Concrete risk | Control (where) |
+| --- | --- | --- |
+| Spoofing | A caller acts on a tier it does not hold, or a token minted for another service is accepted. | Each tier verifies its own identity (`crates/gateway/src/auth.rs`). Bot ID tokens: signature against Google's keys, issuer, audience `identity.bot_audience`, and `sub` in `identity.bot_principals`. Human IAP assertions: signature, issuer, and the audience of their own backend, so a read assertion never opens the write tier. Outside the app, Cloud Run `run.invoker` admits only the bot service accounts and the IAP service agent, and the load balancer routes only the two human prefixes. |
+| Tampering | A caller steers a mutation to another account, host, or destination, or smuggles path segments into an Alpaca URL. | No request names an account or an Alpaca URL: the account id, the account number, and every pinned address live only in the reviewed config, which refuses unknown keys at every level (`crates/gateway/src/config.rs`). Startup reads the account from Alpaca and refuses to serve unless it is ACTIVE and reports `expected_account_number` (`crates/gateway/src/state.rs`). Bot withdrawals go only to `wallet.bot_withdrawal_destinations` and human withdrawals never to them (`check_withdrawal_destination`), journals go only to a configured counterparty (`counterparty_account`), and mints go only to `tokenization.mint_recipients` (`crates/gateway/src/handlers`). Symbols are restricted to letters, digits, `.`, `/`, and `-`, and the library encodes every symbol as one path segment and refuses an empty, `.`, or `..` symbol (`UnsafeSymbol`). Request bodies refuse unknown fields. Order keys must have the form of the caller's tier: bare UUIDs for bots, `cli-` prefixed UUIDs for humans. |
+| Repudiation | A mutation cannot be tied to the caller who asked for it or to what Alpaca did. | Every request on an operation's route writes an audit record, including a request refused for its credential (caller `unverified`), its bot subject, or a body, path, or query that does not parse, with the caller, tier, operation, key, reason, request digest, money moving fields, Alpaca status, the `X-Request-ID` of every Alpaca response (`alpacaRequestIds`), outcome, and error code. A mutation that finishes after its answer writes a second `settled` record (`crates/gateway/src/audit.rs`, `crates/gateway-api/src/record.rs`). Human mutations need a non blank `reason`. The audit stream is routed to `t0-audit-trail`. |
+| Information disclosure | Credentials, tokens, or Travel Rule identity leak through the audit stream. | Audit records never carry credentials, tokens, Travel Rule names, or response bodies. With `environment = "production"`, config validation accepts only the Cloud KMS credential (`client_id` and `kms_key_version`) and refuses a Basic key pair or a local private key (`crates/gateway/src/config.rs`), so the production credential is a KMS key that only the runtime service account can sign with, and no key material lives in its config or the image. Any other environment also accepts the Basic key pair and the local private key, which then sit in that environment's mounted config. The Travel Rule beneficiary comes from config, never from a request. |
+| Denial of service | Operator scripts spend the credential's Alpaca rate limit that the bots need, or one request holds the gateway. | The read and write tiers share `human_budget_per_minute`, counted in requests sent to Alpaca (`crates/gateway/src/budget.rs`). Admission reserves the most requests the operation can send (`Operation::human_budget_cost`): 10 for `activities.list`, whose human calls stop at 10 pages, and 0 for the keyed reads that client poll loops repeat. When the work ends, the gateway keeps one unit per request sent and gives the rest back, only while the one minute window they were taken from is still current. `wallet.whitelist_remove` and `wallet.whitelist_patch_travel_rule` reserve the whitelist read at admission and, after it, one unit per entry they will write, all at once before the first write; a budget that cannot cover every write answers `429 backpressure` and writes nothing, and the units of writes a failed loop never sent go back. Bots are never charged. Human `activities.list` needs a non blank `types`. Every operation runs under its own deadline (`Operation::deadline`). |
+| Elevation of privilege | A reader or a bot reaches an operation outside its tier, or a switched off operation still runs. | An operation is mounted on a tier only when the capability matrix lists it (`crates/gateway-api/src/ops.rs`, `crates/gateway/src/routes.rs`); readers have no mutation routes. `disabled_operations` answers `403 capability_disabled` without a new image. Bot `orders.recover`, `orders.find`, and `conversions.find` accept only bot keys, so the bot never adopts a human order as its own. |
+
+Residual risks:
+
+- The Broker API credential belongs to the broker firm, not to the T0 account. The gateway pins one account, but whoever can sign with the KMS key can act on every account of the firm. Only the runtime service account holds `signerVerifier` on the key, KMS Data Access logging records every signature, and revoking the BrokerDash credential stops all its traffic at Alpaca.
+- Detached mutations are cut at shutdown. On SIGTERM a mutation still waiting for Alpaca answers `504 outcome_unknown` at once; if Alpaca has not answered 8 seconds after the signal, the process exits without its `settled` record. Callers reconcile from reads: by key for orders, conversions, and mints, and from the transfer, journal, or whitelist lists otherwise.
+- Keyless mutations that are not idempotent are never resent. Withdrawals, journals, and whitelist creation carry an `operationId` for the audit record only, because Alpaca does not dedupe them. The gateway sends each one at most once, and a caller that got `outcome_unknown` must read before trying again, or it can move money twice or create a second entry.
+- Whitelist removal and Travel Rule patching have no Alpaca key either, but every attempt drives the whitelist to the same end state, so their `outcome_unknown` answer carries `retryableWithSameKey: true` and the same request may be resent unchanged. When the loop failed after its first write, `alpacaObjectIds` names the entries it already changed.
 
 ## Required evidence
 
-- Request bodies preserve Alpaca's string encodings without rounding: exact
-  issuer redeem `qty`, order `qty` and `notional`, journal `qty`, withdrawal
-  amount (unit tests in each module).
-- Credential tests: insecure base and token URLs rejected for every client,
-  URL syntax in path segments encoded, redirects not followed (including the
-  token mint).
-- Each feature builds independently and the full test suite passes
-  (`.github/workflows/ci.yaml`).
+- Request bodies preserve Alpaca's string encodings without rounding: exact issuer redeem `qty`, order `qty` and `notional`, journal `qty`, withdrawal amount (unit tests in each module).
+- Credential tests: insecure base and token URLs rejected for every client, URL syntax in path segments encoded, redirects not followed (including the token mint).
+- Each feature builds independently and the full test suite passes (`.github/workflows/ci.yaml`).
 - `docs/parity.md` shows no silent behavior change against the consumer code.
+- Gateway caller identity: `crates/gateway/tests/gateway/core.rs` (`a_bot_token_for_another_audience_is_rejected`, `a_service_account_outside_bot_principals_is_forbidden_and_audited`, `a_read_tier_assertion_does_not_open_the_write_tier`, `a_human_prefix_without_iap_is_unauthenticated`, `readers_have_no_mutation_routes`).
+- Gateway account binding: `startup_refuses_an_account_with_another_number` and `startup_fails_closed_when_alpaca_is_unreachable` in `crates/gateway/tests/gateway/core.rs`, and the config unit tests in `crates/gateway/src/config.rs`.
+- Gateway credential: `production_refuses_every_credential_but_the_kms_key` and `every_credential_shape_parses_to_its_variant` in `crates/gateway/src/config.rs`.
+- Gateway destinations and key forms: `bot_withdrawal_to_another_approved_address_is_refused_before_sending` and `a_human_withdrawal_to_a_bot_destination_is_refused_before_sending` (`wallet.rs`), `a_mint_outside_the_pinned_recipients_is_refused_on_every_tier` (`tokenization.rs`), `a_key_in_the_other_tier_form_is_refused_before_anything_is_sent` (`orders.rs`), all in `crates/gateway/tests/gateway`.
+- Gateway audit: `bot_reads_funds_and_the_read_is_audited` (`core.rs`) and `a_withdrawal_past_its_deadline_answers_outcome_unknown_and_settles_applied` (`wallet.rs`).
+- The shipped image builds on every pull request (`gateway-oci` job in `.github/workflows/ci.yaml`), and the gateway crates compile with the shipped default features (`gateway` matrix entry).

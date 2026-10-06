@@ -65,11 +65,19 @@ pub struct AuditEvent {
     /// destination, counterparty, recipient.
     pub summary: BTreeMap<String, String>,
     pub alpaca_status: Option<u16>,
+    /// `X-Request-ID` of every Alpaca response this request received, in
+    /// order. Join key with Alpaca support.
+    #[serde(default)]
+    pub alpaca_request_ids: Vec<String>,
     /// Order, transfer, journal or tokenization request id from Alpaca.
     pub alpaca_object_id: Option<String>,
     pub outcome: Option<Outcome>,
     pub code: Option<ErrorCode>,
     pub rejection: Option<RejectionReason>,
     pub latency_ms: u64,
+    /// The caller went away before the answer, so none was delivered. The
+    /// record carries the Alpaca traffic sent until then.
+    #[serde(default)]
+    pub abandoned: bool,
     pub gateway_version: String,
 }

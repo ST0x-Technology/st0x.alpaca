@@ -498,7 +498,10 @@ impl KmsJwtAuth {
             ])
             .send()
             .await?;
+        // Alpaca answered: record its request id and status for the audit,
+        // but do not count the mint as an API request.
         let status = resp.status();
+        crate::request_id::record(status, resp.headers());
         if !status.is_success() {
             let retry_after = retry_after_from_response_headers(resp.headers());
             return Err(KmsJwtError::TokenStatus {
@@ -1144,6 +1147,45 @@ mod tests {
         let header = runtime.broker_authorization().await.unwrap();
 
         assert_eq!(header.to_str().unwrap(), "Bearer tok-runtime");
+        token_mock.assert_calls(1);
+    }
+
+    /// A refused mint is the only Alpaca answer an operation gets when authx
+    /// rejects the credential, so its request id must reach the audit. It is
+    /// not an API request and does not count as one.
+    #[tokio::test]
+    async fn a_refused_mint_records_its_answer_without_counting_a_request() {
+        let server = MockServer::start_async().await;
+        let token_mock = server.mock(|when, then| {
+            when.method(httpmock::Method::POST).path("/token");
+            then.status(401)
+                .header(crate::request_id::ALPACA_REQUEST_ID_HEADER, "mint-refused")
+                .body("invalid client");
+        });
+        let (_, pem) = test_key_pem();
+        let runtime = AuthRuntime::build(
+            AlpacaAuth::PrivateKeyJwt {
+                client_id: "CKREFUSED".to_string(),
+                private_key_pem: pem,
+            },
+            &server.url("/token"),
+        )
+        .unwrap();
+
+        let (result, traffic) = crate::request_id::collect(runtime.broker_authorization()).await;
+
+        assert!(
+            matches!(result, Err(KmsJwtError::TokenStatus { status: 401, .. })),
+            "{result:?}"
+        );
+        assert_eq!(
+            traffic,
+            crate::request_id::Traffic {
+                request_ids: vec!["mint-refused".to_string()],
+                requests_sent: 0,
+                last_status: Some(401),
+            }
+        );
         token_mock.assert_calls(1);
     }
 

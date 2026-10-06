@@ -9,6 +9,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use httpmock::Mock;
 use httpmock::prelude::*;
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use p256::ecdsa::SigningKey;
@@ -21,7 +22,7 @@ use st0x_alpaca_gateway::audit::MemorySink;
 use st0x_alpaca_gateway::config::GatewayConfig;
 use st0x_alpaca_gateway::routes::{Verifiers, app};
 use st0x_alpaca_gateway::state::AppState;
-use st0x_alpaca_gateway_api::client::{GatewayClient, StaticToken};
+use st0x_alpaca_gateway_api::client::{ClientError, GatewayClient, StaticToken, TokenSource};
 use st0x_alpaca_gateway_api::{AuditEvent, Tier};
 use tower::ServiceExt as _;
 
@@ -40,6 +41,9 @@ const EC_KID: &str = "iap-test";
 const RSA_PEM: &str = include_str!("fixtures/bot-signing-key.pem");
 const EC_SECRET: [u8; 32] = [7; 32];
 
+/// Rows in a full Alpaca activities page.
+pub const ACTIVITY_PAGE_SIZE: usize = 100;
+
 pub struct Harness {
     pub alpaca: MockServer,
     /// Held so the key server keeps answering for the harness's lifetime.
@@ -47,6 +51,22 @@ pub struct Harness {
     pub app: Router,
     pub state: AppState,
     pub audit: MemorySink,
+}
+
+/// An IAP assertion sent as IAP forwards it after verifying a human, in
+/// `x-goog-iap-jwt-assertion`, so the harness can stand in for the load
+/// balancer in front of a human tier.
+#[derive(Clone)]
+pub struct IapAssertion(pub String);
+
+impl TokenSource for IapAssertion {
+    async fn token(&self) -> Result<String, ClientError> {
+        Ok(self.0.clone())
+    }
+
+    fn header_name(&self) -> reqwest::header::HeaderName {
+        reqwest::header::HeaderName::from_static("x-goog-iap-jwt-assertion")
+    }
 }
 
 #[derive(Serialize)]
@@ -77,7 +97,7 @@ pub fn config_text(alpaca: &MockServer, keys: &MockServer, extra: &str, tables: 
     format!(
         r#"
 profile = "t0"
-environment = "test"
+environment = "staging"
 listen = "127.0.0.1:0"
 expected_account_number = "{ACCOUNT_NUMBER}"
 {extra}
@@ -213,17 +233,10 @@ impl Harness {
     }
 
     /// Serves the router on a loopback port and returns a typed bot tier
-    /// client carrying a valid bot token. Human tiers need IAP in front to
-    /// turn the bearer token into its assertion header, so they are tested
-    /// through [`Self::call`].
+    /// client carrying a valid bot token.
     pub async fn bot_client(&self) -> GatewayClient<StaticToken> {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let app = self.app.clone();
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-
         GatewayClient::new(
-            &format!("http://{address}"),
+            &self.serve().await,
             Tier::Bot,
             reqwest::Client::new(),
             StaticToken(bot_token(BOT_SUBJECT, BOT_AUDIENCE)),
@@ -231,11 +244,65 @@ impl Harness {
         .unwrap()
     }
 
+    /// Serves the router on a loopback port and returns a typed write tier
+    /// client carrying a valid IAP assertion for an operator, as IAP in
+    /// front of the write tier would forward it.
+    pub async fn write_client(&self) -> GatewayClient<IapAssertion> {
+        GatewayClient::new(
+            &self.serve().await,
+            Tier::Write,
+            reqwest::Client::new(),
+            IapAssertion(iap_token(WRITE_AUDIENCE)),
+        )
+        .unwrap()
+    }
+
+    /// Serves the router on a loopback port and returns its origin.
+    async fn serve(&self) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = self.app.clone();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{address}")
+    }
+
     /// Waits for every detached mutation to finish.
     pub async fn settle(&self) {
         self.state.tasks.close();
         self.state.tasks.wait().await;
     }
+}
+
+pub fn activity_id(page: usize, row: usize) -> String {
+    format!("act-{page:02}-{row:03}")
+}
+
+/// Serves `full_pages` pages of FEE activities, each after the page token of
+/// the one before, then an empty page.
+pub fn serve_activity_pages(harness: &Harness, full_pages: usize) -> Vec<Mock<'_>> {
+    (0..=full_pages)
+        .map(|page| {
+            let rows: Vec<Value> = if page < full_pages {
+                (0..ACTIVITY_PAGE_SIZE)
+                    .map(|row| json!({ "id": activity_id(page, row), "activity_type": "FEE" }))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            harness.alpaca.mock(|when, then| {
+                let when = when
+                    .method(GET)
+                    .path("/v1/accounts/activities")
+                    .query_param("activity_types", "FEE");
+                if page == 0 {
+                    when.query_param_missing("page_token");
+                } else {
+                    when.query_param("page_token", activity_id(page - 1, ACTIVITY_PAGE_SIZE - 1));
+                }
+                then.status(200).json_body(json!(rows));
+            })
+        })
+        .collect()
 }
 
 fn exp() -> u64 {

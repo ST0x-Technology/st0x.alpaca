@@ -4,7 +4,7 @@
 
 use std::time::Duration;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::access::{Profile, Tier};
 
@@ -16,83 +16,46 @@ pub enum Method {
 }
 
 /// One gateway operation. Each one runs one bounded `st0x-alpaca` method.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Operation {
-    #[serde(rename = "account.funds")]
     AccountFunds,
-    #[serde(rename = "account.withdrawable_cash")]
     AccountWithdrawableCash,
-    #[serde(rename = "account.inventory")]
     AccountInventory,
-    #[serde(rename = "account.position_mark")]
     AccountPositionMark,
-    #[serde(rename = "activities.list")]
     ActivitiesList,
-    #[serde(rename = "market.is_open")]
     MarketIsOpen,
-    #[serde(rename = "market.session")]
     MarketSession,
-    #[serde(rename = "market.session_status")]
     MarketSessionStatus,
-    #[serde(rename = "market.latest_trade")]
     MarketLatestTrade,
-    #[serde(rename = "market.latest_quote")]
     MarketLatestQuote,
-    #[serde(rename = "market.latest_overnight_quote")]
     MarketLatestOvernightQuote,
-    #[serde(rename = "assets.get")]
     AssetsGet,
-    #[serde(rename = "assets.counter_trade_shares")]
     AssetsCounterTradeShares,
-    #[serde(rename = "orders.place_market")]
     OrdersPlaceMarket,
-    #[serde(rename = "orders.place_limit")]
     OrdersPlaceLimit,
-    #[serde(rename = "orders.place_exact_limit")]
     OrdersPlaceExactLimit,
-    #[serde(rename = "orders.get")]
     OrdersGet,
-    #[serde(rename = "orders.find")]
     OrdersFind,
-    #[serde(rename = "orders.recover")]
     OrdersRecover,
-    #[serde(rename = "orders.cancel")]
     OrdersCancel,
-    #[serde(rename = "conversions.submit")]
     ConversionsSubmit,
-    #[serde(rename = "conversions.get")]
     ConversionsGet,
-    #[serde(rename = "conversions.find")]
     ConversionsFind,
-    #[serde(rename = "journals.create")]
     JournalsCreate,
-    #[serde(rename = "wallet.withdraw")]
     WalletWithdraw,
-    #[serde(rename = "wallet.transfer")]
     WalletTransfer,
-    #[serde(rename = "wallet.transfers")]
     WalletTransfers,
-    #[serde(rename = "wallet.find_deposit")]
     WalletFindDeposit,
-    #[serde(rename = "wallet.deposit_address")]
+    WalletFindTransfer,
     WalletDepositAddress,
-    #[serde(rename = "wallet.whitelist")]
     WalletWhitelist,
-    #[serde(rename = "wallet.whitelist_create")]
     WalletWhitelistCreate,
-    #[serde(rename = "wallet.whitelist_remove")]
     WalletWhitelistRemove,
-    #[serde(rename = "wallet.whitelist_patch_travel_rule")]
     WalletWhitelistPatchTravelRule,
-    #[serde(rename = "tokenization.mint")]
     TokenizationMint,
-    #[serde(rename = "tokenization.requests")]
     TokenizationRequests,
-    #[serde(rename = "tokenization.request")]
     TokenizationRequest,
-    #[serde(rename = "tokenization.find_mint")]
     TokenizationFindMint,
-    #[serde(rename = "tokenization.find_redemption")]
     TokenizationFindRedemption,
 }
 
@@ -109,7 +72,7 @@ const ACTIVITY_PAGES: Duration = Duration::from_secs(120);
 const WITHDRAWAL_ANSWER: Duration = Duration::from_secs(60);
 
 impl Operation {
-    pub const ALL: [Self; 38] = [
+    pub const ALL: [Self; 39] = [
         Self::AccountFunds,
         Self::AccountWithdrawableCash,
         Self::AccountInventory,
@@ -138,6 +101,7 @@ impl Operation {
         Self::WalletTransfer,
         Self::WalletTransfers,
         Self::WalletFindDeposit,
+        Self::WalletFindTransfer,
         Self::WalletDepositAddress,
         Self::WalletWhitelist,
         Self::WalletWhitelistCreate,
@@ -182,6 +146,7 @@ impl Operation {
             Self::WalletTransfer => "wallet.transfer",
             Self::WalletTransfers => "wallet.transfers",
             Self::WalletFindDeposit => "wallet.find_deposit",
+            Self::WalletFindTransfer => "wallet.find_transfer",
             Self::WalletDepositAddress => "wallet.deposit_address",
             Self::WalletWhitelist => "wallet.whitelist",
             Self::WalletWhitelistCreate => "wallet.whitelist_create",
@@ -227,6 +192,7 @@ impl Operation {
             Self::WalletTransfer => "/wallet/transfers/{transfer_id}",
             Self::WalletTransfers => "/wallet/transfers",
             Self::WalletFindDeposit => "/wallet/deposits/by-tx/{tx_hash}",
+            Self::WalletFindTransfer => "/wallet/transfers/by-tx/{tx_hash}",
             Self::WalletDepositAddress => "/wallet/deposit-address",
             Self::WalletWhitelist => "/wallet/whitelist",
             Self::WalletWhitelistCreate => "/wallet/whitelist/entries",
@@ -310,19 +276,65 @@ impl Operation {
         }
     }
 
-    /// Units this operation takes from the shared human budget. Keyed single
-    /// reads that client loops depend on cost nothing: a `429` there would
-    /// end a crate poll loop before its deadline cancel.
+    /// Units this operation takes from the shared human budget: the most
+    /// Broker API requests one call can send. The gateway gives back what a
+    /// call did not send (an asset read the cache answered, a placement
+    /// without the duplicate key lookup). Exceptions:
+    ///
+    /// - the keyed reads the crate poll loops repeat cost nothing, though
+    ///   each sends one request (`wallet.find_transfer`,
+    ///   `tokenization.request` and `tokenization.find_redemption` read a
+    ///   whole Alpaca list): a `429` there would end a poll loop before its
+    ///   deadline cancel;
+    /// - `activities.list` costs its human page cap, one request per page;
+    /// - the whitelist removal and Travel Rule patch cost their list read;
+    ///   the gateway charges their entry writes once the list shows how many
+    ///   there are.
     #[must_use]
     pub const fn human_budget_cost(self) -> u32 {
         match self {
             Self::OrdersGet
             | Self::ConversionsGet
             | Self::WalletTransfer
+            | Self::WalletFindTransfer
             | Self::TokenizationRequest
             | Self::TokenizationFindRedemption => 0,
+            Self::AccountFunds
+            | Self::AccountWithdrawableCash
+            | Self::AccountPositionMark
+            | Self::MarketIsOpen
+            | Self::MarketSession
+            | Self::MarketLatestTrade
+            | Self::MarketLatestQuote
+            | Self::MarketLatestOvernightQuote
+            | Self::AssetsGet
+            | Self::AssetsCounterTradeShares
+            | Self::OrdersFind
+            | Self::OrdersCancel
+            | Self::ConversionsSubmit
+            | Self::ConversionsFind
+            | Self::JournalsCreate
+            | Self::WalletTransfers
+            | Self::WalletFindDeposit
+            | Self::WalletDepositAddress
+            | Self::WalletWhitelist
+            | Self::WalletWhitelistCreate
+            | Self::WalletWhitelistRemove
+            | Self::WalletWhitelistPatchTravelRule
+            | Self::TokenizationMint
+            | Self::TokenizationRequests
+            | Self::TokenizationFindMint => 1,
+            // The positions and the account; the order read back by key and
+            // its placement time when the order omits it; the extended
+            // session's next calendar; the whitelist read and the withdrawal.
+            Self::AccountInventory
+            | Self::OrdersRecover
+            | Self::MarketSessionStatus
+            | Self::WalletWithdraw => 2,
+            // The asset, the order, the order Alpaca already holds under a
+            // duplicate key, and its placement time when the answer omits it.
+            Self::OrdersPlaceMarket | Self::OrdersPlaceLimit | Self::OrdersPlaceExactLimit => 4,
             Self::ActivitiesList => 10,
-            _ => 1,
         }
     }
 
@@ -355,6 +367,7 @@ impl Operation {
             | Self::WalletTransfer
             | Self::WalletTransfers
             | Self::WalletFindDeposit
+            | Self::WalletFindTransfer
             | Self::WalletDepositAddress
             | Self::TokenizationRequests
             | Self::TokenizationRequest
@@ -396,6 +409,23 @@ impl std::fmt::Display for Operation {
     }
 }
 
+/// Written as its catalog name, the single spelling audit records and config
+/// use.
+impl Serialize for Operation {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.name())
+    }
+}
+
+/// Read from its catalog name; any other string is refused.
+impl<'de> Deserialize<'de> for Operation {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let name = String::deserialize(deserializer)?;
+        Self::from_name(&name)
+            .ok_or_else(|| serde::de::Error::custom(format_args!("unknown operation {name:?}")))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
@@ -415,11 +445,57 @@ mod tests {
     }
 
     #[test]
-    fn serde_name_matches_catalog_name() {
+    fn operations_travel_as_their_catalog_names() {
         for operation in Operation::ALL {
             let json = serde_json::to_value(operation).unwrap();
             assert_eq!(json, serde_json::Value::from(operation.name()));
-            assert_eq!(Operation::from_name(operation.name()), Some(operation));
+            assert_eq!(
+                serde_json::from_value::<Operation>(json).unwrap(),
+                operation
+            );
+        }
+        for unknown in ["wallet.withdraw_all", "WalletWithdraw", ""] {
+            assert!(serde_json::from_value::<Operation>(unknown.into()).is_err());
+        }
+    }
+
+    /// After `outcome_unknown` a caller may resend only where Alpaca dedupes
+    /// the request or it is idempotent: the order key (`clientOrderId`), the
+    /// cancel's order id, the mint's `issuerRequestId`, and the whitelist
+    /// removal and Travel Rule patch, which set the same end state. Withdraw,
+    /// journal and whitelist create have no Alpaca key, and Alpaca refuses a
+    /// reused conversion key without the crate adopting the order, so a
+    /// resend there could move value twice or fail a placed conversion.
+    #[test]
+    fn only_deduplicated_or_idempotent_mutations_are_resendable() {
+        let resendable: HashSet<_> = Operation::ALL
+            .into_iter()
+            .filter(|op| op.resendable_with_same_key())
+            .collect();
+
+        assert_eq!(
+            resendable,
+            HashSet::from([
+                Operation::OrdersPlaceMarket,
+                Operation::OrdersPlaceLimit,
+                Operation::OrdersPlaceExactLimit,
+                Operation::OrdersCancel,
+                Operation::TokenizationMint,
+                Operation::WalletWhitelistRemove,
+                Operation::WalletWhitelistPatchTravelRule,
+            ])
+        );
+        for keyless in [
+            Operation::WalletWithdraw,
+            Operation::JournalsCreate,
+            Operation::WalletWhitelistCreate,
+            Operation::ConversionsSubmit,
+        ] {
+            assert!(keyless.mutates(), "{keyless}");
+            assert!(!keyless.resendable_with_same_key(), "{keyless}");
+        }
+        for read in Operation::ALL.into_iter().filter(|op| !op.mutates()) {
+            assert!(!read.resendable_with_same_key(), "{read}");
         }
     }
 

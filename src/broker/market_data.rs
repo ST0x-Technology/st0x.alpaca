@@ -11,11 +11,13 @@ use st0x_finance::NotPositive;
 
 use crate::auth::KmsJwtError;
 use crate::broker::AlpacaBrokerApiClient;
+use crate::broker::client::SymbolSegment;
 use crate::broker::{
     Backpressure, IndicativeQuote, LatestQuote, LatestQuoteError, Permanence, Positive, Symbol,
     Usd, deserialize_float_from_number_or_string, deserialize_option_float_from_number_or_string,
 };
 use crate::rate_limit::retry_after_from_response_headers;
+use crate::request_id;
 
 /// The latest-quote feed to price against. Not configurable: each session has
 /// exactly one correct feed, and offering the others only creates a way to
@@ -239,8 +241,9 @@ struct LatestQuotePayload {
 /// fast instead of being lossily replaced; lossy decoding is used only for
 /// the trace line and the error-body display.
 async fn get_market_data_bytes(request: RequestBuilder) -> Result<Vec<u8>, AlpacaMarketDataError> {
-    let response = request.send().await?;
+    let response = request_id::send(request).await?;
     let status = response.status();
+    request_id::record(status, response.headers());
     let url = response.url().clone();
     let retry_after = retry_after_from_response_headers(response.headers());
     let bytes = response.bytes().await?;
@@ -273,10 +276,11 @@ async fn get_market_data_bytes(request: RequestBuilder) -> Result<Vec<u8>, Alpac
 
 pub(crate) async fn fetch_latest_trade_price(
     client: &AlpacaBrokerApiClient,
-    symbol: &Symbol,
+    segment: &SymbolSegment<'_>,
 ) -> Result<Positive<Usd>, AlpacaMarketDataError> {
+    let symbol = segment.symbol();
     let request = client
-        .market_data_get(&format!("/v2/stocks/{symbol}/trades/latest"))
+        .market_data_get(&format!("/v2/stocks/{segment}/trades/latest"))
         .await?;
     let bytes = get_market_data_bytes(request).await?;
 
@@ -304,9 +308,9 @@ pub(crate) async fn fetch_latest_trade_price(
 /// fifteen minutes by construction, not a per-quote property worth checking.
 pub(crate) async fn fetch_latest_quote(
     client: &AlpacaBrokerApiClient,
-    symbol: &Symbol,
+    segment: &SymbolSegment<'_>,
 ) -> Result<LatestQuote, AlpacaMarketDataError> {
-    let (quote, _) = fetch_quote_and_timestamp(client, symbol, QuoteFeed::DelayedSip).await?;
+    let (quote, _) = fetch_quote_and_timestamp(client, segment, QuoteFeed::DelayedSip).await?;
     Ok(quote)
 }
 
@@ -317,12 +321,12 @@ pub(crate) async fn fetch_latest_quote(
 /// unknown age must never be priced from (SPEC "Overnight hedging (24/5)").
 pub(crate) async fn fetch_latest_overnight_quote(
     client: &AlpacaBrokerApiClient,
-    symbol: &Symbol,
+    segment: &SymbolSegment<'_>,
 ) -> Result<IndicativeQuote, AlpacaMarketDataError> {
-    let (quote, at) = fetch_quote_and_timestamp(client, symbol, QuoteFeed::Overnight).await?;
+    let (quote, at) = fetch_quote_and_timestamp(client, segment, QuoteFeed::Overnight).await?;
 
     let at = at.ok_or_else(|| AlpacaMarketDataError::MissingQuoteTimestamp {
-        symbol: symbol.clone(),
+        symbol: segment.symbol().clone(),
     })?;
 
     Ok(IndicativeQuote { quote, at })
@@ -330,11 +334,12 @@ pub(crate) async fn fetch_latest_overnight_quote(
 
 async fn fetch_quote_and_timestamp(
     client: &AlpacaBrokerApiClient,
-    symbol: &Symbol,
+    segment: &SymbolSegment<'_>,
     feed: QuoteFeed,
 ) -> Result<(LatestQuote, Option<DateTime<Utc>>), AlpacaMarketDataError> {
+    let symbol = segment.symbol();
     let request = client
-        .market_data_get(&format!("/v2/stocks/{symbol}/quotes/latest"))
+        .market_data_get(&format!("/v2/stocks/{segment}/quotes/latest"))
         .await?;
     let bytes = get_market_data_bytes(request.query(&[("feed", feed.as_query_value())])).await?;
 
@@ -432,7 +437,7 @@ mod tests {
                 .json_body(json!({ "symbol": "AAPL", "quote": quote }));
         });
 
-        fetch_latest_quote(&client, &symbol).await
+        fetch_latest_quote(&client, &SymbolSegment::new(&symbol).unwrap()).await
     }
 
     #[tokio::test]
@@ -485,7 +490,9 @@ mod tests {
                 }));
         });
 
-        let quote = fetch_latest_quote(&client, &symbol).await.unwrap();
+        let quote = fetch_latest_quote(&client, &SymbolSegment::new(&symbol).unwrap())
+            .await
+            .unwrap();
 
         assert_eq!(
             quote.bid().inner(),
@@ -515,7 +522,9 @@ mod tests {
                 }));
         });
 
-        let error = fetch_latest_quote(&client, &symbol).await.unwrap_err();
+        let error = fetch_latest_quote(&client, &SymbolSegment::new(&symbol).unwrap())
+            .await
+            .unwrap_err();
 
         assert!(matches!(
             error,
@@ -560,7 +569,9 @@ mod tests {
                 .json_body(json!({ "symbol": "AAPL" }));
         });
 
-        let error = fetch_latest_quote(&client, &symbol).await.unwrap_err();
+        let error = fetch_latest_quote(&client, &SymbolSegment::new(&symbol).unwrap())
+            .await
+            .unwrap_err();
 
         assert!(matches!(error, AlpacaMarketDataError::MissingQuote { .. }));
     }
@@ -616,7 +627,7 @@ mod tests {
                 }));
         });
 
-        let error = fetch_latest_trade_price(&client, &symbol)
+        let error = fetch_latest_trade_price(&client, &SymbolSegment::new(&symbol).unwrap())
             .await
             .unwrap_err();
 
@@ -647,7 +658,9 @@ mod tests {
                 }));
         });
 
-        let price = fetch_latest_trade_price(&client, &symbol).await.unwrap();
+        let price = fetch_latest_trade_price(&client, &SymbolSegment::new(&symbol).unwrap())
+            .await
+            .unwrap();
 
         assert_eq!(
             price.inner(),
@@ -674,7 +687,9 @@ mod tests {
                 }));
         });
 
-        fetch_latest_trade_price(&client, &symbol).await.unwrap();
+        fetch_latest_trade_price(&client, &SymbolSegment::new(&symbol).unwrap())
+            .await
+            .unwrap();
 
         assert!(logs_contain("Alpaca market data response body received"));
         assert!(logs_contain("market_data_marker"));
@@ -699,7 +714,7 @@ mod tests {
                 }));
         });
 
-        let error = fetch_latest_trade_price(&client, &symbol)
+        let error = fetch_latest_trade_price(&client, &SymbolSegment::new(&symbol).unwrap())
             .await
             .unwrap_err();
 
@@ -737,7 +752,9 @@ mod tests {
                 .json_body(json!({ "message": "subscription does not permit SIP feed" }));
         });
 
-        let error = fetch_latest_quote(&client, &symbol).await.unwrap_err();
+        let error = fetch_latest_quote(&client, &SymbolSegment::new(&symbol).unwrap())
+            .await
+            .unwrap_err();
 
         assert!(matches!(
             &error,
@@ -764,7 +781,7 @@ mod tests {
                 .json_body(json!({ "symbol": "AAPL", "quote": quote }));
         });
 
-        fetch_latest_overnight_quote(&client, &symbol).await
+        fetch_latest_overnight_quote(&client, &SymbolSegment::new(&symbol).unwrap()).await
     }
 
     #[tokio::test]
@@ -825,7 +842,7 @@ mod tests {
                 .json_body(json!({ "message": "unauthorized" }));
         });
 
-        let error = fetch_latest_overnight_quote(&client, &symbol)
+        let error = fetch_latest_overnight_quote(&client, &SymbolSegment::new(&symbol).unwrap())
             .await
             .unwrap_err();
 
@@ -880,7 +897,7 @@ mod tests {
                 .json_body(json!({ "message": "rate limited" }));
         });
 
-        let error = fetch_latest_trade_price(&client, &symbol)
+        let error = fetch_latest_trade_price(&client, &SymbolSegment::new(&symbol).unwrap())
             .await
             .unwrap_err();
 
@@ -905,7 +922,7 @@ mod tests {
                 .json_body(json!({ "message": "rate limited" }));
         });
 
-        let error = fetch_latest_trade_price(&client, &symbol)
+        let error = fetch_latest_trade_price(&client, &SymbolSegment::new(&symbol).unwrap())
             .await
             .unwrap_err();
 
@@ -928,7 +945,7 @@ mod tests {
                 .json_body(json!({ "message": "boom" }));
         });
 
-        let error = fetch_latest_trade_price(&client, &symbol)
+        let error = fetch_latest_trade_price(&client, &SymbolSegment::new(&symbol).unwrap())
             .await
             .unwrap_err();
 
@@ -1034,5 +1051,40 @@ mod tests {
             assert_eq!(error.permanence(), Permanence::Permanent);
             assert_eq!(error.backpressure(), None);
         }
+    }
+
+    /// Market data requests count as Alpaca traffic too, refusals included.
+    #[tokio::test]
+    async fn market_data_traffic_is_collected() {
+        let server = MockServer::start();
+        let client = mock_client(&server);
+        let symbol = Symbol::new("AAPL").unwrap();
+        let trade = server.mock(|when, then| {
+            when.method(GET).path("/v2/stocks/AAPL/trades/latest");
+            then.status(200)
+                .header("content-type", "application/json")
+                .header("x-request-id", "trade-answered")
+                .json_body(json!({ "trade": { "p": "123.45" } }));
+        });
+        let quote = server.mock(|when, then| {
+            when.method(GET).path("/v2/stocks/AAPL/quotes/latest");
+            then.status(403)
+                .header("content-type", "application/json")
+                .header("x-request-id", "quote-refused")
+                .json_body(json!({ "message": "subscription does not permit SIP feed" }));
+        });
+        let segment = SymbolSegment::new(&symbol).unwrap();
+
+        let ((), traffic) = crate::request_id::collect(async {
+            fetch_latest_trade_price(&client, &segment).await.unwrap();
+            fetch_latest_quote(&client, &segment).await.unwrap_err();
+        })
+        .await;
+
+        trade.assert();
+        quote.assert();
+        assert_eq!(traffic.request_ids, ["trade-answered", "quote-refused"]);
+        assert_eq!(traffic.requests_sent, 2);
+        assert_eq!(traffic.last_status, Some(403));
     }
 }
