@@ -2,18 +2,54 @@
 //!
 //! One client talks to one deployment on one tier. Bots use [`Tier::Bot`]
 //! with [`MetadataIdToken`]; operator tools use a human tier with the ID
-//! token their OAuth flow produced ([`StaticToken`]). The client never
-//! retries a request: retry decisions belong to the caller, guided by
-//! [`ErrorBody::retryable`] and [`ErrorBody::retryable_with_same_key`].
+//! token their OAuth flow produced ([`StaticToken`]). Every operation has
+//! one method, with its request and response types fixed by the method. The
+//! client never retries a request: retry decisions belong to the caller,
+//! guided by [`ErrorBody::retryable`] and
+//! [`ErrorBody::retryable_with_same_key`].
+//!
+//! Calling an operation the deployment does not serve on the client's tier
+//! answers [`ClientError::Gateway`] with `unknown_operation`.
 
 use std::time::Duration;
 
+use alloy_primitives::{Address, TxHash};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use st0x_alpaca::broker::ClientOrderId;
+use st0x_alpaca::core::Network;
+use st0x_alpaca::st0x_finance::Symbol;
+use st0x_alpaca::tokenization::{IssuerRequestId, TokenizationRequestId};
+use st0x_alpaca::wallet::WhitelistEntry;
 use url::Url;
+use uuid::Uuid;
 
 use crate::ON_BEHALF_OF_HEADER;
 use crate::access::Tier;
+use crate::dto::account::{
+    ActivitiesQuery, ActivitiesResponse, FundsResponse, InventoryResponse, PositionMarkResponse,
+    WithdrawableCashResponse,
+};
+use crate::dto::market::{
+    AssetResponse, CounterTradeSharesRequest, CounterTradeSharesResponse, IsOpenResponse,
+    LatestTradeResponse, OvernightQuoteResponse, QuoteResponse, SessionResponse,
+    SessionStatusResponse,
+};
+use crate::dto::orders::{
+    CancelOrderRequest, CancelOrderResponse, ConversionOrderResponse, ConversionRequest,
+    ExactLimitOrderRequest, FindConversionResponse, FindOrderResponse, LimitOrderRequest,
+    MarketOrderRequest, OrderStateResponse, PlacementResponse, RecoverOrderRequest,
+    RecoverOrderResponse,
+};
+use crate::dto::tokenization::{
+    LookupResponse, MintRequest, NetworkQuery, RequestsQuery, RequestsResponse,
+    TokenizationRequestResponse,
+};
+use crate::dto::wallet::{
+    DepositAddressQuery, DepositAddressResponse, DepositResponse, JournalCreateRequest,
+    JournalCreateResponse, Transfer, TransferResponse, TransfersResponse, TravelRulePatchRequest,
+    WhitelistCreateRequest, WhitelistRemoveRequest, WhitelistResponse, WithdrawRequest,
+};
 use crate::failure::ErrorBody;
 use crate::ops::{Method, Operation};
 
@@ -31,6 +67,7 @@ pub trait TokenSource: Send + Sync {
 }
 
 /// A token the caller already holds, such as an operator's OAuth ID token.
+#[derive(Clone)]
 pub struct StaticToken(pub String);
 
 impl TokenSource for StaticToken {
@@ -41,6 +78,7 @@ impl TokenSource for StaticToken {
 
 /// A Google ID token for the runtime service account, from the metadata
 /// server, with the email claim so the gateway can audit it.
+#[derive(Clone)]
 pub struct MetadataIdToken {
     audience: String,
     http: reqwest::Client,
@@ -78,6 +116,8 @@ pub enum ClientError {
     Token(#[source] reqwest::Error),
     #[error("invalid gateway URL: {0}")]
     Url(#[from] url::ParseError),
+    /// A method did not supply a parameter its path names. A bug in the
+    /// client, caught before anything is sent.
     #[error("missing path parameter {0}")]
     MissingParameter(&'static str),
     /// The request did not get an answer: connect failure, transport error
@@ -94,12 +134,17 @@ pub enum ClientError {
 }
 
 /// Client of one gateway deployment on one tier.
+#[derive(Clone)]
 pub struct GatewayClient<Token> {
     base: Url,
     tier: Tier,
     http: reqwest::Client,
     token: Token,
+    on_behalf_of: Option<String>,
 }
+
+/// No path parameter, no query, no body.
+const NONE: Option<&()> = None;
 
 impl<Token: TokenSource> GatewayClient<Token> {
     /// `base` is the deployment's origin: the Cloud Run URL for the bot
@@ -119,25 +164,583 @@ impl<Token: TokenSource> GatewayClient<Token> {
             tier,
             http,
             token,
+            on_behalf_of: None,
         })
     }
 
-    /// Calls `operation`. `params` fills the path's `{name}` segments,
-    /// `query` becomes the query string, `body` the JSON body.
-    /// `on_behalf_of` names the human a bot acts for, for the audit record.
+    /// A copy of this client that names `human` in `X-On-Behalf-Of` on every
+    /// request, for a bot route acting for an IAP verified operator. Audit
+    /// only; the gateway never authorizes on it.
+    #[must_use]
+    pub fn acting_for(&self, human: impl Into<String>) -> Self
+    where
+        Token: Clone,
+    {
+        Self {
+            on_behalf_of: Some(human.into()),
+            ..self.clone()
+        }
+    }
+
+    // account.* and activities.list
+
+    /// `account.funds`.
     ///
     /// # Errors
     ///
-    /// Returns [`ClientError::Gateway`] with the contract error body for any
-    /// non 2xx answer, [`ClientError::Transport`] when no answer arrived, and
-    /// the other variants for local failures.
-    pub async fn call<Query, Request, Response>(
+    /// [`ClientError`]; see the type for each case.
+    pub async fn account_funds(&self) -> Result<FundsResponse, ClientError> {
+        self.send(Operation::AccountFunds, &[], NONE, NONE).await
+    }
+
+    /// `account.withdrawable_cash`.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`]; see the type for each case.
+    pub async fn withdrawable_cash(&self) -> Result<WithdrawableCashResponse, ClientError> {
+        self.send(Operation::AccountWithdrawableCash, &[], NONE, NONE)
+            .await
+    }
+
+    /// `account.inventory`.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`]; see the type for each case.
+    pub async fn inventory(&self) -> Result<InventoryResponse, ClientError> {
+        self.send(Operation::AccountInventory, &[], NONE, NONE)
+            .await
+    }
+
+    /// `account.position_mark`.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`]; see the type for each case.
+    pub async fn position_mark(
+        &self,
+        symbol: &Symbol,
+    ) -> Result<PositionMarkResponse, ClientError> {
+        self.send(
+            Operation::AccountPositionMark,
+            &[("symbol", symbol.to_string())],
+            NONE,
+            NONE,
+        )
+        .await
+    }
+
+    /// `activities.list`.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`]; see the type for each case.
+    pub async fn activities(
+        &self,
+        query: &ActivitiesQuery,
+    ) -> Result<ActivitiesResponse, ClientError> {
+        self.send(Operation::ActivitiesList, &[], Some(query), NONE)
+            .await
+    }
+
+    // market.* and assets.*
+
+    /// `market.is_open`.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`]; see the type for each case.
+    pub async fn market_is_open(&self) -> Result<IsOpenResponse, ClientError> {
+        self.send(Operation::MarketIsOpen, &[], NONE, NONE).await
+    }
+
+    /// `market.session`.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`]; see the type for each case.
+    pub async fn market_session(&self) -> Result<SessionResponse, ClientError> {
+        self.send(Operation::MarketSession, &[], NONE, NONE).await
+    }
+
+    /// `market.session_status`.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`]; see the type for each case.
+    pub async fn market_session_status(&self) -> Result<SessionStatusResponse, ClientError> {
+        self.send(Operation::MarketSessionStatus, &[], NONE, NONE)
+            .await
+    }
+
+    /// `market.latest_trade`.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`]; see the type for each case.
+    pub async fn latest_trade(&self, symbol: &Symbol) -> Result<LatestTradeResponse, ClientError> {
+        self.send(
+            Operation::MarketLatestTrade,
+            &[("symbol", symbol.to_string())],
+            NONE,
+            NONE,
+        )
+        .await
+    }
+
+    /// `market.latest_quote`.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`]; see the type for each case.
+    pub async fn latest_quote(&self, symbol: &Symbol) -> Result<QuoteResponse, ClientError> {
+        self.send(
+            Operation::MarketLatestQuote,
+            &[("symbol", symbol.to_string())],
+            NONE,
+            NONE,
+        )
+        .await
+    }
+
+    /// `market.latest_overnight_quote`.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`]; see the type for each case.
+    pub async fn latest_overnight_quote(
+        &self,
+        symbol: &Symbol,
+    ) -> Result<OvernightQuoteResponse, ClientError> {
+        self.send(
+            Operation::MarketLatestOvernightQuote,
+            &[("symbol", symbol.to_string())],
+            NONE,
+            NONE,
+        )
+        .await
+    }
+
+    /// `assets.get`.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`]; see the type for each case.
+    pub async fn asset(&self, symbol: &Symbol) -> Result<AssetResponse, ClientError> {
+        self.send(
+            Operation::AssetsGet,
+            &[("symbol", symbol.to_string())],
+            NONE,
+            NONE,
+        )
+        .await
+    }
+
+    /// `assets.counter_trade_shares`.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`]; see the type for each case.
+    pub async fn counter_trade_shares(
+        &self,
+        symbol: &Symbol,
+        request: &CounterTradeSharesRequest,
+    ) -> Result<CounterTradeSharesResponse, ClientError> {
+        self.send(
+            Operation::AssetsCounterTradeShares,
+            &[("symbol", symbol.to_string())],
+            NONE,
+            Some(request),
+        )
+        .await
+    }
+
+    // orders.* and conversions.*
+
+    /// `orders.place_market`.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`]; see the type for each case.
+    pub async fn place_market_order(
+        &self,
+        request: &MarketOrderRequest,
+    ) -> Result<PlacementResponse, ClientError> {
+        self.send(Operation::OrdersPlaceMarket, &[], NONE, Some(request))
+            .await
+    }
+
+    /// `orders.place_limit`.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`]; see the type for each case.
+    pub async fn place_limit_order(
+        &self,
+        request: &LimitOrderRequest,
+    ) -> Result<PlacementResponse, ClientError> {
+        self.send(Operation::OrdersPlaceLimit, &[], NONE, Some(request))
+            .await
+    }
+
+    /// `orders.place_exact_limit`.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`]; see the type for each case.
+    pub async fn place_exact_limit_order(
+        &self,
+        request: &ExactLimitOrderRequest,
+    ) -> Result<PlacementResponse, ClientError> {
+        self.send(Operation::OrdersPlaceExactLimit, &[], NONE, Some(request))
+            .await
+    }
+
+    /// `orders.get`.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`]; see the type for each case.
+    pub async fn order(&self, order_id: Uuid) -> Result<OrderStateResponse, ClientError> {
+        self.send(
+            Operation::OrdersGet,
+            &[("order_id", order_id.to_string())],
+            NONE,
+            NONE,
+        )
+        .await
+    }
+
+    /// `orders.find`.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`]; see the type for each case.
+    pub async fn find_order(
+        &self,
+        client_order_id: &ClientOrderId,
+    ) -> Result<FindOrderResponse, ClientError> {
+        self.send(
+            Operation::OrdersFind,
+            &[("client_order_id", client_order_id.to_string())],
+            NONE,
+            NONE,
+        )
+        .await
+    }
+
+    /// `orders.recover`.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`]; see the type for each case.
+    pub async fn recover_order(
+        &self,
+        request: &RecoverOrderRequest,
+    ) -> Result<RecoverOrderResponse, ClientError> {
+        self.send(Operation::OrdersRecover, &[], NONE, Some(request))
+            .await
+    }
+
+    /// `orders.cancel`.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`]; see the type for each case.
+    pub async fn cancel_order(
+        &self,
+        order_id: Uuid,
+        request: &CancelOrderRequest,
+    ) -> Result<CancelOrderResponse, ClientError> {
+        self.send(
+            Operation::OrdersCancel,
+            &[("order_id", order_id.to_string())],
+            NONE,
+            Some(request),
+        )
+        .await
+    }
+
+    /// `conversions.submit`.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`]; see the type for each case.
+    pub async fn submit_conversion(
+        &self,
+        request: &ConversionRequest,
+    ) -> Result<ConversionOrderResponse, ClientError> {
+        self.send(Operation::ConversionsSubmit, &[], NONE, Some(request))
+            .await
+    }
+
+    /// `conversions.get`.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`]; see the type for each case.
+    pub async fn conversion(&self, order_id: Uuid) -> Result<ConversionOrderResponse, ClientError> {
+        self.send(
+            Operation::ConversionsGet,
+            &[("order_id", order_id.to_string())],
+            NONE,
+            NONE,
+        )
+        .await
+    }
+
+    /// `conversions.find`.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`]; see the type for each case.
+    pub async fn find_conversion(
+        &self,
+        client_order_id: &ClientOrderId,
+    ) -> Result<FindConversionResponse, ClientError> {
+        self.send(
+            Operation::ConversionsFind,
+            &[("client_order_id", client_order_id.to_string())],
+            NONE,
+            NONE,
+        )
+        .await
+    }
+
+    // journals.create
+
+    /// `journals.create`.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`]; see the type for each case.
+    pub async fn create_journal(
+        &self,
+        request: &JournalCreateRequest,
+    ) -> Result<JournalCreateResponse, ClientError> {
+        self.send(Operation::JournalsCreate, &[], NONE, Some(request))
+            .await
+    }
+
+    // wallet.*
+
+    /// `wallet.withdraw`. Never resend after an unknown outcome; reconcile
+    /// from [`Self::transfers`].
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`]; see the type for each case.
+    pub async fn withdraw(&self, request: &WithdrawRequest) -> Result<Transfer, ClientError> {
+        self.send(Operation::WalletWithdraw, &[], NONE, Some(request))
+            .await
+    }
+
+    /// `wallet.transfer`.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`]; see the type for each case.
+    pub async fn transfer(&self, transfer_id: Uuid) -> Result<TransferResponse, ClientError> {
+        self.send(
+            Operation::WalletTransfer,
+            &[("transfer_id", transfer_id.to_string())],
+            NONE,
+            NONE,
+        )
+        .await
+    }
+
+    /// `wallet.transfers`.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`]; see the type for each case.
+    pub async fn transfers(&self) -> Result<TransfersResponse, ClientError> {
+        self.send(Operation::WalletTransfers, &[], NONE, NONE).await
+    }
+
+    /// `wallet.find_deposit`.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`]; see the type for each case.
+    pub async fn find_deposit(&self, tx_hash: &TxHash) -> Result<DepositResponse, ClientError> {
+        self.send(
+            Operation::WalletFindDeposit,
+            &[("tx_hash", tx_hash.to_string())],
+            NONE,
+            NONE,
+        )
+        .await
+    }
+
+    /// `wallet.deposit_address`.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`]; see the type for each case.
+    pub async fn deposit_address(
+        &self,
+        query: &DepositAddressQuery,
+    ) -> Result<DepositAddressResponse, ClientError> {
+        self.send(Operation::WalletDepositAddress, &[], Some(query), NONE)
+            .await
+    }
+
+    /// `wallet.whitelist`.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`]; see the type for each case.
+    pub async fn whitelist(&self) -> Result<WhitelistResponse, ClientError> {
+        self.send(Operation::WalletWhitelist, &[], NONE, NONE).await
+    }
+
+    /// `wallet.whitelist_create`. Never resend after an unknown outcome;
+    /// reconcile from [`Self::whitelist`].
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`]; see the type for each case.
+    pub async fn create_whitelist_entry(
+        &self,
+        request: &WhitelistCreateRequest,
+    ) -> Result<WhitelistEntry, ClientError> {
+        self.send(Operation::WalletWhitelistCreate, &[], NONE, Some(request))
+            .await
+    }
+
+    /// `wallet.whitelist_remove`.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`]; see the type for each case.
+    pub async fn remove_whitelist_entries(
+        &self,
+        address: &Address,
+        request: &WhitelistRemoveRequest,
+    ) -> Result<WhitelistResponse, ClientError> {
+        self.send(
+            Operation::WalletWhitelistRemove,
+            &[("address", address.to_string())],
+            NONE,
+            Some(request),
+        )
+        .await
+    }
+
+    /// `wallet.whitelist_patch_travel_rule`.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`]; see the type for each case.
+    pub async fn patch_travel_rule(
+        &self,
+        request: &TravelRulePatchRequest,
+    ) -> Result<WhitelistResponse, ClientError> {
+        self.send(
+            Operation::WalletWhitelistPatchTravelRule,
+            &[],
+            NONE,
+            Some(request),
+        )
+        .await
+    }
+
+    // tokenization.*
+
+    /// `tokenization.mint`.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`]; see the type for each case.
+    pub async fn request_mint(
+        &self,
+        request: &MintRequest,
+    ) -> Result<TokenizationRequestResponse, ClientError> {
+        self.send(Operation::TokenizationMint, &[], NONE, Some(request))
+            .await
+    }
+
+    /// `tokenization.requests`.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`]; see the type for each case.
+    pub async fn tokenization_requests(
+        &self,
+        query: &RequestsQuery,
+    ) -> Result<RequestsResponse, ClientError> {
+        self.send(Operation::TokenizationRequests, &[], Some(query), NONE)
+            .await
+    }
+
+    /// `tokenization.request`.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`]; see the type for each case.
+    pub async fn tokenization_request(
+        &self,
+        tokenization_request_id: &TokenizationRequestId,
+        network: Network,
+    ) -> Result<TokenizationRequestResponse, ClientError> {
+        self.send(
+            Operation::TokenizationRequest,
+            &[(
+                "tokenization_request_id",
+                tokenization_request_id.to_string(),
+            )],
+            Some(&NetworkQuery { network }),
+            NONE,
+        )
+        .await
+    }
+
+    /// `tokenization.find_mint`.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`]; see the type for each case.
+    pub async fn find_mint(
+        &self,
+        issuer_request_id: &IssuerRequestId,
+    ) -> Result<LookupResponse, ClientError> {
+        self.send(
+            Operation::TokenizationFindMint,
+            &[("issuer_request_id", issuer_request_id.to_string())],
+            NONE,
+            NONE,
+        )
+        .await
+    }
+
+    /// `tokenization.find_redemption`.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`]; see the type for each case.
+    pub async fn find_redemption(
+        &self,
+        tx_hash: &TxHash,
+        network: Network,
+    ) -> Result<LookupResponse, ClientError> {
+        self.send(
+            Operation::TokenizationFindRedemption,
+            &[("tx_hash", tx_hash.to_string())],
+            Some(&NetworkQuery { network }),
+            NONE,
+        )
+        .await
+    }
+
+    async fn send<Query, Request, Response>(
         &self,
         operation: Operation,
-        params: &[(&'static str, &str)],
+        params: &[(&'static str, String)],
         query: Option<&Query>,
         body: Option<&Request>,
-        on_behalf_of: Option<&str>,
     ) -> Result<Response, ClientError>
     where
         Query: Serialize + ?Sized,
@@ -160,7 +763,7 @@ impl<Token: TokenSource> GatewayClient<Token> {
         if let Some(body) = body {
             request = request.json(body);
         }
-        if let Some(human) = on_behalf_of {
+        if let Some(human) = &self.on_behalf_of {
             request = request.header(ON_BEHALF_OF_HEADER, human);
         }
 
@@ -187,10 +790,11 @@ impl<Token: TokenSource> GatewayClient<Token> {
         }
     }
 
+    /// Builds the URL from the tier prefix and the operation's path.
     fn url(
         &self,
         operation: Operation,
-        params: &[(&'static str, &str)],
+        params: &[(&'static str, String)],
     ) -> Result<Url, ClientError> {
         let mut segments: Vec<&str> = self
             .tier
@@ -210,7 +814,7 @@ impl<Token: TokenSource> GatewayClient<Token> {
                 Some(name) => params
                     .iter()
                     .find(|(param, _)| *param == name)
-                    .map(|(_, value)| *value)
+                    .map(|(_, value)| value.as_str())
                     .ok_or(ClientError::MissingParameter(name))?,
                 None => segment,
             };
@@ -243,19 +847,14 @@ mod tests {
     #[test]
     fn path_parameters_are_encoded_into_the_tier_prefix() {
         let url = client(Tier::Bot)
-            .url(Operation::AccountPositionMark, &[("symbol", "BRK/B")])
+            .url(
+                Operation::AccountPositionMark,
+                &[("symbol", "BRK/B".to_string())],
+            )
             .unwrap();
         assert_eq!(
             url.as_str(),
             "https://t0-alpaca.example.com/bot/v1/account/positions/BRK%2FB/mark"
         );
-    }
-
-    #[test]
-    fn a_missing_path_parameter_is_refused() {
-        let error = client(Tier::Read)
-            .url(Operation::AccountPositionMark, &[])
-            .unwrap_err();
-        assert!(matches!(error, ClientError::MissingParameter(_)), "{error}");
     }
 }

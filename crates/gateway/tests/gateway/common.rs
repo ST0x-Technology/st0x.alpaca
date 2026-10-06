@@ -21,6 +21,7 @@ use st0x_alpaca_gateway::audit::MemorySink;
 use st0x_alpaca_gateway::config::GatewayConfig;
 use st0x_alpaca_gateway::routes::{Verifiers, app};
 use st0x_alpaca_gateway::state::AppState;
+use st0x_alpaca_gateway_api::client::{GatewayClient, StaticToken};
 use st0x_alpaca_gateway_api::{AuditEvent, Tier};
 use tower::ServiceExt as _;
 
@@ -209,6 +210,25 @@ impl Harness {
             .unwrap();
         let value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
         (status, value)
+    }
+
+    /// Serves the router on a loopback port and returns a typed bot tier
+    /// client carrying a valid bot token. Human tiers need IAP in front to
+    /// turn the bearer token into its assertion header, so they are tested
+    /// through [`Self::call`].
+    pub async fn bot_client(&self) -> GatewayClient<StaticToken> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = self.app.clone();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        GatewayClient::new(
+            &format!("http://{address}"),
+            Tier::Bot,
+            reqwest::Client::new(),
+            StaticToken(bot_token(BOT_SUBJECT, BOT_AUDIENCE)),
+        )
+        .unwrap()
     }
 
     /// Waits for every detached mutation to finish.
