@@ -409,7 +409,7 @@ mod tests {
                     after: None,
                     until: None,
                 },
-                MAX_PAGES,
+                std::num::NonZeroUsize::new(MAX_PAGES).unwrap(),
             )
             .await
             .unwrap_err();

@@ -1531,7 +1531,7 @@ async fn poll_until_terminal(
             break;
         };
 
-        match read {
+        let delay = match read {
             Ok(order) => {
                 if let Some(outcome) = order.classify().terminal() {
                     return Ok(SettledConversionOrder {
@@ -1549,19 +1549,27 @@ async fn poll_until_terminal(
                 );
                 last_filled = order.filled_quantity.or(last_filled);
                 last_seen = Some(order);
+                deadlines.interval
             }
-            Err(AlpacaBrokerApiError::Gateway(hop)) if hop.retryable => {
+            // The rule of the wallet and tokenization polls: a read a later
+            // read can clear is read again, after any wait it relayed, so a
+            // passing failure never skips the deadline cancel.
+            Err(error) if error.permanence() == crate::core::Permanence::Transient => {
                 warn!(
                     target: "broker",
                     order_id = %order_id,
-                    error = %hop,
-                    "Conversion order read failed at the gateway, polling again"
+                    %error,
+                    "Conversion order read failed, polling again"
                 );
+                error
+                    .backpressure()
+                    .and_then(|hint| hint.retry_after)
+                    .map_or(deadlines.interval, |wait| wait.max(deadlines.interval))
             }
             Err(error) => return Err(error),
-        }
+        };
 
-        tokio::time::sleep(next_poll_delay(deadlines.interval, deadline)).await;
+        tokio::time::sleep(next_poll_delay(delay, deadline)).await;
     }
 
     warn!(
@@ -5074,6 +5082,8 @@ mod tests {
     struct ScriptedConversion {
         hops: Vec<GatewayHopError>,
         hops_answered: std::sync::atomic::AtomicUsize,
+        alpaca_failures: Vec<fn() -> AlpacaBrokerApiError>,
+        alpaca_failures_answered: std::sync::atomic::AtomicUsize,
         reads: Vec<CryptoOrderResponse>,
         next_read: std::sync::atomic::AtomicUsize,
         after_cancel: Option<CryptoOrderResponse>,
@@ -5091,6 +5101,8 @@ mod tests {
             Self {
                 hops: Vec::new(),
                 hops_answered: std::sync::atomic::AtomicUsize::new(0),
+                alpaca_failures: Vec::new(),
+                alpaca_failures_answered: std::sync::atomic::AtomicUsize::new(0),
                 reads: reads.into_iter().collect(),
                 next_read: std::sync::atomic::AtomicUsize::new(0),
                 after_cancel,
@@ -5137,6 +5149,14 @@ mod tests {
             self.hops.len() - self.hops_answered.load(std::sync::atomic::Ordering::SeqCst)
         }
 
+        /// Answers the first reads with these Alpaca errors, before any hop.
+        fn failing_first_at_alpaca(self, failures: Vec<fn() -> AlpacaBrokerApiError>) -> Self {
+            Self {
+                alpaca_failures: failures,
+                ..self
+            }
+        }
+
         /// Reads answered from `reads`, past the scripted hop failures, or
         /// started and stalled.
         fn reads_made(&self) -> usize {
@@ -5175,6 +5195,12 @@ mod tests {
                 self.next_read
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 return std::future::pending().await;
+            }
+            let failure = self
+                .alpaca_failures_answered
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some(error) = self.alpaca_failures.get(failure) {
+                return Err(error());
             }
             if self.hops_left() > 0 {
                 let hop = self
@@ -5253,6 +5279,57 @@ mod tests {
             assert_eq!(orders.reads_made(), reads_made, "retryable {retryable}");
             assert_eq!(orders.cancels(), 0);
         }
+    }
+
+    /// A read Alpaca answers with a transient error is read again, after
+    /// the `Retry-After` it relayed, and the conversion completes without its
+    /// deadline cancel; a definite 4xx ends the poll on that read.
+    #[tokio::test(start_paused = true)]
+    async fn conversion_poll_reads_again_after_a_transient_alpaca_error() {
+        fn unavailable() -> AlpacaBrokerApiError {
+            AlpacaBrokerApiError::ApiError {
+                status: reqwest::StatusCode::TOO_MANY_REQUESTS,
+                alpaca_code: None,
+                message: "rate limited".to_string(),
+                retry_after: Some(Duration::from_secs(3)),
+            }
+        }
+        fn refused() -> AlpacaBrokerApiError {
+            AlpacaBrokerApiError::ApiError {
+                status: reqwest::StatusCode::FORBIDDEN,
+                alpaca_code: None,
+                message: "forbidden".to_string(),
+                retry_after: None,
+            }
+        }
+        let filled = || {
+            ScriptedConversion::new(
+                [scripted_conversion_order(BrokerOrderStatus::Filled, "500")],
+                None,
+            )
+        };
+
+        let orders = filled().failing_first_at_alpaca(vec![unavailable]);
+        let started = tokio::time::Instant::now();
+        let order =
+            poll_conversion_to_terminal_with(&orders, STALLED_ORDER_ID, Duration::from_millis(1))
+                .await
+                .unwrap();
+        assert_eq!(order.classify(), CryptoOrderOutcome::Filled);
+        assert_eq!(started.elapsed(), Duration::from_secs(3));
+        assert_eq!(orders.cancels(), 0);
+
+        let orders = filled().failing_first_at_alpaca(vec![refused]);
+        let error =
+            poll_conversion_to_terminal_with(&orders, STALLED_ORDER_ID, Duration::from_millis(1))
+                .await
+                .unwrap_err();
+        assert!(
+            matches!(error, AlpacaBrokerApiError::ApiError { status, .. } if status == 403),
+            "{error:?}"
+        );
+        assert_eq!(orders.reads_made(), 0);
+        assert_eq!(orders.cancels(), 0);
     }
 
     /// No read starts at the deadline: with the next read due past it, the

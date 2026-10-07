@@ -616,9 +616,9 @@ impl AlpacaBrokerApi {
     pub async fn fetch_account_activities(
         &self,
         query: &AccountActivitiesQuery,
-        max_pages: usize,
+        max_pages: std::num::NonZeroUsize,
     ) -> Result<Vec<AccountActivity>, AlpacaBrokerApiError> {
-        super::activity::get_account_activities(&self.client, query, max_pages).await
+        super::activity::get_account_activities(&self.client, query, max_pages.get()).await
     }
 }
 

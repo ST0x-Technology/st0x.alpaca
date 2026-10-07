@@ -1,5 +1,7 @@
 //! `account.*` and `activities.list`.
 
+use std::num::NonZeroUsize;
+
 use axum::extract::State;
 use axum::response::Response;
 use axum::routing::{MethodRouter, get};
@@ -83,8 +85,11 @@ async fn position_mark(
 /// Pages `activities.list` may read: the direct context method's cap for
 /// the bot, and a small one for a human call, which takes one unit of the
 /// human budget.
-fn activity_pages(tier: Tier) -> usize {
-    if tier.is_human() { 10 } else { 1000 }
+fn activity_pages(tier: Tier) -> NonZeroUsize {
+    // 10 and 1000, built without an unwrap.
+    const HUMAN: NonZeroUsize = NonZeroUsize::MIN.saturating_add(9);
+    const BOT: NonZeroUsize = NonZeroUsize::MIN.saturating_add(999);
+    if tier.is_human() { HUMAN } else { BOT }
 }
 
 async fn activities(
