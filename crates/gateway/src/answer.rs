@@ -9,6 +9,7 @@ use std::time::Duration;
 use axum::Json;
 use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
+use st0x_alpaca::KmsJwtError;
 use st0x_alpaca::Permanence;
 use st0x_alpaca::broker::{AlpacaBrokerApiError, AlpacaMarketDataError, PlacementError};
 use st0x_alpaca::tokenization::AlpacaTokenizationError;
@@ -183,6 +184,16 @@ fn unsent(source: &reqwest::Error, message: String) -> Failure {
     }
 }
 
+/// The answer for a call that stopped before its request was sent (no
+/// credential, no endpoint): `unavailable`, retryable only when the crate
+/// calls the failure transient, so a revoked credential stays permanent.
+fn unsendable(permanence: Permanence, message: String) -> Failure {
+    Failure {
+        retryable: permanence == Permanence::Transient,
+        ..Failure::new(ErrorCode::Unavailable, message)
+    }
+}
+
 /// The answer for an Alpaca error status: a definite 4xx is `rejected`, a
 /// 408 or 5xx is [`untyped`]. Either keeps the status Alpaca answered.
 fn api_failure(
@@ -262,12 +273,15 @@ pub fn broker(error: &AlpacaBrokerApiError, sent: Sent) -> Failure {
             "more than {pages} pages of account activities match; narrow the after and until \
              window"
         )),
+        // The send gate held the request or its credential mint back: it
+        // never left, and a new request may send it.
+        E::NotSent(_) | E::KmsJwt(KmsJwtError::NotSent(_)) => {
+            Failure::new(ErrorCode::UpstreamTransient, message)
+        }
         // The request never left: no credential, no endpoint, no connection.
         E::KmsJwt(_) | E::InvalidEndpoint(_) | E::InvalidHeader(_) => {
-            Failure::new(ErrorCode::Unavailable, message)
+            unsendable(error.permanence(), message)
         }
-        // The send gate held it back: it never left.
-        E::NotSent(_) => Failure::new(ErrorCode::UpstreamTransient, message),
         E::HttpClient(source) if never_left(source) => unsent(source, message),
         // The key already names an order, so the first request was applied.
         E::ApiError { status, .. }
@@ -303,9 +317,12 @@ fn market_data(
     }
 
     match error {
+        // The send gate held the request or its credential mint back.
+        E::NotSent(_) | E::Auth(KmsJwtError::NotSent(_)) => {
+            Failure::new(ErrorCode::UpstreamTransient, message)
+        }
         // The request never left: no credential, no connection.
-        E::Auth(_) => Failure::new(ErrorCode::Unavailable, message),
-        E::NotSent(_) => Failure::new(ErrorCode::UpstreamTransient, message),
+        E::Auth(_) => unsendable(permanence, message),
         E::Http(source) if never_left(source) => unsent(source, message),
         _ => match status {
             Some(status) => api_failure(status, sent, permanence, message),
@@ -362,8 +379,10 @@ pub fn wallet(error: &AlpacaWalletError, sent: Sent) -> Failure {
         // The request never left: no credential, no endpoint, no connection,
         // or the send gate held it back.
         E::Reqwest(source) if never_left(source) => unsent(source, message),
-        E::NotSent(_) => Failure::new(ErrorCode::UpstreamTransient, message),
-        E::Auth(_) | E::InvalidBaseUrl(_) => Failure::new(ErrorCode::Unavailable, message),
+        E::NotSent(_) | E::Auth(KmsJwtError::NotSent(_)) => {
+            Failure::new(ErrorCode::UpstreamTransient, message)
+        }
+        E::Auth(_) | E::InvalidBaseUrl(_) => unsendable(error.permanence(), message),
         E::TransferNotFound { .. } => Failure {
             alpaca_status: Some(404),
             ..Failure::rejected(RejectionReason::RequestNotFound, message)
@@ -400,11 +419,13 @@ pub fn tokenization(error: &AlpacaTokenizationError, sent: Sent) -> Failure {
     }
 
     match error {
+        E::NotSent(_) | E::Auth(KmsJwtError::NotSent(_)) => {
+            Failure::new(ErrorCode::UpstreamTransient, message)
+        }
         // The request never left: no credential, no endpoint, no connection.
         E::Auth(_) | E::InvalidBaseUrl(_) | E::PrivateKeyJwtUnsupported => {
-            Failure::new(ErrorCode::Unavailable, message)
+            unsendable(error.permanence(), message)
         }
-        E::NotSent(_) => Failure::new(ErrorCode::UpstreamTransient, message),
         E::Reqwest(source) if never_left(source) => unsent(source, message),
         // Raised after scanning a list Alpaca answered with 200, so no
         // Alpaca status goes with the answer.
@@ -508,6 +529,46 @@ mod tests {
                 Some(Duration::from_secs(30)),
                 "{failure:?}"
             );
+        }
+    }
+
+    /// A credential that stops before the request is sent keeps the crate's
+    /// permanence: a revoked KMS grant (403) answers not retryable, a KMS
+    /// outage (503) retryable, and a mutation is `not_applied` either way.
+    #[test]
+    fn a_credential_failure_keeps_its_permanence() {
+        for (status, retryable) in [(403, false), (503, true)] {
+            let kms = || KmsJwtError::KmsStatus {
+                status,
+                body: "signer".to_string(),
+                retry_after: None,
+            };
+            let failures = [
+                broker(&AlpacaBrokerApiError::KmsJwt(kms()), Sent::Mutation)
+                    .for_mutation(Operation::OrdersPlaceMarket),
+                broker(
+                    &AlpacaBrokerApiError::LatestQuote(Box::new(
+                        AlpacaMarketDataError::Auth(kms()),
+                    )),
+                    Sent::Read,
+                ),
+                wallet(&AlpacaWalletError::Auth(kms()), Sent::Mutation)
+                    .for_mutation(Operation::WalletWithdraw),
+                tokenization(&AlpacaTokenizationError::Auth(kms()), Sent::Mutation)
+                    .for_mutation(Operation::TokenizationMint),
+            ];
+
+            for failure in failures {
+                assert_eq!(
+                    failure.code,
+                    ErrorCode::Unavailable,
+                    "{status}: {failure:?}"
+                );
+                assert_eq!(failure.retryable, retryable, "{status}: {failure:?}");
+                if failure.outcome.is_some() {
+                    assert_eq!(failure.outcome, Some(Outcome::NotApplied), "{status}");
+                }
+            }
         }
     }
 
