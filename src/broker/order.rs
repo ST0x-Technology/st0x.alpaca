@@ -1373,8 +1373,8 @@ impl ConversionPollDeadlines {
 ///
 /// # Errors
 ///
-/// The placement error, a read error other than a retryable gateway hop
-/// failure, a crypto order failure, or a conversion deadline error.
+/// The placement error, a read error `permanence()` does not call
+/// transient, a crypto order failure, or a conversion deadline error.
 pub async fn convert_usdc_usd_with(
     orders: &impl ConversionOrders,
     conversion: ConversionOrder,
@@ -1407,7 +1407,7 @@ pub async fn convert_usdc_usd_with(
 ///
 /// # Errors
 ///
-/// A read error other than a retryable gateway hop failure, or a conversion
+/// A read error `permanence()` does not call transient, or a conversion
 /// deadline error.
 pub async fn poll_conversion_to_terminal_with(
     orders: &impl ConversionOrders,
@@ -1509,10 +1509,12 @@ pub(crate) async fn poll_crypto_order_to_terminal(
 /// the other would reintroduce the unbounded wait for the path it missed.
 /// Callers only interpret the returned outcome.
 ///
-/// A read lost on a gateway hop the gateway classified as retryable is read
-/// again at the next interval; every other read error ends the poll. No read
-/// starts at or after the deadline and a read still running there is
-/// dropped, so the remainder is cancelled on time.
+/// A read error `permanence()` calls transient (a 5xx, 408 or 429, a
+/// transport failure, a retryable gateway hop) is read again at the next
+/// interval, or after the `Retry-After` it relayed when that is longer;
+/// every other read error ends the poll. No read starts at or after the
+/// deadline and a read still running there is dropped, so the remainder is
+/// cancelled on time.
 async fn poll_until_terminal(
     orders: &impl ConversionOrders,
     order_id: Uuid,
