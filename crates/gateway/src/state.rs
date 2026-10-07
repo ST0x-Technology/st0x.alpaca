@@ -1,6 +1,6 @@
 //! Shared state, the startup account check, and the runner every handler
 //! goes through: admission (shutdown, capability switch, human budget), the
-//! operation deadline, detached mutations, and audit.
+//! operation deadline, detached work, and audit.
 
 use std::collections::{BTreeMap, HashMap};
 use std::ops::Deref;
@@ -17,12 +17,12 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use st0x_alpaca::broker::{AlpacaBrokerApi, AlpacaBrokerApiError};
 use st0x_alpaca::core::Network;
-use st0x_alpaca::request_id::{self, Traffic, TrafficHandle};
+use st0x_alpaca::request_id::{self, SendGate, Traffic};
 use st0x_alpaca::tokenization::{AlpacaTokenizationError, AlpacaTokenizationService};
 use st0x_alpaca::wallet::{AlpacaWalletError, AlpacaWalletService};
 use st0x_alpaca_gateway_api::{
-    AuditEvent, AuditPhase, ErrorCode, ON_BEHALF_OF_HEADER, Operation, Outcome, REQUEST_ID_HEADER,
-    RejectionReason, Tier,
+    AuditEvent, AuditPhase, DEPLOYMENT, ErrorCode, ON_BEHALF_OF_HEADER, Operation, Outcome,
+    REQUEST_ID_HEADER, RejectionReason, Tier,
 };
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
@@ -33,11 +33,42 @@ use uuid::Uuid;
 use crate::answer::Failure;
 use crate::audit::AuditSink;
 use crate::auth::Principal;
-use crate::budget::{Charge, HumanBudget};
+use crate::budget::{self, HumanBudget};
 use crate::config::GatewayConfig;
 
-/// Longest `X-On-Behalf-Of` value kept in the audit record.
-const ON_BEHALF_OF_MAX: usize = 256;
+/// Longest caller supplied value the audit record keeps: the key, the
+/// reason, each summary value and `X-On-Behalf-Of` keep at most their first
+/// this many characters, so one record stays one line the log pipeline
+/// accepts. The request digest still covers the whole request.
+const AUDIT_FIELD_MAX: usize = 256;
+
+/// Longest Alpaca supplied id the audit record keeps, in characters.
+const AUDIT_ID_MAX: usize = 128;
+
+/// Most Alpaca supplied ids one audit list keeps: the first this many.
+const AUDIT_IDS_MAX: usize = 100;
+
+/// `text` cut to its first `max` characters.
+fn cut(mut text: String, max: usize) -> String {
+    if let Some((at, _)) = text.char_indices().nth(max) {
+        text.truncate(at);
+    }
+    text
+}
+
+/// `value` displayed, cut to its first [`AUDIT_FIELD_MAX`] characters.
+fn capped(value: &impl std::fmt::Display) -> String {
+    cut(value.to_string(), AUDIT_FIELD_MAX)
+}
+
+/// `ids` as the audit record keeps them: the first [`AUDIT_IDS_MAX`], each
+/// cut to its first [`AUDIT_ID_MAX`] characters.
+fn audit_ids(ids: &[String]) -> Vec<String> {
+    ids.iter()
+        .take(AUDIT_IDS_MAX)
+        .map(|id| cut(id.clone(), AUDIT_ID_MAX))
+        .collect()
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum StartupError {
@@ -64,7 +95,7 @@ pub struct Inner {
     pub tokenizers: HashMap<Network, AlpacaTokenizationService>,
     pub audit: Arc<dyn AuditSink>,
     pub budget: HumanBudget,
-    /// Detached mutations; shutdown waits for them.
+    /// Detached work; shutdown waits for it.
     pub tasks: TaskTracker,
     /// Cancelled when shutdown starts. Requests in flight answer at once and
     /// new ones are refused, so the connection drain fits the grace period.
@@ -86,16 +117,6 @@ impl Deref for AppState {
         &self.0
     }
 }
-
-/// Why a mutation stopped waiting for its result.
-enum Abandoned {
-    Deadline,
-    Shutdown,
-}
-
-/// What the detached mutation task hands back: its result and the Alpaca
-/// traffic it sent.
-type Settled<T> = (Result<Done<T>, Failure>, Traffic);
 
 impl AppState {
     /// Builds the Alpaca clients and proves the configured account is the
@@ -139,7 +160,6 @@ impl AppState {
         }
 
         info!(
-            profile = ?config.profile,
             environment = %config.environment,
             account_id = %config.broker.account_id,
             "Gateway bound to its Alpaca account"
@@ -210,330 +230,211 @@ impl AppState {
         operation.deadline()
     }
 
-    /// Admits a call, reserving the most human budget units it can spend.
-    /// The charge comes back so the runner can settle it once the work ends.
-    ///
-    /// A cost above the whole budget can never be admitted, so its refusal
-    /// is not retryable and names the limit. Config validation refuses such
-    /// a budget; this keeps a state built around it from looping callers.
-    fn admit(&self, call: &Call) -> Result<Option<Charge>, Failure> {
+    /// Admits a call: refused at shutdown, for a disabled operation, for a
+    /// human mutation without a reason, and for a human call past this
+    /// minute's budget.
+    fn admit(&self, call: &Call, intent: &Intent) -> Result<(), Failure> {
+        let operation = call.operation;
         if self.shutdown.is_cancelled() {
             return Err(Failure::new(
                 ErrorCode::Unavailable,
                 "the gateway is shutting down",
             ));
         }
-        if self.config.is_disabled(call.operation) {
+        if self.config.is_disabled(operation) {
             return Err(Failure::new(
                 ErrorCode::CapabilityDisabled,
-                format!("{} is disabled in this deployment", call.operation),
+                format!("{operation} is disabled in this deployment"),
             ));
         }
-        if !call.principal.tier.is_human() {
-            return Ok(None);
-        }
-        let operation = call.operation;
-        let cost = operation.human_budget_cost();
-        self.budget.take(cost).map(Some).map_err(|wait| {
-            let limit = self.config.human_budget_per_minute;
-            if cost > limit {
-                Failure {
-                    retryable: false,
-                    ..Failure::new(
-                        ErrorCode::Backpressure,
-                        format!(
-                            "{operation} reserves {cost} units, more than the human budget of \
-                             {limit} requests per minute"
-                        ),
-                    )
-                }
-            } else {
-                Failure {
-                    retry_after: Some(wait),
-                    ..Failure::new(
-                        ErrorCode::Backpressure,
-                        "human request budget spent for this minute",
-                    )
-                }
-            }
-        })
-    }
-
-    /// Keeps the admission units of the Alpaca requests the work sent and
-    /// gives back the rest.
-    fn settle_charge(&self, charge: Option<Charge>, traffic: &Traffic) {
-        if let Some(charge) = charge {
-            self.budget.settle(charge, traffic.requests_sent);
-        }
-    }
-
-    /// Finalizes a refusal decided before any work ran: `not_applied` on a
-    /// mutation, the call's request id, and the answered audit record.
-    #[must_use]
-    pub fn refuse(&self, call: &Call, intent: &Intent, failure: Failure) -> Failure {
-        let failure = if call.operation.mutates() {
-            failure.for_mutation(call.operation)
-        } else {
-            failure
-        };
-        let failure = Failure {
-            request_id: call.request_id,
-            ..failure
-        };
-        self.emit(
-            call,
-            intent,
-            AuditPhase::Answered,
-            &Traffic::default(),
-            Err(&failure),
-        );
-        failure
-    }
-
-    /// Runs a read under its deadline and audits it under `intent`, whose
-    /// key names what was looked up. Shutdown ends it at once with
-    /// `upstream_transient`. A read its caller abandons still settles its
-    /// charge and writes its answered record, marked abandoned.
-    pub async fn read<T, Work>(&self, call: Call, intent: Intent, work: Work) -> Response
-    where
-        T: Serialize,
-        Work: Future<Output = Result<T, Failure>>,
-    {
-        let charge = match self.admit(&call) {
-            Ok(charge) => charge,
-            Err(failure) => return self.refuse(&call, &intent, failure).into_response(),
-        };
-        let mut open = OpenRead {
-            state: self,
-            call: &call,
-            intent: &intent,
-            traffic: TrafficHandle::default(),
-            charge,
-            open: true,
-        };
-
-        let operation = call.operation;
-        let deadline = self.deadline(operation);
-        // Boxed: the Alpaca client futures are large, and every handler
-        // future would otherwise carry this one inline.
-        let result = Box::pin(request_id::collect_into(open.traffic.clone(), async {
-            tokio::select! {
-                finished = tokio::time::timeout(deadline, work) => {
-                    finished.unwrap_or_else(|_| {
-                        Err(Failure::new(
-                            ErrorCode::UpstreamTransient,
-                            format!("{operation} did not finish within {}s", deadline.as_secs()),
-                        ))
-                    })
-                }
-                () = self.shutdown.cancelled() => Err(Failure::new(
-                    ErrorCode::UpstreamTransient,
-                    format!("the gateway is shutting down; {operation} was not finished"),
-                )),
-            }
-        }))
-        .await;
-        let traffic = open.close();
-
-        match result {
-            Ok(body) => {
-                self.emit(&call, &intent, AuditPhase::Answered, &traffic, Ok(None));
-                success(call.request_id, &body)
-            }
-            Err(failure) => {
-                let failure = Failure {
-                    request_id: call.request_id,
-                    ..failure
-                };
-                self.emit(
-                    &call,
-                    &intent,
-                    AuditPhase::Answered,
-                    &traffic,
-                    Err(&failure),
-                );
-                failure.into_response()
-            }
-        }
-    }
-
-    /// Runs a mutation on a detached task, so a caller disconnect, an
-    /// expired deadline or shutdown never aborts a request already sent to
-    /// Alpaca, and answers by the deadline (or at once on shutdown) either
-    /// way. The admission charge is settled when the work ends, answered or
-    /// not.
-    pub async fn mutate<T, Work>(&self, call: Call, intent: Intent, work: Work) -> Response
-    where
-        T: Serialize + Send + 'static,
-        Work: Future<Output = Result<Done<T>, Failure>> + Send + 'static,
-    {
-        let operation = call.operation;
-        let charge = match self.admit(&call) {
-            Ok(charge) => charge,
-            Err(failure) => return self.refuse(&call, &intent, failure).into_response(),
-        };
-        if call.principal.tier == Tier::Write
+        let tier = call.principal.tier;
+        if tier == Tier::Write
+            && operation.mutates()
             && intent
                 .reason
                 .as_deref()
                 .is_none_or(|reason| reason.trim().is_empty())
         {
-            let failure = Failure::invalid("a human mutation needs a non blank reason");
-            self.settle_charge(charge, &Traffic::default());
+            return Err(Failure::invalid(
+                "a human mutation needs a non blank reason",
+            ));
+        }
+        if !tier.is_human() {
+            return Ok(());
+        }
+        self.budget
+            .take(budget::cost(operation))
+            .map_err(|wait| Failure {
+                retry_after: Some(wait),
+                ..Failure::new(
+                    ErrorCode::Backpressure,
+                    "human request budget spent for this minute",
+                )
+            })
+    }
+
+    /// Answers `call` with `failure` and writes its answered record without
+    /// Alpaca traffic: a refusal decided before any work ran, or an answer
+    /// without the work's result. A mutation's failure carries its outcome.
+    #[must_use]
+    pub fn refuse(&self, call: &Call, intent: &Intent, failure: Failure) -> Failure {
+        let failure = Failure {
+            request_id: call.request_id,
+            ..failure.for_mutation(call.operation)
+        };
+        self.audit.emit(&self.event(
+            call,
+            intent,
+            AuditPhase::Answered,
+            &Traffic::default(),
+            Err(&failure),
+        ));
+        failure
+    }
+
+    /// [`Self::run`] for a read, whose answer names no Alpaca object.
+    pub async fn read<T, Build, Work>(&self, call: Call, intent: Intent, read: Build) -> Response
+    where
+        T: Serialize + Send + 'static,
+        Build: FnOnce(Self) -> Work,
+        Work: Future<Output = Result<T, Failure>> + Send + 'static,
+    {
+        let read = read(self.clone());
+        self.run(call, intent, |_, _| async move {
+            read.await.map(|body| Done {
+                body,
+                alpaca_object_ids: Vec::new(),
+            })
+        })
+        .await
+    }
+
+    /// Runs an admitted call on a detached task, so a caller disconnect,
+    /// the deadline or shutdown never aborts a request already sent to
+    /// Alpaca. `work` gets the state and the deadline. It runs under a send
+    /// gate that closes at the deadline, at shutdown, and before the caller
+    /// is answered without the result: no Alpaca request and no credential
+    /// mint starts after that answer, and one the gate holds back fails as
+    /// never sent. The task writes the one record carrying the result and
+    /// its Alpaca traffic: `answered` when the handler took the result,
+    /// `settled` when the handler had stopped waiting. The handler answers
+    /// by the deadline, or at once on shutdown; without the result it
+    /// answers `outcome_unknown` for a mutation and `upstream_transient`
+    /// for a read, and writes that answer's record.
+    pub async fn run<T, Build, Work>(&self, call: Call, intent: Intent, work: Build) -> Response
+    where
+        T: Serialize + Send + 'static,
+        Build: FnOnce(Self, tokio::time::Instant) -> Work,
+        Work: Future<Output = Result<Done<T>, Failure>> + Send + 'static,
+    {
+        if let Err(failure) = self.admit(&call, &intent) {
             return self.refuse(&call, &intent, failure).into_response();
         }
-
-        let (sender, receiver) = oneshot::channel::<Settled<T>>();
-        let state = self.clone();
-        let settle_call = call.clone();
-        let settle_intent = intent.clone();
-        self.tasks.spawn(async move {
-            let (result, traffic) = request_id::collect(work).await;
-            // Before the answer, so the caller's next request sees the units.
-            state.settle_charge(charge, &traffic);
-            // The handler closes the channel before it answers without a
-            // result, so a failed send means nobody will publish this one.
-            if let Err((result, traffic)) = sender.send((result, traffic)) {
-                let record = |outcome: Result<Option<String>, &Failure>| {
-                    state.emit(
-                        &settle_call,
-                        &settle_intent,
-                        AuditPhase::Settled,
-                        &traffic,
-                        outcome,
-                    );
-                };
-                match result {
-                    Ok(done) => record(Ok(done.alpaca_object_id)),
-                    Err(failure) => record(Err(&failure.for_mutation(operation))),
-                }
-            }
-        });
-
-        let (result, traffic) = self.wait_for_mutation(&call, receiver).await;
-
-        match result {
-            Ok(done) => {
-                self.emit(
-                    &call,
-                    &intent,
-                    AuditPhase::Answered,
-                    &traffic,
-                    Ok(done.alpaca_object_id.clone()),
-                );
-                success(call.request_id, &done.body)
-            }
-            Err(failure) => {
-                let failure = Failure {
-                    request_id: call.request_id,
-                    ..failure
-                };
-                self.emit(
-                    &call,
-                    &intent,
-                    AuditPhase::Answered,
-                    &traffic,
-                    Err(&failure),
-                );
-                failure.into_response()
-            }
-        }
-    }
-
-    /// Waits for the detached mutation until its deadline or shutdown,
-    /// whichever comes first, and turns a missing result into
-    /// `outcome_unknown`.
-    async fn wait_for_mutation<T>(
-        &self,
-        call: &Call,
-        mut receiver: oneshot::Receiver<Settled<T>>,
-    ) -> Settled<T> {
         let operation = call.operation;
-        let waited = tokio::select! {
-            settled = &mut receiver => Ok(settled),
-            () = tokio::time::sleep(self.deadline(operation)) => Err(Abandoned::Deadline),
-            () = self.shutdown.cancelled() => Err(Abandoned::Shutdown),
-        };
-        // A result that landed while the deadline or shutdown fired is still
-        // answered; after `close` a later one goes to the settled record.
-        let waited = waited.or_else(|why| {
-            receiver.close();
-            receiver.try_recv().map(Ok).map_err(|_| why)
+        let deadline = tokio::time::Instant::now() + self.deadline(operation);
+        let shutdown = self.shutdown.clone();
+        let gate = SendGate::new(move || {
+            !shutdown.is_cancelled() && tokio::time::Instant::now() < deadline
+        });
+        let work = request_id::collect(request_id::gated(
+            gate.clone(),
+            work(self.clone(), deadline),
+        ));
+        let (sender, mut receiver) = oneshot::channel::<Result<Done<T>, Failure>>();
+        let (state, task_call, task_intent) = (self.clone(), call.clone(), intent.clone());
+        self.tasks.spawn(async move {
+            let (result, traffic) = work.await;
+            let result = result.map_err(|failure| failure.for_mutation(operation));
+            let mut event = state.event(
+                &task_call,
+                &task_intent,
+                AuditPhase::Answered,
+                &traffic,
+                result
+                    .as_ref()
+                    .map(|done| done.alpaca_object_ids.as_slice()),
+            );
+            if sender.send(result).is_err() {
+                event.phase = AuditPhase::Settled;
+            }
+            state.audit.emit(&event);
         });
 
-        match waited {
-            Ok(Ok((result, traffic))) => (
-                result.map_err(|failure| failure.for_mutation(operation)),
-                traffic,
-            ),
-            Ok(Err(_)) => (
-                Err(Failure::new(
-                    ErrorCode::OutcomeUnknown,
-                    "the mutation task ended without a result",
-                )
-                .for_mutation(operation)),
-                Traffic::default(),
-            ),
-            Err(Abandoned::Deadline) => {
-                warn!(%operation, request_id = %call.request_id, "Mutation passed its deadline");
-                (Err(Failure::deadline_passed(operation)), Traffic::default())
+        let result = tokio::select! {
+            result = &mut receiver => result.ok(),
+            () = tokio::time::sleep_until(deadline) => None,
+            () = self.shutdown.cancelled() => None,
+        };
+        // The gate first, so no request starts after the answer; a result
+        // sent before the channel closed is still answered.
+        let result = result.or_else(|| {
+            gate.close();
+            receiver.close();
+            receiver.try_recv().ok()
+        });
+        match result {
+            Some(Ok(done)) => success(call.request_id, &done.body),
+            Some(Err(failure)) => Failure {
+                request_id: call.request_id,
+                ..failure
             }
-            Err(Abandoned::Shutdown) => {
-                warn!(%operation, request_id = %call.request_id, "Mutation still running at shutdown");
-                (
-                    Err(Failure::new(
-                        ErrorCode::OutcomeUnknown,
-                        format!(
-                            "the gateway is shutting down; {operation} may still complete at Alpaca"
-                        ),
-                    )
-                    .for_mutation(operation)),
-                    Traffic::default(),
-                )
+            .into_response(),
+            None => {
+                warn!(%operation, request_id = %call.request_id, "Answered without the result");
+                let failure = self.without_result(operation);
+                self.refuse(&call, &intent, failure).into_response()
             }
         }
     }
 
-    /// Writes the audit record of `call`.
-    fn emit(
-        &self,
-        call: &Call,
-        intent: &Intent,
-        phase: AuditPhase,
-        traffic: &Traffic,
-        result: Result<Option<String>, &Failure>,
-    ) {
-        self.audit
-            .emit(&self.event(call, intent, phase, traffic, result));
+    /// The answer to a call whose result came neither by its deadline nor
+    /// before shutdown.
+    fn without_result(&self, operation: Operation) -> Failure {
+        let within = self.deadline(operation).as_secs();
+        let message = match (self.shutdown.is_cancelled(), operation.mutates()) {
+            (true, true) => {
+                format!("the gateway is shutting down; {operation} may still complete at Alpaca")
+            }
+            (true, false) => format!("the gateway is shutting down; {operation} was not finished"),
+            (false, true) => format!(
+                "{operation} did not finish within {within}s; it may still complete at Alpaca"
+            ),
+            (false, false) => format!("{operation} did not finish within {within}s"),
+        };
+        let code = if operation.mutates() {
+            ErrorCode::OutcomeUnknown
+        } else {
+            ErrorCode::UpstreamTransient
+        };
+        Failure::new(code, message)
     }
 
     /// The audit record of `call`. A success carries the status of the last
-    /// Alpaca answer; a failure carries its own status, else that of the
-    /// last Alpaca answer (a body that did not parse, a network check after
-    /// a 200), and the Alpaca objects it had already changed.
+    /// Alpaca API answer; a failure carries its own Alpaca status and the
+    /// Alpaca objects it had already changed. The Alpaca ids are kept as
+    /// [`audit_ids`] bounds them.
     fn event(
         &self,
         call: &Call,
         intent: &Intent,
         phase: AuditPhase,
         traffic: &Traffic,
-        result: Result<Option<String>, &Failure>,
+        result: Result<&[String], &Failure>,
     ) -> AuditEvent {
-        let (alpaca_object_id, outcome, code, rejection, alpaca_status) = match result {
-            Ok(object_id) => (
-                object_id,
+        let (object_ids, outcome, code, rejection, alpaca_status) = match result {
+            Ok(object_ids) => (
+                object_ids,
                 call.operation.mutates().then_some(Outcome::Applied),
                 None,
                 None,
                 traffic.last_status,
             ),
             Err(failure) => (
-                (!failure.alpaca_object_ids.is_empty())
-                    .then(|| failure.alpaca_object_ids.join(",")),
+                failure.alpaca_object_ids.as_slice(),
                 failure.outcome,
                 Some(failure.code),
                 failure.reason,
-                failure.alpaca_status.or(traffic.last_status),
+                failure.alpaca_status,
             ),
         };
 
@@ -542,8 +443,7 @@ impl AppState {
             request_id: call.request_id,
             phase,
             at: Utc::now(),
-            deployment: self.config.profile.deployment().to_string(),
-            profile: self.config.profile,
+            deployment: DEPLOYMENT.to_string(),
             environment: self.config.environment.as_str().to_string(),
             account_id: self.config.broker.account_id.to_string(),
             principal: call.principal.subject.clone(),
@@ -556,65 +456,14 @@ impl AppState {
             request_digest: intent.digest.clone(),
             summary: intent.summary.clone(),
             alpaca_status,
-            alpaca_request_ids: traffic.request_ids.clone(),
-            alpaca_object_id,
+            alpaca_request_ids: audit_ids(&traffic.request_ids),
+            alpaca_object_id: (!object_ids.is_empty()).then(|| audit_ids(object_ids).join(",")),
             outcome,
             code,
             rejection,
             latency_ms: u64::try_from(elapsed).unwrap_or(u64::MAX),
-            abandoned: false,
             gateway_version: self.version.clone(),
         }
-    }
-}
-
-/// A read between admission and its answer. When the server drops the
-/// request future first (the caller went away), dropping this settles the
-/// charge from the traffic sent until then and writes the answered record
-/// the read would otherwise never write, marked abandoned.
-struct OpenRead<'a> {
-    state: &'a AppState,
-    call: &'a Call,
-    intent: &'a Intent,
-    /// Filled while the work runs, so a drop sees what it sent.
-    traffic: TrafficHandle,
-    charge: Option<Charge>,
-    open: bool,
-}
-
-impl OpenRead<'_> {
-    /// Ends the read: settles the charge and returns the traffic sent, for
-    /// the answer's audit record.
-    fn close(&mut self) -> Traffic {
-        self.open = false;
-        let traffic = self.traffic.snapshot();
-        self.state.settle_charge(self.charge.take(), &traffic);
-        traffic
-    }
-}
-
-impl Drop for OpenRead<'_> {
-    fn drop(&mut self) {
-        if !self.open {
-            return;
-        }
-        let traffic = self.close();
-        warn!(
-            operation = %self.call.operation,
-            request_id = %self.call.request_id,
-            "Read abandoned by its caller"
-        );
-        let event = self.state.event(
-            self.call,
-            self.intent,
-            AuditPhase::Answered,
-            &traffic,
-            Ok(None),
-        );
-        self.state.audit.emit(&AuditEvent {
-            abandoned: true,
-            ..event
-        });
     }
 }
 
@@ -649,37 +498,43 @@ impl Intent {
         }
     }
 
+    /// Keeps the key for the audit record, at most its first
+    /// [`AUDIT_FIELD_MAX`] characters.
     #[must_use]
     pub fn key(mut self, key: &impl std::fmt::Display) -> Self {
-        self.key = Some(key.to_string());
+        self.key = Some(capped(key));
         self
     }
 
+    /// Keeps the caller's reason for the audit record, at most its first
+    /// [`AUDIT_FIELD_MAX`] characters.
     #[must_use]
     pub fn reason(mut self, reason: Option<&str>) -> Self {
-        self.reason = reason.map(str::to_string);
+        self.reason = reason.map(|reason| capped(&reason));
         self
     }
 
+    /// Keeps `value` in the audit summary under `field`, at most its first
+    /// [`AUDIT_FIELD_MAX`] characters.
     #[must_use]
     pub fn note(mut self, field: &str, value: &impl std::fmt::Display) -> Self {
-        self.summary.insert(field.to_string(), value.to_string());
+        self.summary.insert(field.to_string(), capped(value));
         self
     }
 }
 
-/// A finished mutation: the answer body and the Alpaca object it created or
-/// touched.
+/// A finished call: the answer body and the Alpaca objects a mutation
+/// created or touched, as [`Failure::alpaca_object_ids`] names a failure's.
 pub struct Done<T> {
     pub body: T,
-    pub alpaca_object_id: Option<String>,
+    pub alpaca_object_ids: Vec<String>,
 }
 
 impl<T> Done<T> {
     pub fn new(body: T, alpaca_object_id: &impl std::fmt::Display) -> Self {
         Self {
             body,
-            alpaca_object_id: Some(alpaca_object_id.to_string()),
+            alpaca_object_ids: vec![alpaca_object_id.to_string()],
         }
     }
 }
@@ -720,7 +575,7 @@ impl Call {
             .headers
             .get(ON_BEHALF_OF_HEADER)
             .and_then(|value| value.to_str().ok())
-            .map(|value| value.chars().take(ON_BEHALF_OF_MAX).collect());
+            .map(|value| capped(&value));
 
         let call = Self {
             request_id: Uuid::new_v4(),
@@ -742,5 +597,37 @@ impl FromRequestParts<AppState> for Call {
         _state: &AppState,
     ) -> Result<Self, Self::Rejection> {
         Self::of(parts)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_caller_value_the_audit_keeps_stops_at_the_field_cap() {
+        let long = "é".repeat(AUDIT_FIELD_MAX + 1);
+        let capped = "é".repeat(AUDIT_FIELD_MAX);
+        let short = "é".repeat(AUDIT_FIELD_MAX - 1);
+
+        let intent = Intent::default()
+            .key(&long)
+            .reason(Some(&long))
+            .note("counterparty", &long)
+            .note("symbol", &short);
+
+        assert_eq!(intent.key.as_deref(), Some(capped.as_str()));
+        assert_eq!(intent.reason.as_deref(), Some(capped.as_str()));
+        assert_eq!(intent.summary["counterparty"], capped);
+        assert_eq!(intent.summary["symbol"], short);
+    }
+
+    #[test]
+    fn the_audit_keeps_the_first_alpaca_ids_each_cut_at_the_id_cap() {
+        let many: Vec<String> = (0..=AUDIT_IDS_MAX).map(|n| n.to_string()).collect();
+        assert_eq!(audit_ids(&many), many[..AUDIT_IDS_MAX]);
+
+        let long = vec![format!("{}x", "é".repeat(AUDIT_ID_MAX))];
+        assert_eq!(audit_ids(&long), ["é".repeat(AUDIT_ID_MAX)]);
     }
 }

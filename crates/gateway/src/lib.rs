@@ -29,16 +29,13 @@ use crate::routes::Verifiers;
 use crate::state::AppState;
 
 /// The whole shutdown budget, measured from the signal: the connection
-/// drain and the wait for detached mutations share it. Below Cloud Run's
+/// drain and the wait for detached work share it. Below Cloud Run's
 /// default ten second termination grace.
 const DRAIN_GRACE: Duration = Duration::from_secs(8);
 
 /// The commit the binary was built from, which the flake passes at compile
-/// time.
+/// time; every audit record and `/readyz` carry it in the version.
 const BUILD_REV: Option<&str> = option_env!("ST0X_ALPACA_GATEWAY_REV");
-
-/// The Cloud Run revision serving the process, set by Cloud Run.
-const CLOUD_RUN_REVISION: &str = "K_REVISION";
 
 #[derive(Debug, thiserror::Error)]
 pub enum ServeError {
@@ -62,27 +59,19 @@ pub async fn serve(
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<(), ServeError> {
     let listen = config.listen;
-    let state = AppState::connect(config, audit, version()).await?;
+    let version = format!(
+        "{}+{}",
+        env!("CARGO_PKG_VERSION"),
+        BUILD_REV.unwrap_or("unknown")
+    );
+    let state = AppState::connect(config, audit, version).await?;
     let listener = TcpListener::bind(listen).await?;
     run(state, listener, shutdown).await
 }
 
-/// The version every audit record and `/readyz` carry: the package version,
-/// the commit the binary was built from (`unknown` outside the flake build)
-/// and, under Cloud Run, the revision serving it, as
-/// `0.1.0+<commit>@<revision>`.
-fn version() -> String {
-    let package = env!("CARGO_PKG_VERSION");
-    let commit = BUILD_REV.filter(|rev| !rev.is_empty()).unwrap_or("unknown");
-    match std::env::var(CLOUD_RUN_REVISION) {
-        Ok(revision) if !revision.is_empty() => format!("{package}+{commit}@{revision}"),
-        _ => format!("{package}+{commit}"),
-    }
-}
-
 /// Serves `state` on `listener` until `shutdown` resolves. At the signal
 /// every request in flight answers at once (a mutation `outcome_unknown`),
-/// the connections drain, and detached mutations get what is left of
+/// the connections drain, and detached work gets what is left of
 /// [`DRAIN_GRACE`] to finish.
 ///
 /// # Errors
@@ -135,7 +124,7 @@ pub async fn run(
     {
         warn!(
             pending = state.tasks.len(),
-            "Shutdown grace ended with mutations still running; callers reconcile from reads"
+            "Shutdown grace ended with detached work still running; callers reconcile from reads"
         );
     }
     Ok(())

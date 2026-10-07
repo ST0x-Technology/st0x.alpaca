@@ -9,7 +9,7 @@
 
 use chrono::{NaiveDate, NaiveTime};
 use rain_math_float::{Float, FloatError};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::str::FromStr;
 use std::time::Duration;
@@ -26,6 +26,7 @@ pub(crate) use st0x_float_serde::{
 use crate::GatewayHopError;
 use crate::auth::KmsJwtError;
 pub(crate) use crate::core::{Backpressure, Permanence};
+use crate::request_id::{GateClosed, SendError};
 
 mod activity;
 mod amount;
@@ -59,10 +60,9 @@ pub use lifecycle::{
 };
 pub use market_data::AlpacaMarketDataError;
 pub use order::{
-    AlpacaLimitOrder, AlpacaLimitPrice, BrokerOrderStatus, CONVERSION_POLL_INTERVAL,
-    ConversionDirection, ConversionOrder, ConversionOrders, CryptoOrderOutcome,
-    CryptoOrderResponse, ParseAlpacaLimitPriceError, convert_usdc_usd_with,
-    poll_conversion_to_terminal_with,
+    AlpacaLimitOrder, AlpacaLimitPrice, CONVERSION_POLL_INTERVAL, ConversionDirection,
+    ConversionOrder, ConversionOrders, CryptoOrderOutcome, CryptoOrderResponse,
+    ParseAlpacaLimitPriceError, convert_usdc_usd_with, poll_conversion_to_terminal_with,
 };
 pub use positions::{AccountFunds, EquityPosition, Inventory};
 pub use precision::{ALPACA_MAX_DECIMAL_PLACES, truncate_to_decimal_places};
@@ -103,7 +103,7 @@ pub enum TimeInForce {
 }
 
 /// Asset status from Alpaca Broker API (public because it's exposed in error types)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AssetStatus {
     Active,
@@ -431,18 +431,16 @@ pub enum AlpacaBrokerApiError {
     #[error("Asset {symbol} is not active (status: {status:?})")]
     AssetNotActive { symbol: Symbol, status: AssetStatus },
 
-    /// A symbol that cannot be one Alpaca URL path segment: empty, or a dot
-    /// segment (`.`, `..`) that URL parsing would resolve into another path.
-    /// Raised before any request is sent.
-    #[error("Symbol {:?} cannot be used as an Alpaca URL path segment", .symbol.as_str())]
-    UnsafeSymbol { symbol: Symbol },
-
     /// The hop to the Alpaca gateway failed or the gateway refused the call
     /// without relaying an Alpaca answer. Built only by a gateway client;
     /// backpressure only when the gateway relayed a wait, and as permanent
     /// as the gateway classified it.
     #[error(transparent)]
     Gateway(#[from] GatewayHopError),
+
+    /// The caller's send gate held the request back: it never left.
+    #[error(transparent)]
+    NotSent(#[from] GateClosed),
 
     #[error("Asset {symbol} is not tradable on Alpaca")]
     AssetNotTradable { symbol: Symbol },
@@ -508,6 +506,15 @@ pub enum AlpacaBrokerApiError {
     LatestQuote(#[source] Box<AlpacaMarketDataError>),
 }
 
+impl From<SendError> for AlpacaBrokerApiError {
+    fn from(error: SendError) -> Self {
+        match error {
+            SendError::Http(source) => Self::HttpClient(source),
+            SendError::NotSent(closed) => Self::NotSent(closed),
+        }
+    }
+}
+
 fn format_api_error(
     status: reqwest::StatusCode,
     alpaca_code: Option<&u64>,
@@ -558,6 +565,7 @@ impl AlpacaBrokerApiError {
             Self::ApiError { .. }
             | Self::UsdConversionInsufficientBalance { .. }
             | Self::HttpClient(_)
+            | Self::NotSent(_)
             | Self::KmsJwt(_)
             | Self::JsonParse(_)
             | Self::AlpacaAmount(_)
@@ -580,7 +588,6 @@ impl AlpacaBrokerApiError {
             | Self::AccountActivitiesPaginationInvariantViolation
             | Self::AccountActivitiesPageLimitExceeded { .. }
             | Self::AssetNotActive { .. }
-            | Self::UnsafeSymbol { .. }
             | Self::AssetNotTradable { .. }
             | Self::InvalidLimitPricePrecision { .. }
             | Self::UsdBalanceConversion(_)
@@ -614,12 +621,15 @@ impl AlpacaBrokerApiError {
         match self {
             Self::ApiError { status, .. } => crate::core::response_status_permanence(*status),
 
-            // Request-builder failures are deterministic for the same inputs.
+            // Request builder failures are deterministic for the same inputs.
             // Once a request is built, connect failures, resets, and the
-            // client's own request timeout are transient. A single-symbol
-            // endpoint returning another symbol is likewise an upstream
-            // routing/cache failure: a fresh request can clear it, but the
-            // mismatched financial value must never be consumed.
+            // client's own request timeout are transient, also while the
+            // body streams: reqwest reports a body read failure as a decode
+            // error, since `bytes()` wraps any of them that way, and a body
+            // that arrived whole but does not parse is `JsonParse`. A single
+            // symbol endpoint returning another symbol is likewise an
+            // upstream routing or cache failure: a fresh request can clear
+            // it, but the mismatched financial value must never be consumed.
             Self::HttpClient(source) if source.is_builder() => Permanence::Permanent,
             // A deterministic mint failure (revoked signerVerifier grant,
             // disabled BrokerDash credential: 4xx from KMS or the token
@@ -653,7 +663,6 @@ impl AlpacaBrokerApiError {
             | Self::AccountActivitiesPaginationInvariantViolation
             | Self::AccountActivitiesPageLimitExceeded { .. }
             | Self::AssetNotActive { .. }
-            | Self::UnsafeSymbol { .. }
             | Self::AssetNotTradable { .. }
             | Self::InvalidLimitPricePrecision { .. }
             | Self::UsdBalanceConversion(_)
@@ -674,7 +683,10 @@ impl AlpacaBrokerApiError {
             // resume path exists to prevent.
             | Self::ConversionTimedOut { .. }
             | Self::ConversionCancelNotSettled { .. }
-            | Self::ConversionOrderNotFound { .. } => Permanence::Permanent,
+            | Self::ConversionOrderNotFound { .. }
+            // A closed send gate stays closed for the rest of its scope, so
+            // a retry there is held back the same way.
+            | Self::NotSent(_) => Permanence::Permanent,
 
             Self::LatestTrade(source) | Self::LatestQuote(source) => source.permanence(),
         }

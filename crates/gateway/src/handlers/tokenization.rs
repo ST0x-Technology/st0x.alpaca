@@ -1,12 +1,14 @@
 //! `tokenization.*`.
 
+use alloy_primitives::TxHash;
 use axum::extract::State;
 use axum::response::Response;
 use axum::routing::{MethodRouter, get, post};
-use st0x_alpaca::tokenization::AlpacaTokenizationService;
+use st0x_alpaca::tokenization::{
+    AlpacaTokenizationService, IssuerRequestId, TokenizationRequestId,
+};
 use st0x_alpaca_gateway_api::dto::tokenization::{
-    IssuerRequestIdPath, LookupResponse, MintRequest, NetworkQuery, RedemptionTxPath,
-    RequestsQuery, RequestsResponse, TokenizationRequestPath, TokenizationRequestResponse,
+    LookupResponse, MintRequest, NetworkQuery, RequestsQuery, RequestsResponse,
 };
 use st0x_alpaca_gateway_api::{ErrorCode, Operation};
 
@@ -50,10 +52,8 @@ async fn mint(
         .note("network", &request.network)
         .note("recipient", &request.wallet_address);
 
-    let work_state = state.clone();
     state
-        .mutate(call, intent, async move {
-            let state = work_state;
+        .run(call, intent, move |state, _| async move {
             if !state
                 .config
                 .tokenization
@@ -78,10 +78,7 @@ async fn mint(
                 .map_err(|error| tokenization(&error, Sent::Mutation))?;
 
             let object_id = minted.id.clone();
-            Ok(Done::new(
-                TokenizationRequestResponse::from(minted),
-                &object_id,
-            ))
+            Ok(Done::new(minted, &object_id))
         })
         .await
 }
@@ -92,7 +89,7 @@ async fn requests(
     Query(query): Query<RequestsQuery>,
 ) -> Response {
     state
-        .read(call, Intent::default(), async {
+        .read(call, Intent::default(), |state| async move {
             let tokenizer = account_wide(&state)?;
             let listed = if query.pending_only.unwrap_or(false) {
                 tokenizer.list_pending_requests().await
@@ -101,9 +98,7 @@ async fn requests(
             };
 
             listed
-                .map(|requests| RequestsResponse {
-                    requests: requests.into_iter().map(Into::into).collect(),
-                })
+                .map(|requests| RequestsResponse { requests })
                 .map_err(|error| tokenization(&error, Sent::Read))
         })
         .await
@@ -112,19 +107,18 @@ async fn requests(
 async fn request(
     State(state): State<AppState>,
     call: Call,
-    Params(path): Params<TokenizationRequestPath>,
+    Params(request_id): Params<TokenizationRequestId>,
     Query(query): Query<NetworkQuery>,
 ) -> Response {
     let intent = Intent::default()
-        .key(&path.tokenization_request_id)
+        .key(&request_id)
         .note("network", &query.network);
     state
-        .read(call, intent, async {
+        .read(call, intent, |state| async move {
             state
                 .tokenizer(query.network)?
-                .get_request(&path.tokenization_request_id)
+                .get_request(&request_id)
                 .await
-                .map(TokenizationRequestResponse::from)
                 .map_err(|error| tokenization(&error, Sent::Read))
         })
         .await
@@ -133,17 +127,15 @@ async fn request(
 async fn find_mint(
     State(state): State<AppState>,
     call: Call,
-    Params(path): Params<IssuerRequestIdPath>,
+    Params(issuer_request_id): Params<IssuerRequestId>,
 ) -> Response {
-    let intent = Intent::default().key(&path.issuer_request_id);
+    let intent = Intent::default().key(&issuer_request_id);
     state
-        .read(call, intent, async {
+        .read(call, intent, |state| async move {
             account_wide(&state)?
-                .find_mint_by_issuer_request_id(&path.issuer_request_id)
+                .find_mint_by_issuer_request_id(&issuer_request_id)
                 .await
-                .map(|request| LookupResponse {
-                    request: request.map(Into::into),
-                })
+                .map(|request| LookupResponse { request })
                 .map_err(|error| tokenization(&error, Sent::Read))
         })
         .await
@@ -152,21 +144,19 @@ async fn find_mint(
 async fn find_redemption(
     State(state): State<AppState>,
     call: Call,
-    Params(path): Params<RedemptionTxPath>,
+    Params(tx_hash): Params<TxHash>,
     Query(query): Query<NetworkQuery>,
 ) -> Response {
     let intent = Intent::default()
-        .key(&path.tx_hash)
+        .key(&tx_hash)
         .note("network", &query.network);
     state
-        .read(call, intent, async {
+        .read(call, intent, |state| async move {
             state
                 .tokenizer(query.network)?
-                .find_redemption_by_tx(&path.tx_hash)
+                .find_redemption_by_tx(&tx_hash)
                 .await
-                .map(|request| LookupResponse {
-                    request: request.map(Into::into),
-                })
+                .map(|request| LookupResponse { request })
                 .map_err(|error| tokenization(&error, Sent::Read))
         })
         .await

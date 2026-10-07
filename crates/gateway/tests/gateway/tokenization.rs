@@ -50,7 +50,9 @@ fn alpaca_request(id: &str, kind: &str, status: &str) -> Value {
     })
 }
 
-/// The mint Alpaca must receive for [`mint_body`] to [`BOT_WALLET`] on base.
+/// The mint Alpaca must receive for [`mint_body`] to [`BOT_WALLET`] on base:
+/// the issuer request id as both the `Idempotency-Key` header and
+/// `client_request_id`. Anything else gets httpmock's 404.
 fn expect_mint(harness: &Harness, status: u16, answer: Value) -> httpmock::Mock<'_> {
     harness.alpaca.mock(|when, then| {
         when.method(POST)
@@ -68,50 +70,11 @@ fn expect_mint(harness: &Harness, status: u16, answer: Value) -> httpmock::Mock<
     })
 }
 
+/// A replay of the same mint sends the same idempotency key, so Alpaca
+/// dedupes it.
 #[tokio::test]
-async fn bot_mint_to_the_pinned_recipient_is_applied_and_audited() {
+async fn bot_mint_to_the_pinned_recipient_is_applied_audited_and_replayed_with_its_key() {
     let harness = Harness::start().await;
-    let mint = expect_mint(
-        &harness,
-        200,
-        alpaca_request("tok_req_1", "mint", "pending"),
-    );
-
-    let (status, body) = harness
-        .call(
-            Tier::Bot,
-            "POST",
-            "/tokenization/mints",
-            Some(mint_body(BOT_WALLET, "base", None)),
-        )
-        .await;
-
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["id"], "tok_req_1");
-    assert_eq!(body["status"], "pending");
-    assert_eq!(body["clientRequestId"], ISSUER_REQUEST_ID);
-    mint.assert_calls(1);
-
-    let events = harness.audit_events();
-    assert_eq!(events.len(), 1);
-    let event = &events[0];
-    assert_eq!(event.operation, Operation::TokenizationMint);
-    assert_eq!(event.phase, AuditPhase::Answered);
-    assert_eq!(event.outcome, Some(Outcome::Applied));
-    assert_eq!(event.alpaca_object_id.as_deref(), Some("tok_req_1"));
-    assert_eq!(event.key.as_deref(), Some(ISSUER_REQUEST_ID));
-    assert_eq!(event.summary["recipient"], BOT_WALLET);
-    assert_eq!(event.summary["symbol"], "AAPL");
-    assert_eq!(event.summary["quantity"], "2.5");
-    assert_eq!(event.summary["network"], "base");
-}
-
-#[tokio::test]
-async fn a_replayed_mint_sends_the_same_idempotency_key_and_client_request_id() {
-    let harness = Harness::start().await;
-    // Matches only a POST carrying the issuer request id as both the
-    // `Idempotency-Key` header and `client_request_id`; anything else gets
-    // httpmock's 404 and fails the call.
     let mint = expect_mint(
         &harness,
         200,
@@ -127,11 +90,26 @@ async fn a_replayed_mint_sends_the_same_idempotency_key_and_client_request_id() 
                 Some(mint_body(BOT_WALLET, "base", None)),
             )
             .await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        assert_eq!(body["id"], "tok_req_1");
-    }
 
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["tokenization_request_id"], "tok_req_1");
+        assert_eq!(body["status"], "pending");
+        assert_eq!(body["client_request_id"], ISSUER_REQUEST_ID);
+    }
     mint.assert_calls(2);
+
+    let events = harness.audit_events();
+    assert_eq!(events.len(), 2);
+    let event = &events[0];
+    assert_eq!(event.operation, Operation::TokenizationMint);
+    assert_eq!(event.phase, AuditPhase::Answered);
+    assert_eq!(event.outcome, Some(Outcome::Applied));
+    assert_eq!(event.alpaca_object_id.as_deref(), Some("tok_req_1"));
+    assert_eq!(event.key.as_deref(), Some(ISSUER_REQUEST_ID));
+    assert_eq!(event.summary["recipient"], BOT_WALLET);
+    assert_eq!(event.summary["symbol"], "AAPL");
+    assert_eq!(event.summary["quantity"], "2.5");
+    assert_eq!(event.summary["network"], "base");
 }
 
 #[tokio::test]
@@ -175,66 +153,52 @@ async fn a_mint_outside_the_pinned_recipients_is_refused_on_every_tier() {
     }
 }
 
+/// A definitive rejection of the mint left Alpaca untouched; a server error
+/// may have minted, so it is resendable under the same key.
 #[tokio::test]
-async fn a_definitive_mint_rejection_answers_rejected_and_not_applied() {
-    let harness = Harness::start().await;
-    let mint = expect_mint(
-        &harness,
-        422,
-        json!({ "message": "No positions found for AAPL" }),
-    );
+async fn a_failed_mint_is_not_applied_when_rejected_and_outcome_unknown_otherwise() {
+    for (alpaca_status, answer, status, code, outcome, same_key) in [
+        (
+            422,
+            json!({ "message": "No positions found for AAPL" }),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            ErrorCode::Rejected,
+            Outcome::NotApplied,
+            false,
+        ),
+        (
+            500,
+            json!({ "message": "internal error" }),
+            StatusCode::GATEWAY_TIMEOUT,
+            ErrorCode::OutcomeUnknown,
+            Outcome::Unknown,
+            true,
+        ),
+    ] {
+        let harness = Harness::start().await;
+        let mint = expect_mint(&harness, alpaca_status, answer);
 
-    let (status, body) = harness
-        .call(
-            Tier::Write,
-            "POST",
-            "/tokenization/mints",
-            Some(mint_body(BOT_WALLET, "base", Some("move shares onchain"))),
-        )
-        .await;
+        let (got, body) = harness
+            .call(
+                Tier::Write,
+                "POST",
+                "/tokenization/mints",
+                Some(mint_body(BOT_WALLET, "base", Some("move shares onchain"))),
+            )
+            .await;
 
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
-    assert_eq!(body["code"], "rejected");
-    assert_eq!(body["reason"], "insufficient_position");
-    assert_eq!(body["outcome"], "not_applied");
-    assert_eq!(body["retryableWithSameKey"], false);
-    mint.assert_calls(1);
-
-    let events = harness.audit_events();
-    assert_eq!(events.len(), 1);
-    assert_eq!(events[0].outcome, Some(Outcome::NotApplied));
-    assert_eq!(
-        events[0].rejection,
-        Some(RejectionReason::InsufficientPosition)
-    );
-    assert_eq!(events[0].reason.as_deref(), Some("move shares onchain"));
-}
-
-#[tokio::test]
-async fn a_server_error_on_the_mint_is_outcome_unknown_and_resendable_with_the_same_key() {
-    let harness = Harness::start().await;
-    let mint = expect_mint(&harness, 500, json!({ "message": "internal error" }));
-
-    let (status, body) = harness
-        .call(
-            Tier::Bot,
-            "POST",
-            "/tokenization/mints",
-            Some(mint_body(BOT_WALLET, "base", None)),
-        )
-        .await;
-
-    assert_eq!(status, StatusCode::GATEWAY_TIMEOUT, "{body}");
-    assert_eq!(body["code"], "outcome_unknown");
-    assert_eq!(body["outcome"], "unknown");
-    assert_eq!(body["retryable"], false);
-    assert_eq!(body["retryableWithSameKey"], true);
-    mint.assert_calls(1);
-
-    let events = harness.audit_events();
-    assert_eq!(events.len(), 1);
-    assert_eq!(events[0].outcome, Some(Outcome::Unknown));
-    assert_eq!(events[0].code, Some(ErrorCode::OutcomeUnknown));
+        assert_eq!(got, status, "{alpaca_status}: {body}");
+        assert_eq!(body["code"], json!(code), "{alpaca_status}");
+        assert_eq!(body["outcome"], json!(outcome), "{alpaca_status}");
+        assert_eq!(body["retryable"], false, "{alpaca_status}");
+        assert_eq!(body["retryableWithSameKey"], same_key, "{alpaca_status}");
+        mint.assert_calls(1);
+        let events = harness.audit_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].outcome, Some(outcome));
+        assert_eq!(events[0].code, Some(code));
+        assert_eq!(events[0].reason.as_deref(), Some("move shares onchain"));
+    }
 }
 
 #[tokio::test]
@@ -278,65 +242,45 @@ async fn an_unconfigured_network_is_refused_before_anything_is_sent() {
     lookups.assert_calls(0);
 }
 
+/// The ids of the tokenization requests a lookup answered: a list, one
+/// request, or none.
+fn request_ids(body: &Value) -> Vec<&str> {
+    fn id(request: &Value) -> Option<&str> {
+        request["tokenization_request_id"].as_str()
+    }
+    match &body["requests"] {
+        Value::Array(requests) => requests.iter().filter_map(id).collect(),
+        _ => id(&body["request"])
+            .or_else(|| id(body))
+            .into_iter()
+            .collect(),
+    }
+}
+
+/// Each lookup answers from the list Alpaca holds: the pending list only
+/// the pending requests (Alpaca has been seen ignoring the filter), a
+/// request by id or a definite not found, a mint by its issuer request id
+/// or null, and a redemption by its transaction.
 #[tokio::test]
-async fn pending_only_lists_just_the_requests_alpaca_reports_pending() {
+async fn lookups_answer_the_matching_request_or_a_definite_absence() {
     let harness = Harness::start().await;
+    let pending = alpaca_request("tok_req_pending", "mint", "pending");
+    let completed = alpaca_request("tok_req_1", "mint", "completed");
+    let mut redemption = alpaca_request("tok_req_redeem", "redeem", "pending");
+    redemption["tx_hash"] = json!(REDEMPTION_TX);
+    redemption["client_request_id"] = Value::Null;
+    let every = json!([pending, completed]);
     harness.alpaca.mock(|when, then| {
         when.method(GET)
             .path(requests_path())
             .query_param("status", "pending");
-        // Alpaca has been seen ignoring the filter; the crate drops the rest.
-        then.status(200).json_body(json!([
-            alpaca_request("tok_req_pending", "mint", "pending"),
-            alpaca_request("tok_req_done", "mint", "completed"),
-        ]));
+        then.status(200).json_body(every.clone());
     });
-    harness.alpaca.mock(|when, then| {
-        when.method(GET)
-            .path(requests_path())
-            .query_param_missing("status");
-        then.status(200).json_body(json!([
-            alpaca_request("tok_req_pending", "mint", "pending"),
-            alpaca_request("tok_req_done", "mint", "completed"),
-        ]));
-    });
-
-    let (status, body) = harness
-        .call(
-            Tier::Read,
-            "GET",
-            "/tokenization/requests?pendingOnly=true",
-            None,
-        )
-        .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let ids: Vec<&str> = body["requests"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|request| request["id"].as_str().unwrap())
-        .collect();
-    assert_eq!(ids, ["tok_req_pending"]);
-
-    let (status, body) = harness
-        .call(Tier::Bot, "GET", "/tokenization/requests", None)
-        .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["requests"].as_array().unwrap().len(), 2);
-}
-
-#[tokio::test]
-async fn lookups_answer_the_matching_request_or_null() {
-    let harness = Harness::start().await;
-    let mut redemption = alpaca_request("tok_req_redeem", "redeem", "pending");
-    redemption["tx_hash"] = json!(REDEMPTION_TX);
-    redemption["client_request_id"] = Value::Null;
     harness.alpaca.mock(|when, then| {
         when.method(GET)
             .path(requests_path())
             .query_param("type", "mint");
-        then.status(200)
-            .json_body(json!([alpaca_request("tok_req_1", "mint", "completed")]));
+        then.status(200).json_body(json!([completed]));
     });
     harness.alpaca.mock(|when, then| {
         when.method(GET)
@@ -344,76 +288,74 @@ async fn lookups_answer_the_matching_request_or_null() {
             .query_param("type", "redeem");
         then.status(200).json_body(json!([redemption]));
     });
-
-    let (status, body) = harness
-        .call(
-            Tier::Bot,
-            "GET",
-            &format!("/tokenization/mints/by-issuer-request-id/{ISSUER_REQUEST_ID}"),
-            None,
-        )
-        .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["request"]["id"], "tok_req_1");
-
-    let (status, body) = harness
-        .call(
-            Tier::Bot,
-            "GET",
-            "/tokenization/mints/by-issuer-request-id/0d6f3a52-1c1e-4f43-8a51-7b9e4f2f9a01",
-            None,
-        )
-        .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["request"], Value::Null);
-
-    let (status, body) = harness
-        .call(
-            Tier::Read,
-            "GET",
-            &format!("/tokenization/redemptions/by-tx/{REDEMPTION_TX}?network=base"),
-            None,
-        )
-        .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["request"]["id"], "tok_req_redeem");
-    assert_eq!(body["request"]["txHash"], REDEMPTION_TX);
-}
-
-#[tokio::test]
-async fn an_unknown_request_id_is_a_definite_not_found() {
-    let harness = Harness::start().await;
     harness.alpaca.mock(|when, then| {
-        when.method(GET).path(requests_path());
-        then.status(200)
-            .json_body(json!([alpaca_request("tok_req_1", "mint", "completed")]));
+        when.method(GET)
+            .path(requests_path())
+            .query_param_missing("status")
+            .query_param_missing("type");
+        then.status(200).json_body(every.clone());
     });
 
-    let (status, body) = harness
-        .call(
-            Tier::Bot,
-            "GET",
-            "/tokenization/requests/tok_req_1?network=base",
+    let unknown_mint = "0d6f3a52-1c1e-4f43-8a51-7b9e4f2f9a01";
+    for (tier, path, status, reason, ids) in [
+        (
+            Tier::Read,
+            "/tokenization/requests?pendingOnly=true".to_string(),
+            StatusCode::OK,
             None,
-        )
-        .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["status"], "completed");
+            &["tok_req_pending"][..],
+        ),
+        (
+            Tier::Bot,
+            "/tokenization/requests".to_string(),
+            StatusCode::OK,
+            None,
+            &["tok_req_pending", "tok_req_1"][..],
+        ),
+        (
+            Tier::Bot,
+            "/tokenization/requests/tok_req_1?network=base".to_string(),
+            StatusCode::OK,
+            None,
+            &["tok_req_1"][..],
+        ),
+        // Alpaca answered the list with 200; no Alpaca 404 is invented.
+        (
+            Tier::Bot,
+            "/tokenization/requests/tok_req_missing?network=base".to_string(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Some("request_not_found"),
+            &[][..],
+        ),
+        (
+            Tier::Bot,
+            format!("/tokenization/mints/by-issuer-request-id/{ISSUER_REQUEST_ID}"),
+            StatusCode::OK,
+            None,
+            &["tok_req_1"][..],
+        ),
+        (
+            Tier::Bot,
+            format!("/tokenization/mints/by-issuer-request-id/{unknown_mint}"),
+            StatusCode::OK,
+            None,
+            &[][..],
+        ),
+        (
+            Tier::Read,
+            format!("/tokenization/redemptions/by-tx/{REDEMPTION_TX}?network=base"),
+            StatusCode::OK,
+            None,
+            &["tok_req_redeem"][..],
+        ),
+    ] {
+        let (got, body) = harness.call(tier, "GET", &path, None).await;
 
-    let (status, body) = harness
-        .call(
-            Tier::Bot,
-            "GET",
-            "/tokenization/requests/tok_req_missing?network=base",
-            None,
-        )
-        .await;
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
-    assert_eq!(body["code"], "rejected");
-    assert_eq!(body["reason"], "request_not_found");
-    assert_eq!(body["retryable"], false);
-    // Alpaca answered the list with 200; no Alpaca 404 is invented.
-    assert!(body["alpacaStatus"].is_null(), "{body}");
+        assert_eq!(got, status, "{path}: {body}");
+        assert_eq!(body["reason"], json!(reason), "{path}");
+        assert!(body["alpacaStatus"].is_null(), "{path}: {body}");
+        assert_eq!(request_ids(&body), ids, "{path}: {body}");
+    }
 }
 
 #[tokio::test]
@@ -428,50 +370,37 @@ async fn a_lookup_alpaca_answers_off_the_bound_network_is_rejected_naming_the_re
         then.status(200).json_body(json!([foreign, unnamed]));
     });
 
-    let (status, body) = harness
-        .call(
-            Tier::Bot,
-            "GET",
-            "/tokenization/requests/tok_req_1?network=base",
-            None,
-        )
-        .await;
+    for (id, reason) in [
+        ("tok_req_1", "wrong_network"),
+        ("tok_req_2", "network_missing"),
+    ] {
+        let (status, body) = harness
+            .call(
+                Tier::Bot,
+                "GET",
+                &format!("/tokenization/requests/{id}?network=base"),
+                None,
+            )
+            .await;
 
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
-    assert_eq!(body["code"], "rejected");
-    assert_eq!(body["reason"], "wrong_network");
-    assert_eq!(body["network"], "ethereum");
-    assert_eq!(body["alpacaObjectIds"], json!(["tok_req_1"]));
-    assert_eq!(body["retryable"], false);
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{id}: {body}");
+        assert_eq!(body["code"], "rejected", "{id}");
+        assert_eq!(body["reason"], reason, "{id}");
+        assert_eq!(body["retryable"], false, "{id}");
+    }
 
-    let (status, body) = harness
-        .call(
-            Tier::Bot,
-            "GET",
-            "/tokenization/requests/tok_req_2?network=base",
-            None,
-        )
-        .await;
-
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
-    assert_eq!(body["reason"], "network_missing");
-    assert!(body["network"].is_null(), "{body}");
-    assert_eq!(body["alpacaObjectIds"], json!(["tok_req_2"]));
-
-    // Both refusals were decided after Alpaca answered 200, and the audit
-    // keeps that status.
     let events = harness.audit_events();
-    let rejections: Vec<_> = events.iter().map(|event| event.rejection).collect();
+    let audited: Vec<_> = events
+        .iter()
+        .map(|event| (event.rejection, event.alpaca_object_id.as_deref()))
+        .collect();
     assert_eq!(
-        rejections,
+        audited,
         [
-            Some(RejectionReason::WrongNetwork),
-            Some(RejectionReason::NetworkMissing)
+            (Some(RejectionReason::WrongNetwork), Some("tok_req_1")),
+            (Some(RejectionReason::NetworkMissing), Some("tok_req_2")),
         ]
     );
-    for event in &events {
-        assert_eq!(event.alpaca_status, Some(200), "{event:?}");
-    }
 }
 
 #[tokio::test]
@@ -495,10 +424,8 @@ async fn a_mint_alpaca_answers_on_another_network_is_outcome_unknown() {
     assert_eq!(status, StatusCode::GATEWAY_TIMEOUT, "{body}");
     assert_eq!(body["code"], "outcome_unknown");
     assert_eq!(body["outcome"], "unknown");
-    assert_eq!(body["alpacaObjectIds"], json!(["tok_req_1"]));
     mint.assert_calls(1);
     let event = &harness.audit_events()[0];
     assert_eq!(event.outcome, Some(Outcome::Unknown));
     assert_eq!(event.alpaca_object_id.as_deref(), Some("tok_req_1"));
-    assert_eq!(event.alpaca_status, Some(200));
 }

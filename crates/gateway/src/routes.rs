@@ -1,5 +1,5 @@
 //! The router: one prefix per tier, each operation mounted only on the tiers
-//! the profile's capability matrix allows, behind that tier's identity check.
+//! the capability matrix allows, behind that tier's identity check.
 //! The check runs inside the operation's route, so it answers and audits a
 //! refusal as that operation.
 
@@ -70,7 +70,6 @@ impl Verifiers {
 
 /// The whole service: health routes plus every tier's operations.
 pub fn app(state: AppState, verifiers: &Verifiers) -> Router {
-    let profile = state.config.profile;
     let mut router = Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz));
@@ -78,7 +77,7 @@ pub fn app(state: AppState, verifiers: &Verifiers) -> Router {
     for tier in Tier::ALL {
         let guard = Guard::new(verifiers.for_tier(tier), state.clone());
         for operation in Operation::ALL {
-            if !operation.allows(profile, tier) {
+            if !operation.allows(tier) {
                 continue;
             }
             let Some(handler) = handlers::route(operation) else {
@@ -110,7 +109,6 @@ async fn healthz() -> Response {
 async fn readyz(State(state): State<AppState>) -> Response {
     Json(json!({
         "status": "ready",
-        "profile": state.config.profile,
         "environment": state.config.environment,
         "version": state.version,
     }))

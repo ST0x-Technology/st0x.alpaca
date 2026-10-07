@@ -30,10 +30,12 @@ impl AuditSink for StdoutSink {
     }
 }
 
-/// The structured log entry of `event`: Cloud Run reads `severity`,
-/// `message` and the `logging.googleapis.com/labels` the audit sink filters
-/// on; the event goes under `audit`.
-fn line(event: &AuditEvent) -> Value {
+/// The structured log entry of `event`, which [`StdoutSink`] writes as one
+/// line: Cloud Run reads `severity`, `message` and the
+/// `logging.googleapis.com/labels` the audit sink filters on; the event
+/// goes under `audit`.
+#[must_use]
+pub fn line(event: &AuditEvent) -> Value {
     json!({
         "severity": "NOTICE",
         "message": format!("{} {}", event.operation, event.phase.as_str()),
@@ -76,7 +78,7 @@ mod tests {
 
     use chrono::Utc;
     use st0x_alpaca_gateway_api::{
-        AuditPhase, ErrorCode, Operation, Outcome, Profile, RejectionReason, Tier,
+        AuditPhase, ErrorCode, Operation, Outcome, RejectionReason, Tier,
     };
     use uuid::Uuid;
 
@@ -89,7 +91,6 @@ mod tests {
             phase: AuditPhase::Settled,
             at: Utc::now(),
             deployment: "t0-alpaca".to_string(),
-            profile: Profile::T0,
             environment: "production".to_string(),
             account_id: "904837e3-3b76-47ec-b432-046db621571b".to_string(),
             principal: "111".to_string(),
@@ -108,7 +109,6 @@ mod tests {
             code: Some(ErrorCode::Rejected),
             rejection: Some(RejectionReason::AlpacaApi),
             latency_ms: 12,
-            abandoned: false,
             gateway_version: "0.1.0+rev".to_string(),
         };
 

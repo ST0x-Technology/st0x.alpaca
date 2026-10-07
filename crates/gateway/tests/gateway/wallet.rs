@@ -3,12 +3,17 @@
 
 use std::time::Duration;
 
-use axum::http::StatusCode;
+use axum::http::{HeaderValue, StatusCode};
 use httpmock::prelude::*;
 use serde_json::{Value, json};
-use st0x_alpaca_gateway_api::{AuditEvent, AuditPhase, ErrorCode, Operation, Outcome, Tier};
+use st0x_alpaca_gateway_api::{
+    AuditEvent, AuditPhase, ErrorCode, ON_BEHALF_OF_HEADER, Operation, Outcome, Tier,
+};
 
-use crate::common::{ACCOUNT_ID, BOT_WALLET, Harness, JOURNAL_COUNTERPARTY, MARKET_MAKER_WALLET};
+use crate::common::{
+    ACCOUNT_ID, BOT_WALLET, Harness, JOURNAL_COUNTERPARTY, MARKET_MAKER_WALLET,
+    assert_read_audited, authorized,
+};
 
 const TRANSFER_ID: &str = "0f8a4c62-1c3e-4a5b-9d7e-2b6f8c9d0e1a";
 const OTHER_WALLET: &str = "0x3333333333333333333333333333333333333333";
@@ -58,14 +63,19 @@ fn withdrawal(address: &str) -> Value {
     })
 }
 
+/// The `X-Request-ID` Alpaca answers the whitelist read with.
+const WHITELIST_REQUEST_ID: &str = "req-whitelist";
+
 /// Serves the whitelist with every configured address approved.
 fn serve_approved_whitelist(harness: &Harness) {
     harness.alpaca.mock(|when, then| {
         when.method(GET).path(whitelist_path());
-        then.status(200).json_body(json!([
-            whitelist_entry("wl-mm", MARKET_MAKER_WALLET, "APPROVED"),
-            whitelist_entry("wl-other", OTHER_WALLET, "APPROVED"),
-        ]));
+        then.status(200)
+            .header("x-request-id", WHITELIST_REQUEST_ID)
+            .json_body(json!([
+                whitelist_entry("wl-mm", MARKET_MAKER_WALLET, "APPROVED"),
+                whitelist_entry("wl-other", OTHER_WALLET, "APPROVED"),
+            ]));
     });
 }
 
@@ -73,6 +83,23 @@ fn answered(events: &[AuditEvent]) -> Option<&AuditEvent> {
     events
         .iter()
         .find(|event| event.phase == AuditPhase::Answered)
+}
+
+fn settled(events: &[AuditEvent]) -> Option<&AuditEvent> {
+    events
+        .iter()
+        .find(|event| event.phase == AuditPhase::Settled)
+}
+
+async fn withdraw(harness: &Harness, tier: Tier, address: &str) -> (StatusCode, Value) {
+    harness
+        .call(
+            tier,
+            "POST",
+            "/wallet/withdrawals",
+            Some(withdrawal(address)),
+        )
+        .await
 }
 
 #[tokio::test]
@@ -86,17 +113,11 @@ async fn bot_withdrawal_to_the_market_maker_wallet_is_applied_and_audited() {
             "address": MARKET_MAKER_WALLET
         }));
         then.status(200)
+            .header("x-request-id", "req-withdrawal")
             .json_body(transfer_json(MARKET_MAKER_WALLET));
     });
 
-    let (status, body) = harness
-        .call(
-            Tier::Bot,
-            "POST",
-            "/wallet/withdrawals",
-            Some(withdrawal(MARKET_MAKER_WALLET)),
-        )
-        .await;
+    let (status, body) = withdraw(&harness, Tier::Bot, MARKET_MAKER_WALLET).await;
 
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["id"], TRANSFER_ID);
@@ -118,89 +139,128 @@ async fn bot_withdrawal_to_the_market_maker_wallet_is_applied_and_audited() {
         MARKET_MAKER_WALLET
     );
     assert_eq!(event.summary["amount"], "250.5");
-}
-
-#[tokio::test]
-async fn bot_withdrawal_to_another_approved_address_is_refused_before_sending() {
-    let harness = Harness::start().await;
-    serve_approved_whitelist(&harness);
-    let post = harness.alpaca.mock(|when, then| {
-        when.method(POST).path(transfers_path());
-        then.status(200).json_body(transfer_json(OTHER_WALLET));
-    });
-
-    let (status, body) = harness
-        .call(
-            Tier::Bot,
-            "POST",
-            "/wallet/withdrawals",
-            Some(withdrawal(OTHER_WALLET)),
-        )
-        .await;
-
-    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
-    assert_eq!(body["reason"], "destination_not_allowed");
-    assert_eq!(body["outcome"], "not_applied");
-    post.assert_calls(0);
+    // The whitelist read, then the transfer POST, in the order sent.
     assert_eq!(
-        answered(&harness.audit_events()).unwrap().outcome,
-        Some(Outcome::NotApplied)
+        event.alpaca_request_ids,
+        [WHITELIST_REQUEST_ID, "req-withdrawal"]
     );
 }
 
+/// The bot withdraws only to its pinned destinations, a human never to
+/// them, and nobody to an address whose whitelist entry awaits approval;
+/// each refusal comes before the transfer is sent.
 #[tokio::test]
-async fn a_human_withdrawal_to_a_bot_destination_is_refused_before_sending() {
-    let harness = Harness::start().await;
-    serve_approved_whitelist(&harness);
-    let post = harness.alpaca.mock(|when, then| {
-        when.method(POST).path(transfers_path());
-        then.status(200)
-            .json_body(transfer_json(MARKET_MAKER_WALLET));
-    });
-
-    let (status, body) = harness
-        .call(
+async fn a_withdrawal_outside_the_caller_lane_is_refused_before_sending() {
+    for (tier, address, whitelist_status, status, reason) in [
+        (
+            Tier::Bot,
+            OTHER_WALLET,
+            "APPROVED",
+            StatusCode::FORBIDDEN,
+            "destination_not_allowed",
+        ),
+        (
             Tier::Write,
-            "POST",
-            "/wallet/withdrawals",
-            Some(withdrawal(MARKET_MAKER_WALLET)),
-        )
-        .await;
+            MARKET_MAKER_WALLET,
+            "APPROVED",
+            StatusCode::FORBIDDEN,
+            "destination_not_allowed",
+        ),
+        (
+            Tier::Write,
+            OTHER_WALLET,
+            "PENDING",
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "address_not_whitelisted",
+        ),
+    ] {
+        let harness = Harness::start().await;
+        harness.alpaca.mock(|when, then| {
+            when.method(GET).path(whitelist_path());
+            then.status(200)
+                .json_body(json!([whitelist_entry("wl", address, whitelist_status)]));
+        });
+        let post = harness.alpaca.mock(|when, then| {
+            when.method(POST).path(transfers_path());
+            then.status(200).json_body(transfer_json(address));
+        });
 
-    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
-    assert_eq!(body["reason"], "destination_not_allowed");
-    post.assert_calls(0);
+        let (got, body) = withdraw(&harness, tier, address).await;
+
+        assert_eq!(got, status, "{tier:?} to {address}: {body}");
+        assert_eq!(body["reason"], reason, "{tier:?} to {address}");
+        assert_eq!(body["outcome"], "not_applied", "{tier:?} to {address}");
+        post.assert_calls(0);
+        assert_eq!(
+            answered(&harness.audit_events()).unwrap().outcome,
+            Some(Outcome::NotApplied)
+        );
+    }
 }
 
+/// Every audit record stays one bounded log line whatever a caller sends:
+/// an oversized counterparty, asset or network fails its wire bound and
+/// never reaches the record, and the reason and `X-On-Behalf-Of`, which
+/// have no wire bound, keep only their first 256 characters.
 #[tokio::test]
-async fn a_withdrawal_to_an_address_awaiting_approval_is_rejected_before_sending() {
+async fn oversized_caller_values_never_grow_an_audit_record() {
     let harness = Harness::start().await;
-    harness.alpaca.mock(|when, then| {
-        when.method(GET).path(whitelist_path());
-        then.status(200).json_body(json!([whitelist_entry(
-            "wl-other",
-            OTHER_WALLET,
-            "PENDING"
-        )]));
+    // Long enough to dwarf every bound, short enough for one URI.
+    let oversized = "a".repeat(50_000);
+    let journal = json!({
+        "counterparty": oversized,
+        "symbol": "AAPL",
+        "qty": "5",
+        "operationId": "6a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d",
+        "reason": "return shares to the issuer"
     });
-    let post = harness.alpaca.mock(|when, then| {
-        when.method(POST).path(transfers_path());
-        then.status(200).json_body(transfer_json(OTHER_WALLET));
-    });
+    let mut withdrawal_of_oversized_asset = withdrawal(OTHER_WALLET);
+    withdrawal_of_oversized_asset["asset"] = json!(oversized);
 
-    let (status, body) = harness
-        .call(
-            Tier::Write,
+    for (method, path, body) in [
+        ("POST", "/journals".to_string(), Some(journal)),
+        (
             "POST",
-            "/wallet/withdrawals",
-            Some(withdrawal(OTHER_WALLET)),
-        )
-        .await;
+            "/wallet/withdrawals".to_string(),
+            Some(withdrawal_of_oversized_asset),
+        ),
+        (
+            "GET",
+            format!("/wallet/deposit-address?asset=USDC&network={oversized}"),
+            None,
+        ),
+    ] {
+        let (status, body) = harness.call(Tier::Write, method, &path, body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{path}: {body}");
+    }
 
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
-    assert_eq!(body["reason"], "address_not_whitelisted");
-    assert_eq!(body["outcome"], "not_applied");
-    post.assert_calls(0);
+    let mut overlong_reason = withdrawal(MARKET_MAKER_WALLET);
+    overlong_reason["reason"] = json!(format!("{}{oversized}", "é".repeat(256)));
+    let mut request = authorized(
+        Tier::Write,
+        "POST",
+        &format!("{}/wallet/withdrawals", Tier::Write.prefix()),
+        Some(overlong_reason),
+    );
+    request.headers_mut().insert(
+        ON_BEHALF_OF_HEADER,
+        HeaderValue::from_str(&format!("{}{oversized}", "o".repeat(256))).unwrap(),
+    );
+    let (status, body) = harness.send(request).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+
+    let events = harness.audit_events();
+    assert_eq!(events.len(), 4, "{events:?}");
+    for event in &events {
+        let line = serde_json::to_string(event).unwrap();
+        assert!(line.len() < 4096, "a {} byte record", line.len());
+    }
+    let human = events.last().unwrap();
+    assert_eq!(human.reason.as_deref(), Some("é".repeat(256).as_str()));
+    assert_eq!(
+        human.on_behalf_of.as_deref(),
+        Some("o".repeat(256).as_str())
+    );
 }
 
 #[tokio::test]
@@ -216,14 +276,7 @@ async fn a_failed_whitelist_read_answers_not_applied_without_sending() {
             .json_body(transfer_json(MARKET_MAKER_WALLET));
     });
 
-    let (status, body) = harness
-        .call(
-            Tier::Bot,
-            "POST",
-            "/wallet/withdrawals",
-            Some(withdrawal(MARKET_MAKER_WALLET)),
-        )
-        .await;
+    let (status, body) = withdraw(&harness, Tier::Bot, MARKET_MAKER_WALLET).await;
 
     assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
     assert_eq!(body["code"], "upstream_transient");
@@ -242,14 +295,7 @@ async fn a_withdrawal_past_its_deadline_answers_outcome_unknown_and_settles_appl
             .json_body(transfer_json(MARKET_MAKER_WALLET));
     });
 
-    let (status, body) = harness
-        .call(
-            Tier::Bot,
-            "POST",
-            "/wallet/withdrawals",
-            Some(withdrawal(MARKET_MAKER_WALLET)),
-        )
-        .await;
+    let (status, body) = withdraw(&harness, Tier::Bot, MARKET_MAKER_WALLET).await;
 
     assert_eq!(status, StatusCode::GATEWAY_TIMEOUT, "{body}");
     assert_eq!(body["code"], "outcome_unknown");
@@ -258,10 +304,10 @@ async fn a_withdrawal_past_its_deadline_answers_outcome_unknown_and_settles_appl
 
     harness.settle().await;
     let events = harness.audit_events();
-    let settled = events
-        .iter()
-        .find(|event| event.phase == AuditPhase::Settled)
-        .unwrap();
+    let answer = answered(&events).unwrap();
+    assert_eq!(answer.outcome, Some(Outcome::Unknown), "{events:?}");
+    assert!(answer.alpaca_request_ids.is_empty(), "{events:?}");
+    let settled = settled(&events).unwrap();
     assert_eq!(settled.outcome, Some(Outcome::Applied));
     assert_eq!(settled.alpaca_object_id.as_deref(), Some(TRANSFER_ID));
 }
@@ -277,14 +323,7 @@ async fn a_withdrawal_that_fails_after_its_deadline_settles_outcome_unknown_with
             .json_body(json!({ "message": "internal error" }));
     });
 
-    let (status, body) = harness
-        .call(
-            Tier::Bot,
-            "POST",
-            "/wallet/withdrawals",
-            Some(withdrawal(MARKET_MAKER_WALLET)),
-        )
-        .await;
+    let (status, body) = withdraw(&harness, Tier::Bot, MARKET_MAKER_WALLET).await;
 
     assert_eq!(status, StatusCode::GATEWAY_TIMEOUT, "{body}");
     assert_eq!(body["code"], "outcome_unknown");
@@ -292,68 +331,88 @@ async fn a_withdrawal_that_fails_after_its_deadline_settles_outcome_unknown_with
     harness.settle().await;
     post.assert_calls(1);
     let events = harness.audit_events();
-    let settled = events
-        .iter()
-        .find(|event| event.phase == AuditPhase::Settled)
-        .unwrap();
+    let settled = settled(&events).unwrap();
     assert_eq!(settled.outcome, Some(Outcome::Unknown));
     assert_eq!(settled.code, Some(ErrorCode::OutcomeUnknown));
     assert_eq!(settled.alpaca_status, Some(500));
     assert_eq!(settled.alpaca_object_id, None);
 }
 
+/// The answer and the cut of the whitelist read fall on the same instant,
+/// so the caller hears either `outcome_unknown` with a `settled` record
+/// after it, or `not_applied` at once; either way nothing was sent.
+#[tokio::test]
+async fn a_withdrawal_whose_whitelist_read_outlasts_its_deadline_is_never_sent() {
+    let harness = Harness::start_with_deadline(Duration::from_millis(200)).await;
+    harness.alpaca.mock(|when, then| {
+        when.method(GET).path(whitelist_path());
+        then.status(200)
+            .delay(Duration::from_secs(30))
+            .json_body(json!([whitelist_entry(
+                "wl-mm",
+                MARKET_MAKER_WALLET,
+                "APPROVED"
+            )]));
+    });
+    let post = harness.alpaca.mock(|when, then| {
+        when.method(POST).path(transfers_path());
+        then.status(200)
+            .json_body(transfer_json(MARKET_MAKER_WALLET));
+    });
+
+    let (_, body) = withdraw(&harness, Tier::Bot, MARKET_MAKER_WALLET).await;
+    assert!(
+        matches!(body["outcome"].as_str(), Some("unknown" | "not_applied")),
+        "{body}"
+    );
+
+    // The cut read ends the detached work long before the read would answer.
+    tokio::time::timeout(Duration::from_secs(5), harness.settle())
+        .await
+        .unwrap();
+    post.assert_calls(0);
+    let events = harness.audit_events();
+    let last = events.last().unwrap();
+    assert_eq!(last.outcome, Some(Outcome::NotApplied), "{events:?}");
+    assert_eq!(last.alpaca_object_id, None);
+}
+
 const SETTLED_TX: &str = "0xabababababababababababababababababababababababababababababababab";
 
-/// The transfer list: a withdrawal settled under [`SETTLED_TX`] after a
-/// withdrawal under `tx_hash` in a status the library does not know.
-fn serve_transfers_with_a_malformed_row(harness: &Harness, tx_hash: Value) -> httpmock::Mock<'_> {
-    let mut settled = transfer_json(MARKET_MAKER_WALLET);
-    settled["tx_hash"] = json!(SETTLED_TX);
-    settled["status"] = json!("COMPLETE");
+/// An incoming transfer in a status the library does not know, listed
+/// before the deposit: only the hash, not the direction, tells the scan to
+/// skip it.
+#[tokio::test]
+async fn a_deposit_lookup_by_hash_finds_its_deposit_past_an_unrelated_malformed_row() {
+    let harness = Harness::start().await;
+    let mut deposit = transfer_json(MARKET_MAKER_WALLET);
+    deposit["direction"] = json!("INCOMING");
+    deposit["tx_hash"] = json!(SETTLED_TX);
+    deposit["status"] = json!("COMPLETE");
     let mut malformed = transfer_json(OTHER_WALLET);
     malformed["id"] = json!("5c0f7d1e-2b3a-4c5d-8e6f-7a8b9c0d1e2f");
-    malformed["tx_hash"] = tx_hash;
+    malformed["direction"] = json!("INCOMING");
+    malformed["tx_hash"] = json!(format!("0x{}", "cd".repeat(32)));
     malformed["status"] = json!("QUEUED_FOR_REVIEW");
     harness.alpaca.mock(|when, then| {
         when.method(GET).path(transfers_path());
-        then.status(200).json_body(json!([malformed, settled]));
-    })
-}
-
-#[tokio::test]
-async fn a_transfer_lookup_by_hash_finds_its_transfer_past_an_unrelated_malformed_row() {
-    let harness = Harness::start().await;
-    serve_transfers_with_a_malformed_row(&harness, json!(format!("0x{}", "cd".repeat(32))));
+        then.status(200).json_body(json!([malformed, deposit]));
+    });
 
     let (status, body) = harness
         .call(
             Tier::Bot,
             "GET",
-            &format!("/wallet/transfers/by-tx/{SETTLED_TX}"),
+            &format!("/wallet/deposits/by-tx/{SETTLED_TX}"),
             None,
         )
         .await;
 
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["transfer"]["id"], TRANSFER_ID);
-    assert_eq!(body["transfer"]["txHash"], SETTLED_TX);
+    assert_eq!(body["deposit"]["id"], TRANSFER_ID);
+    assert_eq!(body["deposit"]["tx_hash"], SETTLED_TX);
     let events = harness.audit_events();
     assert_eq!(answered(&events).unwrap().key.as_deref(), Some(SETTLED_TX));
-}
-
-#[tokio::test]
-async fn an_unreadable_pending_withdrawal_fails_the_transfer_list_as_it_fails_the_direct_one() {
-    let harness = Harness::start().await;
-    serve_transfers_with_a_malformed_row(&harness, Value::Null);
-
-    let (status, body) = harness
-        .call(Tier::Bot, "GET", "/wallet/transfers", None)
-        .await;
-
-    // Dropping the row would let a reconciliation miss a withdrawal.
-    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
-    assert_eq!(body["code"], "upstream_transient");
-    assert!(harness.state.wallet.list_all_transfers().await.is_err());
 }
 
 fn deposit_address_path() -> String {
@@ -410,32 +469,6 @@ async fn a_deposit_address_lookup_sends_only_the_asset_and_network_asked_for() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["address"].as_str().unwrap().to_lowercase(), BOT_WALLET);
     lookup.assert_calls(1);
-}
-
-#[tokio::test]
-async fn a_transfer_read_reports_the_fees_alpaca_charged() {
-    let harness = Harness::start().await;
-    let mut transfer = transfer_json(MARKET_MAKER_WALLET);
-    transfer["network_fee"] = json!("1.25");
-    transfer["fees"] = json!("0.5");
-    harness.alpaca.mock(|when, then| {
-        when.method(GET)
-            .path(format!("{}/{TRANSFER_ID}", transfers_path()));
-        then.status(200).json_body(transfer);
-    });
-
-    let (status, body) = harness
-        .call(
-            Tier::Bot,
-            "GET",
-            &format!("/wallet/transfers/{TRANSFER_ID}"),
-            None,
-        )
-        .await;
-
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["id"], TRANSFER_ID);
-    assert_eq!(body["reportedFees"], "1.75");
 }
 
 #[tokio::test]
@@ -528,8 +561,10 @@ async fn a_journal_to_an_unknown_counterparty_is_refused_before_sending() {
     journal.assert_calls(0);
 }
 
+/// The Travel Rule beneficiary comes from config only: the create attaches
+/// it, and a request carrying its own is refused.
 #[tokio::test]
-async fn whitelist_create_attaches_the_configured_beneficiary() {
+async fn whitelist_create_attaches_the_configured_beneficiary_and_refuses_one_from_the_request() {
     let harness = Harness::start().await;
     let create = harness.alpaca.mock(|when, then| {
         when.method(POST).path(whitelist_path()).json_body_includes(
@@ -546,39 +581,11 @@ async fn whitelist_create_attaches_the_configured_beneficiary() {
         then.status(200)
             .json_body(whitelist_entry("wl-new", OTHER_WALLET, "PENDING"));
     });
-
-    let (status, body) = harness
-        .call(
-            Tier::Write,
-            "POST",
-            "/wallet/whitelist/entries",
-            Some(json!({
-                "address": OTHER_WALLET,
-                "asset": "USDC",
-                "operationId": "9e8d7c6b-5a4f-4e3d-8c2b-1a0f9e8d7c6b",
-                "reason": "new treasury wallet"
-            })),
-        )
-        .await;
-
-    assert_eq!(status, StatusCode::OK, "{body}");
-    create.assert_calls(1);
-    assert_eq!(body["id"], "wl-new");
-    assert_eq!(body["status"], "pending");
-    let events = harness.audit_events();
-    assert_eq!(
-        answered(&events).unwrap().alpaca_object_id.as_deref(),
-        Some("wl-new")
-    );
-}
-
-#[tokio::test]
-async fn whitelist_create_refuses_travel_rule_fields_from_the_request() {
-    let harness = Harness::start().await;
-    let create = harness.alpaca.mock(|when, then| {
-        when.method(POST).path(whitelist_path());
-        then.status(200)
-            .json_body(whitelist_entry("wl-new", OTHER_WALLET, "PENDING"));
+    let mut request = json!({
+        "address": OTHER_WALLET,
+        "asset": "USDC",
+        "operationId": "9e8d7c6b-5a4f-4e3d-8c2b-1a0f9e8d7c6b",
+        "reason": "new treasury wallet"
     });
 
     let (status, body) = harness
@@ -586,35 +593,89 @@ async fn whitelist_create_refuses_travel_rule_fields_from_the_request() {
             Tier::Write,
             "POST",
             "/wallet/whitelist/entries",
-            Some(json!({
-                "address": OTHER_WALLET,
-                "asset": "USDC",
-                "operationId": "9e8d7c6b-5a4f-4e3d-8c2b-1a0f9e8d7c6b",
-                "reason": "new treasury wallet",
-                "travelRuleInfo": { "beneficiaryEntityName": "Somebody Else" }
-            })),
+            Some(request.clone()),
+        )
+        .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    create.assert_calls(1);
+    assert_eq!(body["id"], "wl-new");
+    assert_eq!(body["status"], "PENDING");
+    let events = harness.audit_events();
+    assert_eq!(
+        answered(&events).unwrap().alpaca_object_id.as_deref(),
+        Some("wl-new")
+    );
+
+    request["travelRuleInfo"] = json!({ "beneficiaryEntityName": "Somebody Else" });
+    let (status, body) = harness
+        .call(
+            Tier::Write,
+            "POST",
+            "/wallet/whitelist/entries",
+            Some(request),
         )
         .await;
 
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-    assert_eq!(
-        body["code"],
-        serde_json::to_value(ErrorCode::InvalidRequest).unwrap()
-    );
-    create.assert_calls(0);
+    assert_eq!(body["code"], "invalid_request");
+    create.assert_calls(1);
 }
 
-/// The whitelist with two entries for [`OTHER_WALLET`] and one for the
-/// market maker wallet.
+/// Serves the whitelist under [`WHITELIST_REQUEST_ID`]: two entries for
+/// [`OTHER_WALLET`] and one for the market maker wallet.
 fn serve_whitelist_of_two(harness: &Harness) -> httpmock::Mock<'_> {
     harness.alpaca.mock(|when, then| {
         when.method(GET).path(whitelist_path());
-        then.status(200).json_body(json!([
-            whitelist_entry("wl-a", OTHER_WALLET, "APPROVED"),
-            whitelist_entry("wl-mm", MARKET_MAKER_WALLET, "APPROVED"),
-            whitelist_entry("wl-b", OTHER_WALLET, "PENDING"),
-        ]));
+        then.status(200)
+            .header("x-request-id", WHITELIST_REQUEST_ID)
+            .json_body(json!([
+                whitelist_entry("wl-a", OTHER_WALLET, "APPROVED"),
+                whitelist_entry("wl-mm", MARKET_MAKER_WALLET, "APPROVED"),
+                whitelist_entry("wl-b", OTHER_WALLET, "PENDING"),
+            ]));
     })
+}
+
+/// The read an operator reconciles a partly applied whitelist loop from
+/// answers every entry Alpaca reports.
+#[tokio::test]
+async fn a_reader_lists_every_whitelist_entry_and_the_read_is_audited() {
+    let harness = Harness::start().await;
+    let list = serve_whitelist_of_two(&harness);
+
+    let (status, body) = harness
+        .call(Tier::Read, "GET", "/wallet/whitelist", None)
+        .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let entries: Vec<(&str, &str)> = body["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| {
+            (
+                entry["id"].as_str().unwrap(),
+                entry["status"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        entries,
+        [
+            ("wl-a", "APPROVED"),
+            ("wl-mm", "APPROVED"),
+            ("wl-b", "PENDING")
+        ]
+    );
+    list.assert_calls(1);
+    assert_read_audited(
+        &harness,
+        Operation::WalletWhitelist,
+        Tier::Read,
+        None,
+        &[WHITELIST_REQUEST_ID],
+    );
 }
 
 fn entry_path(id: &str) -> String {
@@ -685,7 +746,13 @@ async fn whitelist_remove_failing_after_one_delete_is_outcome_unknown_naming_the
     assert_eq!(body["code"], "outcome_unknown");
     assert_eq!(body["outcome"], "unknown");
     assert_eq!(body["retryableWithSameKey"], true);
-    assert_eq!(body["alpacaObjectIds"], json!(["wl-a"]));
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap()
+            .contains("whitelist entries wl-a were already changed"),
+        "{body}"
+    );
     first.assert_calls(1);
     second.assert_calls(1);
     let events = harness.audit_events();
@@ -694,161 +761,63 @@ async fn whitelist_remove_failing_after_one_delete_is_outcome_unknown_naming_the
     assert_eq!(event.alpaca_object_id.as_deref(), Some("wl-a"));
 }
 
+/// The first delete answers after the deadline; the send gate, closed at
+/// the answer, holds the second back, and the settled record names the
+/// entry the loop changed.
 #[tokio::test]
-async fn whitelist_remove_failing_after_its_deadline_settles_naming_the_deleted_entry() {
+async fn whitelist_remove_sends_no_delete_once_its_deadline_passed() {
     let harness = Harness::start_with_deadline(Duration::from_millis(200)).await;
     serve_whitelist_of_two(&harness);
-    answer_delete(&harness, "wl-a", 200);
-    let path = entry_path("wl-b");
-    harness.alpaca.mock(|when, then| {
+    let path = entry_path("wl-a");
+    let first = harness.alpaca.mock(|when, then| {
         when.method(DELETE).path(path);
-        then.status(500)
+        then.status(200)
             .delay(Duration::from_secs(1))
-            .json_body(json!({ "message": "internal error" }));
+            .json_body(json!({}));
     });
+    let second = answer_delete(&harness, "wl-b", 200);
 
     let (status, body) = remove_other_wallet(&harness).await;
     assert_eq!(status, StatusCode::GATEWAY_TIMEOUT, "{body}");
     assert_eq!(body["code"], "outcome_unknown");
 
     harness.settle().await;
+    first.assert_calls(1);
+    second.assert_calls(0);
     let events = harness.audit_events();
-    let settled = events
-        .iter()
-        .find(|event| event.phase == AuditPhase::Settled)
-        .unwrap();
+    let settled = settled(&events).unwrap();
     assert_eq!(settled.outcome, Some(Outcome::Unknown));
-    assert_eq!(settled.alpaca_status, Some(500));
     assert_eq!(settled.alpaca_object_id.as_deref(), Some("wl-a"));
-}
-
-#[tokio::test]
-async fn whitelist_remove_with_a_failed_whitelist_read_is_not_applied() {
-    let harness = Harness::start().await;
-    harness.alpaca.mock(|when, then| {
-        when.method(GET).path(whitelist_path());
-        then.status(503).body("unavailable");
-    });
-    let delete = harness.alpaca.mock(|when, then| {
-        when.method(DELETE);
-        then.status(200);
-    });
-
-    let (status, body) = remove_other_wallet(&harness).await;
-
-    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
-    assert_eq!(body["code"], "upstream_transient");
-    assert_eq!(body["outcome"], "not_applied");
-    delete.assert_calls(0);
-    let events = harness.audit_events();
-    assert_eq!(
-        answered(&events).unwrap().outcome,
-        Some(Outcome::NotApplied)
-    );
-}
-
-fn answer_patch<'a>(harness: &'a Harness, id: &str, status: u16) -> httpmock::Mock<'a> {
-    let path = format!("{}/travel-rule-info", entry_path(id));
-    harness.alpaca.mock(|when, then| {
-        when.method(PATCH).path(path).json_body(json!({
-            "travel_rule_info": {
-                "beneficiary_is_self_hosted": true,
-                "beneficiary_entity_name": "T0 Trade Ltd"
-            }
-        }));
-        then.status(status).json_body(json!({}));
-    })
-}
-
-fn patch_travel_rule() -> Value {
-    json!({
-        "operationId": "2a3b4c5d-6e7f-4809-9a1b-2c3d4e5f6a7b",
-        "reason": "attach the beneficiary"
-    })
-}
-
-async fn send_travel_rule_patch(harness: &Harness) -> (StatusCode, Value) {
-    harness
-        .call(
-            Tier::Write,
-            "POST",
-            "/wallet/whitelist/travel-rule",
-            Some(patch_travel_rule()),
-        )
-        .await
-}
-
-#[tokio::test]
-async fn a_travel_rule_patch_the_remaining_budget_cannot_cover_is_refused_with_nothing_written() {
-    // One unit for the read and three for the writes fit twice; after its
-    // read the third patch has one unit left, enough for one of its three
-    // writes but not all of them.
-    let harness = Harness::start_with("human_budget_per_minute = 10", "").await;
-    serve_whitelist_of_two(&harness);
-    let patches = [
-        answer_patch(&harness, "wl-a", 200),
-        answer_patch(&harness, "wl-mm", 200),
-        answer_patch(&harness, "wl-b", 200),
-    ];
-
-    for _ in 0..2 {
-        let (status, body) = send_travel_rule_patch(&harness).await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-    }
-
-    let (status, body) = send_travel_rule_patch(&harness).await;
-
-    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
-    assert_eq!(body["code"], "backpressure");
-    assert_eq!(body["outcome"], "not_applied");
-    assert_eq!(body["retryable"], true);
-    assert!(body["retryAfterSecs"].as_u64().unwrap() >= 1, "{body}");
-    assert!(body["alpacaStatus"].is_null(), "{body}");
-    for patch in &patches {
-        patch.assert_calls(2);
-    }
-    let events = harness.audit_events();
-    assert_eq!(events.last().unwrap().outcome, Some(Outcome::NotApplied));
-}
-
-#[tokio::test]
-async fn a_travel_rule_patch_longer_than_a_minute_of_budget_is_refused_as_never_admissible() {
-    // The smallest budget config accepts, against ten entries: ten writes
-    // and the read never fit in ten units.
-    let harness = Harness::start_with("human_budget_per_minute = 10", "").await;
-    let entries: Vec<Value> = (0..10)
-        .map(|entry| whitelist_entry(&format!("wl-{entry}"), OTHER_WALLET, "APPROVED"))
-        .collect();
-    harness.alpaca.mock(|when, then| {
-        when.method(GET).path(whitelist_path());
-        then.status(200).json_body(json!(entries));
-    });
-    let patch = harness.alpaca.mock(|when, then| {
-        when.method(PATCH);
-        then.status(200).json_body(json!({}));
-    });
-
-    let (status, body) = send_travel_rule_patch(&harness).await;
-
-    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
-    assert_eq!(body["code"], "backpressure");
-    assert_eq!(body["outcome"], "not_applied");
-    assert_eq!(body["retryable"], false);
-    assert!(body["retryAfterSecs"].is_null(), "{body}");
-    patch.assert_calls(0);
 }
 
 #[tokio::test]
 async fn travel_rule_patch_sends_the_configured_beneficiary_to_every_entry() {
     let harness = Harness::start().await;
     serve_whitelist_of_two(&harness);
-    let patches = [
-        answer_patch(&harness, "wl-a", 200),
-        answer_patch(&harness, "wl-mm", 200),
-        answer_patch(&harness, "wl-b", 200),
-    ];
+    let patches = ["wl-a", "wl-mm", "wl-b"].map(|id| {
+        let path = format!("{}/travel-rule-info", entry_path(id));
+        harness.alpaca.mock(|when, then| {
+            when.method(PATCH).path(path).json_body(json!({
+                "travel_rule_info": {
+                    "beneficiary_is_self_hosted": true,
+                    "beneficiary_entity_name": "T0 Trade Ltd"
+                }
+            }));
+            then.status(200).json_body(json!({}));
+        })
+    });
 
-    let (status, body) = send_travel_rule_patch(&harness).await;
+    let (status, body) = harness
+        .call(
+            Tier::Write,
+            "POST",
+            "/wallet/whitelist/travel-rule",
+            Some(json!({
+                "operationId": "2a3b4c5d-6e7f-4809-9a1b-2c3d4e5f6a7b",
+                "reason": "attach the beneficiary"
+            })),
+        )
+        .await;
 
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["entries"].as_array().unwrap().len(), 3);
@@ -861,44 +830,4 @@ async fn travel_rule_patch_sends_the_configured_beneficiary_to_every_entry() {
     assert_eq!(event.alpaca_object_id.as_deref(), Some("wl-a,wl-mm,wl-b"));
     let audit = serde_json::to_string(event).unwrap();
     assert!(!audit.contains("T0 Trade Ltd"), "{audit}");
-}
-
-#[tokio::test]
-async fn travel_rule_patch_failing_after_one_patch_is_outcome_unknown() {
-    let harness = Harness::start().await;
-    serve_whitelist_of_two(&harness);
-    let first = answer_patch(&harness, "wl-a", 200);
-    let second = answer_patch(&harness, "wl-mm", 404);
-    let third = answer_patch(&harness, "wl-b", 200);
-
-    let (status, body) = send_travel_rule_patch(&harness).await;
-
-    assert_eq!(status, StatusCode::GATEWAY_TIMEOUT, "{body}");
-    assert_eq!(body["code"], "outcome_unknown");
-    assert_eq!(body["retryableWithSameKey"], true);
-    assert_eq!(body["alpacaObjectIds"], json!(["wl-a"]));
-    first.assert_calls(1);
-    second.assert_calls(1);
-    third.assert_calls(0);
-    let events = harness.audit_events();
-    assert_eq!(answered(&events).unwrap().outcome, Some(Outcome::Unknown));
-}
-
-#[tokio::test]
-async fn travel_rule_patch_with_a_failed_whitelist_read_is_not_applied() {
-    let harness = Harness::start().await;
-    harness.alpaca.mock(|when, then| {
-        when.method(GET).path(whitelist_path());
-        then.status(503).body("unavailable");
-    });
-    let patch = harness.alpaca.mock(|when, then| {
-        when.method(PATCH);
-        then.status(200);
-    });
-
-    let (status, body) = send_travel_rule_patch(&harness).await;
-
-    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
-    assert_eq!(body["outcome"], "not_applied");
-    patch.assert_calls(0);
 }

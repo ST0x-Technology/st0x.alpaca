@@ -6,9 +6,8 @@ use axum::routing::{MethodRouter, get, post};
 use st0x_alpaca_gateway_api::Operation;
 use st0x_alpaca_gateway_api::dto::SymbolPath;
 use st0x_alpaca_gateway_api::dto::market::{
-    AssetResponse, CounterTradeSharesRequest, CounterTradeSharesResponse, IsOpenResponse,
-    LatestTradeResponse, OvernightQuoteResponse, QuoteResponse, SessionResponse,
-    SessionStatusResponse,
+    CounterTradeSharesRequest, IsOpenResponse, LatestTradeResponse, OvernightQuoteResponse,
+    QuoteResponse, SessionResponse,
 };
 
 use crate::answer::{Sent, broker};
@@ -31,7 +30,7 @@ pub(super) fn route(operation: Operation) -> Option<MethodRouter<AppState>> {
 
 async fn is_open(State(state): State<AppState>, call: Call) -> Response {
     state
-        .read(call, Intent::default(), async {
+        .read(call, Intent::default(), |state| async move {
             state
                 .broker
                 .is_market_open()
@@ -44,7 +43,7 @@ async fn is_open(State(state): State<AppState>, call: Call) -> Response {
 
 async fn session(State(state): State<AppState>, call: Call) -> Response {
     state
-        .read(call, Intent::default(), async {
+        .read(call, Intent::default(), |state| async move {
             state
                 .broker
                 .market_session()
@@ -57,12 +56,11 @@ async fn session(State(state): State<AppState>, call: Call) -> Response {
 
 async fn session_status(State(state): State<AppState>, call: Call) -> Response {
     state
-        .read(call, Intent::default(), async {
+        .read(call, Intent::default(), |state| async move {
             state
                 .broker
                 .market_session_status()
                 .await
-                .map(SessionStatusResponse::from)
                 .map_err(|error| broker(&error, Sent::Read))
         })
         .await
@@ -75,7 +73,7 @@ async fn latest_trade(
 ) -> Response {
     let intent = Intent::default().key(&path.symbol);
     state
-        .read(call, intent, async {
+        .read(call, intent, |state| async move {
             state
                 .broker
                 .fetch_latest_trade_price(&path.symbol)
@@ -93,7 +91,7 @@ async fn latest_quote(
 ) -> Response {
     let intent = Intent::default().key(&path.symbol);
     state
-        .read(call, intent, async {
+        .read(call, intent, |state| async move {
             state
                 .broker
                 .fetch_latest_quote(&path.symbol)
@@ -111,7 +109,7 @@ async fn latest_overnight_quote(
 ) -> Response {
     let intent = Intent::default().key(&path.symbol);
     state
-        .read(call, intent, async {
+        .read(call, intent, |state| async move {
             state
                 .broker
                 .fetch_latest_overnight_quote(&path.symbol)
@@ -129,12 +127,11 @@ async fn asset(
 ) -> Response {
     let intent = Intent::default().key(&path.symbol);
     state
-        .read(call, intent, async {
+        .read(call, intent, |state| async move {
             state
                 .broker
                 .get_asset_details(&path.symbol)
                 .await
-                .map(AssetResponse::from)
                 .map_err(|error| broker(&error, Sent::Read))
         })
         .await
@@ -150,12 +147,11 @@ async fn counter_trade_shares(
         .key(&path.symbol)
         .note("quantity", &request.shares);
     state
-        .read(call, intent, async {
+        .read(call, intent, |state| async move {
             state
                 .broker
                 .prepare_counter_trade_shares(&path.symbol, request.shares, request.extended_hours)
                 .await
-                .map(CounterTradeSharesResponse::from)
                 .map_err(|error| broker(&error, Sent::Read))
         })
         .await

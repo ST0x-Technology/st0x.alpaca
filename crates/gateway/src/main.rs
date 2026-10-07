@@ -60,7 +60,6 @@ fn validate(path: &std::path::Path) -> ExitCode {
     match GatewayConfig::load(path) {
         Ok(config) => {
             tracing::info!(
-                profile = ?config.profile,
                 environment = %config.environment,
                 account_id = %config.broker.account_id,
                 "Config is valid"

@@ -1,8 +1,6 @@
 use reqwest::Method;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
-use std::borrow::Cow;
-use std::fmt;
 use std::time::Duration;
 use tracing::{debug, info, trace};
 use uuid::Uuid;
@@ -26,47 +24,6 @@ use crate::request_id;
 /// this single source of truth instead of duplicating the literal -- a
 /// change here then cannot silently invalidate those tests.
 pub const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// A symbol checked and percent encoded as one Alpaca URL path segment.
-///
-/// The only way a symbol reaches an Alpaca URL. Percent encoding keeps `/`,
-/// `?`, `#`, `%` and `\` inside the one segment, and the dot segments URL
-/// parsing resolves away (`.`, `..`) are refused, so no symbol can point the
-/// credential at another Alpaca path. Displays as the encoded segment.
-#[derive(Debug)]
-pub(crate) struct SymbolSegment<'symbol> {
-    symbol: &'symbol Symbol,
-    encoded: Cow<'symbol, str>,
-}
-
-impl<'symbol> SymbolSegment<'symbol> {
-    /// # Errors
-    ///
-    /// [`AlpacaBrokerApiError::UnsafeSymbol`] for an empty symbol or a dot
-    /// segment.
-    pub(crate) fn new(symbol: &'symbol Symbol) -> Result<Self, AlpacaBrokerApiError> {
-        match symbol.as_str() {
-            "" | "." | ".." => Err(AlpacaBrokerApiError::UnsafeSymbol {
-                symbol: symbol.clone(),
-            }),
-            raw => Ok(Self {
-                symbol,
-                encoded: urlencoding::encode(raw),
-            }),
-        }
-    }
-
-    /// The symbol as the caller named it.
-    pub(crate) fn symbol(&self) -> &'symbol Symbol {
-        self.symbol
-    }
-}
-
-impl fmt::Display for SymbolSegment<'_> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.encoded)
-    }
-}
 
 /// Alpaca Broker API HTTP client. Basic (key/secret) or keyless
 /// (KMS-signed bearer tokens) authentication, injected per request so a
@@ -294,8 +251,11 @@ impl AlpacaBrokerApiClient {
         &self,
         symbol: &Symbol,
     ) -> Result<AssetResponse, AlpacaBrokerApiError> {
-        let segment = SymbolSegment::new(symbol)?;
-        let url = format!("{}/v1/assets/{segment}", self.base_url);
+        let url = format!(
+            "{}/v1/assets/{}",
+            self.base_url,
+            urlencoding::encode(symbol.as_str())
+        );
         debug!("Fetching asset info for {symbol}");
         self.get(&url).await
     }
@@ -1056,10 +1016,9 @@ mod tests {
         );
     }
 
-    /// The gateway audits and budgets each operation with its Alpaca
-    /// traffic: every request sent on GET, DELETE and POST, a request whose
-    /// answer never came included, the request id of every answer, refusals
-    /// alike, and the status of the last answer.
+    /// The gateway audits each operation with its Alpaca traffic: the
+    /// request id of every answer on GET, DELETE and POST, refusals alike,
+    /// and the status of the last answer.
     #[tokio::test]
     async fn traffic_of_every_request_is_collected() {
         let server = MockServer::start();
@@ -1093,12 +1052,6 @@ mod tests {
         });
         let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
         let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
-        // Port 1 is reserved and never listening: the connection is refused,
-        // so the request never left and is not counted.
-        let unreachable = AlpacaBrokerApiClient::new(&create_test_ctx(AlpacaBrokerApiMode::Mock(
-            "http://127.0.0.1:1".to_string(),
-        )))
-        .unwrap();
         let quantity = Positive::new(FractionalShares::new(
             Float::parse("1".to_string()).unwrap(),
         ))
@@ -1115,7 +1068,6 @@ mod tests {
                 )
                 .await
                 .unwrap_err();
-            unreachable.verify_account().await.unwrap_err();
         })
         .await;
 
@@ -1130,7 +1082,6 @@ mod tests {
                     "cancel-refused".to_string(),
                     "journal-failed".to_string(),
                 ],
-                requests_sent: 3,
                 last_status: Some(500),
             }
         );

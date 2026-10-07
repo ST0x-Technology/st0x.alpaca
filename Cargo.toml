@@ -111,16 +111,11 @@ tokio = { version = "1", features = [
   "macros",
   "net",
   "rt-multi-thread",
+  "test-util",
 ] }
 
-[lints.rust]
-unsafe_code = "forbid"
-
-[lints.clippy]
-all = "deny"
-pedantic = "deny"
-unwrap_used = "deny"
-expect_used = "deny"
+[lints]
+workspace = true
 
 [workspace]
 members = ["crates/gateway-api", "crates/gateway"]

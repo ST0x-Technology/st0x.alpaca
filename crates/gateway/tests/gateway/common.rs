@@ -1,5 +1,9 @@
-//! Test harness: an Alpaca mock, Google and IAP key servers, signed caller
-//! tokens, and the gateway router driven in process.
+//! Test harness: an Alpaca mock that also serves the Google and IAP signing
+//! keys, signed caller tokens, and the gateway router driven in process.
+//! Each harness holds one pooled `httpmock` server: `httpmock` hands its
+//! servers out from a capped pool and blocks for a free one, so a test
+//! holding one while it waits for a second deadlocks the suite once enough
+//! tests run at once.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -23,7 +27,8 @@ use st0x_alpaca_gateway::config::GatewayConfig;
 use st0x_alpaca_gateway::routes::{Verifiers, app};
 use st0x_alpaca_gateway::state::AppState;
 use st0x_alpaca_gateway_api::client::{ClientError, GatewayClient, StaticToken, TokenSource};
-use st0x_alpaca_gateway_api::{AuditEvent, Tier};
+use st0x_alpaca_gateway_api::{AuditEvent, AuditPhase, Operation, Tier};
+use tokio::task::JoinHandle;
 use tower::ServiceExt as _;
 
 pub const ACCOUNT_ID: &str = "904837e3-3b76-47ec-b432-046db621571b";
@@ -44,10 +49,12 @@ const EC_SECRET: [u8; 32] = [7; 32];
 /// Rows in a full Alpaca activities page.
 pub const ACTIVITY_PAGE_SIZE: usize = 100;
 
+/// The `X-Request-ID` Alpaca answers the trading account read with.
+pub const ACCOUNT_REQUEST_ID: &str = "req-account";
+
 pub struct Harness {
+    /// Alpaca, and the signing keys under `/google` and `/iap`.
     pub alpaca: MockServer,
-    /// Held so the key server keeps answering for the harness's lifetime.
-    _keys: MockServer,
     pub app: Router,
     pub state: AppState,
     pub audit: MemorySink,
@@ -91,12 +98,12 @@ pub fn account_body(account_number: &str) -> Value {
     })
 }
 
-/// Config text for a gateway pointed at the two mock servers. `extra` is
-/// spliced in as top level keys; `tables` is appended as extra tables.
-pub fn config_text(alpaca: &MockServer, keys: &MockServer, extra: &str, tables: &str) -> String {
+/// Config text for a gateway pointed at the mock server, which serves
+/// Alpaca and, through [`serve_keys`], the signing keys. `extra` is spliced
+/// in as top level keys; `tables` is appended as extra tables.
+pub fn config_text(alpaca: &MockServer, extra: &str, tables: &str) -> String {
     format!(
         r#"
-profile = "t0"
 environment = "staging"
 listen = "127.0.0.1:0"
 expected_account_number = "{ACCOUNT_NUMBER}"
@@ -113,8 +120,8 @@ bot_audience = "{BOT_AUDIENCE}"
 bot_principals = ["{BOT_SUBJECT}"]
 read_audience = "{READ_AUDIENCE}"
 write_audience = "{WRITE_AUDIENCE}"
-google_jwks_url = "{keys}/google"
-iap_jwks_url = "{keys}/iap"
+google_jwks_url = "{alpaca}/google"
+iap_jwks_url = "{alpaca}/iap"
 
 [wallet]
 bot_withdrawal_destinations = ["{MARKET_MAKER_WALLET}"]
@@ -129,15 +136,16 @@ issuer = "{JOURNAL_COUNTERPARTY}"
 {tables}
 "#,
         alpaca = alpaca.base_url(),
-        keys = keys.base_url(),
     )
 }
 
-pub fn serve_keys(keys: &MockServer) {
+/// Serves the Google and IAP signing keys under `/google` and `/iap`, which
+/// no Alpaca path shares.
+pub fn serve_keys(server: &MockServer) {
     let rsa = rsa::RsaPrivateKey::from_pkcs1_pem(RSA_PEM).unwrap();
     let n = URL_SAFE_NO_PAD.encode(rsa.n().to_bytes_be());
     let e = URL_SAFE_NO_PAD.encode(rsa.e().to_bytes_be());
-    keys.mock(|when, then| {
+    server.mock(|when, then| {
         when.method(GET).path("/google");
         then.status(200).json_body(json!({
             "keys": [{ "kid": RSA_KID, "kty": "RSA", "alg": "RS256", "n": n, "e": e }]
@@ -150,7 +158,7 @@ pub fn serve_keys(keys: &MockServer) {
         .to_encoded_point(false);
     let x = URL_SAFE_NO_PAD.encode(point.x().unwrap());
     let y = URL_SAFE_NO_PAD.encode(point.y().unwrap());
-    keys.mock(|when, then| {
+    server.mock(|when, then| {
         when.method(GET).path("/iap");
         then.status(200).json_body(json!({
             "keys": [{ "kid": EC_KID, "kty": "EC", "crv": "P-256", "x": x, "y": y }]
@@ -162,7 +170,7 @@ impl Harness {
     /// A gateway whose startup account check passed, with the default
     /// config.
     pub async fn start() -> Self {
-        Self::start_with("", "").await
+        Self::start_full("", "", None).await
     }
 
     pub async fn start_with(extra: &str, tables: &str) -> Self {
@@ -176,15 +184,16 @@ impl Harness {
 
     async fn start_full(extra: &str, tables: &str, deadline: Option<Duration>) -> Self {
         let alpaca = MockServer::start_async().await;
-        let keys = MockServer::start_async().await;
-        serve_keys(&keys);
+        serve_keys(&alpaca);
         alpaca.mock(|when, then| {
             when.method(GET)
                 .path(format!("/v1/trading/accounts/{ACCOUNT_ID}/account"));
-            then.status(200).json_body(account_body(ACCOUNT_NUMBER));
+            then.status(200)
+                .header("x-request-id", ACCOUNT_REQUEST_ID)
+                .json_body(account_body(ACCOUNT_NUMBER));
         });
 
-        let config = GatewayConfig::parse(&config_text(&alpaca, &keys, extra, tables)).unwrap();
+        let config = GatewayConfig::parse(&config_text(&alpaca, extra, tables)).unwrap();
         let audit = MemorySink::default();
         let state = AppState::connect_with_deadline(
             config,
@@ -199,7 +208,6 @@ impl Harness {
 
         Self {
             alpaca,
-            _keys: keys,
             app,
             state,
             audit,
@@ -223,13 +231,7 @@ impl Harness {
     }
 
     pub async fn send(&self, request: Request<Body>) -> (StatusCode, Value) {
-        let response = self.app.clone().oneshot(request).await.unwrap();
-        let status = response.status();
-        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
-        (status, value)
+        answer(self.app.clone(), request).await
     }
 
     /// Serves the router on a loopback port and returns a typed bot tier
@@ -238,7 +240,6 @@ impl Harness {
         GatewayClient::new(
             &self.serve().await,
             Tier::Bot,
-            reqwest::Client::new(),
             StaticToken(bot_token(BOT_SUBJECT, BOT_AUDIENCE)),
         )
         .unwrap()
@@ -251,7 +252,6 @@ impl Harness {
         GatewayClient::new(
             &self.serve().await,
             Tier::Write,
-            reqwest::Client::new(),
             IapAssertion(iap_token(WRITE_AUDIENCE)),
         )
         .unwrap()
@@ -266,15 +266,70 @@ impl Harness {
         format!("http://{address}")
     }
 
-    /// Waits for every detached mutation to finish.
+    /// Waits for every detached task to finish.
     pub async fn settle(&self) {
         self.state.tasks.close();
         self.state.tasks.wait().await;
     }
 }
 
+/// The status and JSON body `app` answers `request` with.
+async fn answer(app: Router, request: Request<Body>) -> (StatusCode, Value) {
+    let response = app.oneshot(request).await.unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    (status, value)
+}
+
+/// Waits until `mock` has received a request. The hit is counted before
+/// any configured delay, so the answer may still be in flight. Fails at
+/// once with the task's result when `task` ends first, and after ten
+/// seconds when neither happens, so a regression fails the test instead of
+/// hanging it.
+pub async fn until_called<T: std::fmt::Debug>(mock: &Mock<'_>, task: &mut JoinHandle<T>) {
+    let called = async {
+        while mock.calls_async().await == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+    tokio::select! {
+        () = called => {}
+        finished = task => panic!("the task ended before the mock was called: {finished:?}"),
+        () = tokio::time::sleep(Duration::from_secs(10)) => {
+            panic!("the mock was not called within ten seconds");
+        }
+    }
+}
+
 pub fn activity_id(page: usize, row: usize) -> String {
     format!("act-{page:02}-{row:03}")
+}
+
+/// Asserts that the one audit record is the answered `tier` read of
+/// `operation` keyed by `key`, which Alpaca answered with 200 under
+/// `request_ids`.
+pub fn assert_read_audited(
+    harness: &Harness,
+    operation: Operation,
+    tier: Tier,
+    key: Option<&str>,
+    request_ids: &[&str],
+) {
+    let events = harness.audit_events();
+    assert_eq!(events.len(), 1, "{events:?}");
+    let event = &events[0];
+    assert_eq!(event.operation, operation);
+    assert_eq!(event.tier, tier);
+    assert_eq!(event.phase, AuditPhase::Answered);
+    assert_eq!(event.account_id, ACCOUNT_ID);
+    assert_eq!(event.key.as_deref(), key);
+    assert_eq!(event.outcome, None);
+    assert_eq!(event.code, None);
+    assert_eq!(event.alpaca_status, Some(200));
+    assert_eq!(event.alpaca_request_ids, request_ids);
 }
 
 /// Serves `full_pages` pages of FEE activities, each after the page token of

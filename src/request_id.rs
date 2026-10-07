@@ -1,145 +1,186 @@
-//! Alpaca request traffic seen while running a future.
+//! Alpaca request ids seen while running a future, and the gate that decides
+//! whether its requests may still leave.
 //!
-//! A caller that audits and budgets its Alpaca traffic (the gateway) wraps
-//! one operation in [`collect`] and gets back what the operation sent and
-//! what Alpaca answered, without any method signature carrying it: how many
-//! Alpaca API requests went out, the `X-Request-ID` of every answer, and the
-//! status of the last answer. A caller that must see that traffic even when
-//! the operation's future is dropped before it finishes (its own caller went
-//! away) runs it under [`collect_into`] with a [`TrafficHandle`] it keeps.
-//! Outside a scope recording is a no op.
+//! [`collect`] returns a future's output with the request id of every Alpaca
+//! answer and the status of the last Alpaca API answer. [`gated`] runs a
+//! future under a [`SendGate`]: once [`SendGate::close`] returned, no Alpaca
+//! request and no credential mint of that future starts. Outside a scope
+//! nothing is recorded and every request may leave.
 
+use std::cell::RefCell;
+use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use reqwest::header::HeaderMap;
+#[cfg(feature = "broker")]
 use reqwest::{RequestBuilder, Response, StatusCode};
 
 /// Header Alpaca puts its request id in.
 pub const ALPACA_REQUEST_ID_HEADER: &str = "x-request-id";
 
-/// The Alpaca traffic of one [`collect`] or [`collect_into`] scope.
+/// The Alpaca traffic of one [`collect`] scope.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Traffic {
     /// The request id of every Alpaca answer that carried one, in order,
-    /// token mint answers included.
+    /// credential mint answers included.
     pub request_ids: Vec<String>,
-    /// Alpaca API requests that may have reached Alpaca, answered or not. A
-    /// send that failed before its request could leave (the request never
-    /// built, or no connection was made) is not counted, and token mints are
-    /// not API requests.
-    pub requests_sent: u32,
-    /// The status of the last Alpaca answer, token mint answers included.
+    /// The status of the last Alpaca API answer. A credential mint answer
+    /// never sets it.
     pub last_status: Option<u16>,
 }
 
-/// Shared view of one [`collect_into`] scope's traffic. Every clone sees the
-/// same traffic, and it stays readable after the future recording into it is
-/// dropped.
-#[derive(Debug, Clone, Default)]
-pub struct TrafficHandle(Arc<Mutex<Traffic>>);
+/// Whether the requests of a [`gated`] scope may still leave. Every Alpaca
+/// request asks it right before it leaves and holds its lock until the
+/// request is in the HTTP client's hands; a credential mint asks it before
+/// it starts. A closed gate holds the request back with [`GateClosed`].
+/// Clones share one gate.
+#[derive(Clone)]
+pub struct SendGate(Arc<Gate<dyn Fn() -> bool + Send + Sync>>);
 
-impl TrafficHandle {
-    /// The traffic recorded so far.
-    #[must_use]
-    pub fn snapshot(&self) -> Traffic {
-        self.lock().clone()
+struct Gate<IsOpen: ?Sized> {
+    closed: Mutex<bool>,
+    is_open: IsOpen,
+}
+
+impl SendGate {
+    /// A gate that is open until [`Self::close`] and while `is_open` answers
+    /// true. `is_open` runs under the gate's lock, so it must be cheap, and
+    /// it must never answer true after it answered false: every client
+    /// classifies a held back request as permanent.
+    pub fn new(is_open: impl Fn() -> bool + Send + Sync + 'static) -> Self {
+        Self(Arc::new(Gate {
+            closed: Mutex::new(false),
+            is_open,
+        }))
     }
 
-    fn lock(&self) -> MutexGuard<'_, Traffic> {
-        // Recording never panics while it holds the lock, so a poisoned
-        // lock still guards whole traffic.
-        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    /// Closes the gate for good, after a request that already found it open
+    /// is in the HTTP client's hands.
+    pub fn close(&self) {
+        *self.lock() = true;
+    }
+
+    fn hold(&self) -> Result<MutexGuard<'_, bool>, GateClosed> {
+        let closed = self.lock();
+        if *closed || !(self.0.is_open)() {
+            Err(GateClosed)
+        } else {
+            Ok(closed)
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, bool> {
+        // The flag is only ever set, so a lock poisoned by a panicking
+        // `is_open` still guards a whole flag.
+        self.0.closed.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
+impl fmt::Debug for SendGate {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.debug_struct("SendGate").finish_non_exhaustive()
+    }
+}
+
+/// A request a closed [`SendGate`] held back. It never left.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("the request was not sent: its send gate was closed")]
+pub struct GateClosed;
+
+/// The failure of [`send`]: the HTTP client's own, or a closed gate.
+#[cfg(feature = "broker")]
+#[derive(Debug)]
+pub(crate) enum SendError {
+    Http(reqwest::Error),
+    NotSent(GateClosed),
+}
+
 tokio::task_local! {
-    static TRAFFIC: TrafficHandle;
+    static TRAFFIC: RefCell<Traffic>;
+    static GATE: SendGate;
 }
 
 /// Runs `future` and returns its output with the Alpaca traffic it made.
 pub async fn collect<Output>(future: impl Future<Output = Output>) -> (Output, Traffic) {
-    let handle = TrafficHandle::default();
-    let output = collect_into(handle.clone(), future).await;
-    let traffic = std::mem::take(&mut *handle.lock());
-    (output, traffic)
+    TRAFFIC
+        .scope(RefCell::default(), async {
+            let output = future.await;
+            (output, TRAFFIC.with(RefCell::take))
+        })
+        .await
 }
 
-/// Runs `future`, recording its Alpaca traffic into `handle` as it happens,
-/// so traffic recorded before the returned future is dropped stays readable
-/// through any clone of `handle`.
-pub async fn collect_into<Output>(
-    handle: TrafficHandle,
-    future: impl Future<Output = Output>,
-) -> Output {
-    TRAFFIC.scope(handle, future).await
+/// Runs `future` with every Alpaca request and credential mint it starts
+/// asking `gate` first. In nested scopes the innermost gate decides.
+pub async fn gated<Output>(gate: SendGate, future: impl Future<Output = Output>) -> Output {
+    GATE.scope(gate, future).await
 }
 
-/// Sends one Alpaca API request, counting it in the active scope. It is
-/// counted before it goes out, so a request whose answer never arrives, or
-/// whose send is dropped half way, still counts. The count is taken back only
-/// when the send failed before the request could leave: it never built, or no
-/// connection was made (the rule an order POST uses to call a failure
-/// unwritten).
-pub(crate) async fn send(request: RequestBuilder) -> reqwest::Result<Response> {
-    update(|traffic| traffic.requests_sent = traffic.requests_sent.saturating_add(1));
-    let sent = request.send().await;
-    if sent
+/// Sends one Alpaca API request unless the active [`SendGate`] holds it
+/// back. Callers send only once everything the request needs is in hand.
+#[cfg(feature = "broker")]
+pub(crate) async fn send(request: RequestBuilder) -> Result<Response, SendError> {
+    start(request)?.await.map_err(SendError::Http)
+}
+
+/// Asks the active gate and, under its lock, hands the request to the HTTP
+/// client, which builds the request's future without awaiting.
+#[cfg(feature = "broker")]
+fn start(
+    request: RequestBuilder,
+) -> Result<impl Future<Output = reqwest::Result<Response>>, SendError> {
+    let gate = GATE.try_with(SendGate::clone).ok();
+    let _open = gate
         .as_ref()
-        .is_err_and(|error| error.is_builder() || error.is_connect())
-    {
-        update(|traffic| traffic.requests_sent = traffic.requests_sent.saturating_sub(1));
-    }
-    sent
+        .map(SendGate::hold)
+        .transpose()
+        .map_err(SendError::NotSent)?;
+    Ok(request.send())
 }
 
-/// Records one Alpaca answer, when a scope is active: its status and its
-/// request id. Every client calls this for every answer, success or error,
-/// before reading the body.
+/// [`GateClosed`] when the active [`gated`] scope's gate is closed. A
+/// credential mint asks it before it starts.
+pub(crate) fn ensure_open() -> Result<(), GateClosed> {
+    GATE.try_with(|gate| gate.hold().map(drop))
+        .unwrap_or(Ok(()))
+}
+
+/// Records one Alpaca API answer: its status and its request id. Every
+/// client calls it right after its send returns, before reading the body.
+#[cfg(feature = "broker")]
 pub(crate) fn record(status: StatusCode, headers: &HeaderMap) {
-    let id = headers
+    update(|traffic| traffic.last_status = Some(status.as_u16()));
+    record_id(headers);
+}
+
+/// Records an answer's request id only, as a credential mint answer does:
+/// its status is not Alpaca's answer to the operation.
+pub(crate) fn record_id(headers: &HeaderMap) {
+    if let Some(id) = headers
         .get(ALPACA_REQUEST_ID_HEADER)
-        .and_then(|value| value.to_str().ok());
-    update(|traffic| {
-        traffic.last_status = Some(status.as_u16());
-        if let Some(id) = id {
-            traffic.request_ids.push(id.to_string());
-        }
-    });
+        .and_then(|value| value.to_str().ok())
+    {
+        update(|traffic| traffic.request_ids.push(id.to_string()));
+    }
 }
 
 fn update(change: impl FnOnce(&mut Traffic)) {
-    let _ = TRAFFIC.try_with(|handle| change(&mut handle.lock()));
+    let _ = TRAFFIC.try_with(|traffic| change(&mut traffic.borrow_mut()));
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "broker"))]
 mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
     use httpmock::prelude::*;
     use reqwest::header::HeaderValue;
-    use tokio::net::TcpListener;
     use tokio::sync::oneshot;
-    use tokio::task::JoinHandle;
 
     use super::*;
 
-    /// A server that accepts one connection and never answers it: a
-    /// request sent to it has left, and its answer never comes. The
-    /// receiver fires once the connection is accepted.
-    async fn silent_server() -> (String, oneshot::Receiver<()>, JoinHandle<()>) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}/silent", listener.local_addr().unwrap());
-        let (accepted, on_accept) = oneshot::channel();
-        let holder = tokio::spawn(async move {
-            let (_socket, _) = listener.accept().await.unwrap();
-            let _ = accepted.send(());
-            std::future::pending::<()>().await;
-        });
-        (url, on_accept, holder)
-    }
-
     #[tokio::test]
-    async fn a_scope_counts_only_requests_that_may_have_left_and_keeps_the_last_answer() {
+    async fn a_scope_keeps_every_request_id_and_the_last_api_status() {
         let server = MockServer::start();
         server.mock(|when, then| {
             when.method(GET).path("/answered");
@@ -149,83 +190,106 @@ mod tests {
             when.method(GET).path("/missing");
             then.status(404);
         });
-        let (silent_url, _, holder) = silent_server().await;
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_millis(300))
-            .build()
-            .unwrap();
+        let client = reqwest::Client::new();
+        let mut mint = HeaderMap::new();
+        mint.insert(ALPACA_REQUEST_ID_HEADER, HeaderValue::from_static("m"));
 
         let ((), traffic) = collect(async {
             let answered = send(client.get(server.url("/answered"))).await.unwrap();
             record(answered.status(), answered.headers());
-
-            let refused = send(client.get("http://127.0.0.1:1/refused"))
-                .await
-                .unwrap_err();
-            assert!(refused.is_connect(), "{refused:?}");
-
-            let unbuilt = send(client.get("not a url")).await.unwrap_err();
-            assert!(unbuilt.is_builder(), "{unbuilt:?}");
-
-            let unanswered = send(client.get(&silent_url)).await.unwrap_err();
-            assert!(unanswered.is_timeout(), "{unanswered:?}");
-
             let missing = send(client.get(server.url("/missing"))).await.unwrap();
             record(missing.status(), missing.headers());
+            record_id(&mint);
         })
         .await;
-        holder.abort();
 
         assert_eq!(
             traffic,
             Traffic {
-                request_ids: vec!["b".to_string()],
-                requests_sent: 3,
+                request_ids: vec!["b".to_string(), "m".to_string()],
                 last_status: Some(404),
             }
         );
     }
 
+    /// The gate is asked by each request as it would leave, not once for
+    /// the scope: a request sent while it is open leaves, and one sent after
+    /// a clone of it closed never reaches the server.
     #[tokio::test]
-    async fn a_dropped_operation_leaves_its_traffic_in_the_handle() {
-        let server = MockServer::start();
-        server.mock(|when, then| {
+    async fn a_send_gate_holds_back_every_request_after_it_closes() {
+        let server = MockServer::start_async().await;
+        let answered = server.mock(|when, then| {
             when.method(GET).path("/answered");
-            then.status(200).header(ALPACA_REQUEST_ID_HEADER, "a");
+            then.status(200);
         });
-        let (silent_url, on_accept, holder) = silent_server().await;
         let client = reqwest::Client::new();
-        let handle = TrafficHandle::default();
+        let gate = SendGate::new(|| true);
 
-        let operation = collect_into(handle.clone(), async {
-            let answered = send(client.get(server.url("/answered"))).await.unwrap();
-            record(answered.status(), answered.headers());
-            let _ = send(client.get(&silent_url)).await;
-            unreachable!("the silent server never answers");
-        });
-        // The caller goes away while the second request waits for its
-        // answer, dropping the operation.
-        tokio::select! {
-            () = operation => {}
-            accepted = on_accept => accepted.unwrap(),
-        }
-        holder.abort();
+        gated(gate.clone(), async {
+            send(client.get(server.url("/answered"))).await.unwrap();
+            gate.close();
+            let held = send(client.post(server.url("/answered")))
+                .await
+                .unwrap_err();
+            assert!(matches!(held, SendError::NotSent(GateClosed)), "{held:?}");
+        })
+        .await;
 
-        assert_eq!(
-            handle.snapshot(),
-            Traffic {
-                request_ids: vec!["a".to_string()],
-                requests_sent: 2,
-                last_status: Some(200),
-            }
-        );
+        answered.assert_calls_async(1).await;
     }
 
-    #[test]
-    fn recording_outside_a_scope_is_ignored() {
-        let mut headers = HeaderMap::new();
-        headers.insert(ALPACA_REQUEST_ID_HEADER, HeaderValue::from_static("a"));
-        update(|traffic| traffic.requests_sent += 1);
-        record(StatusCode::OK, &headers);
+    /// A close racing a send on another worker: the sender found the gate
+    /// open, so the close returns only once that request is handed over, and
+    /// the send after the close is held back.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_close_waits_for_a_send_that_found_the_gate_open() {
+        let server = MockServer::start_async().await;
+        let written = server.mock(|when, then| {
+            when.method(POST).path("/write");
+            then.status(200);
+        });
+        let client = reqwest::Client::new();
+        let (asking, asked) = std::sync::mpsc::channel();
+        let answered = Arc::new(AtomicBool::new(false));
+        let gate = SendGate::new({
+            let answered = Arc::clone(&answered);
+            move || {
+                // Long enough for the close to land before this answer,
+                // unless the gate's lock holds it back.
+                let _ = asking.send(());
+                std::thread::sleep(Duration::from_millis(200));
+                answered.store(true, Ordering::SeqCst);
+                true
+            }
+        });
+        let (closed, on_close) = oneshot::channel::<()>();
+        let url = server.url("/write");
+        let sender = tokio::spawn(gated(gate.clone(), async move {
+            let first = send(client.post(&url)).await;
+            on_close.await.unwrap();
+            let second = send(client.post(&url)).await;
+            (first, second)
+        }));
+
+        let open_at_close = tokio::task::spawn_blocking({
+            let gate = gate.clone();
+            move || {
+                asked.recv().unwrap();
+                gate.close();
+                answered.load(Ordering::SeqCst)
+            }
+        })
+        .await
+        .unwrap();
+        closed.send(()).unwrap();
+        let (first, second) = sender.await.unwrap();
+
+        assert!(open_at_close);
+        assert_eq!(first.unwrap().status(), StatusCode::OK);
+        assert!(
+            matches!(second, Err(SendError::NotSent(GateClosed))),
+            "{second:?}"
+        );
+        written.assert_calls_async(1).await;
     }
 }

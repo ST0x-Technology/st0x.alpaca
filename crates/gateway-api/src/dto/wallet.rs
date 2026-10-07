@@ -5,70 +5,14 @@
 //! deployment's config. No request here carries an account id or Travel Rule
 //! info; unknown fields are refused.
 
-use alloy_primitives::{Address, TxHash};
-use chrono::{DateTime, NaiveDate, Utc};
+use alloy_primitives::Address;
+use chrono::NaiveDate;
 use rain_math_float::Float;
-use serde::{Deserialize, Serialize};
-use st0x_alpaca::broker::{AlpacaAmount, JournalResponse, JournalStatus};
+use serde::{Deserialize, Deserializer, Serialize};
+use st0x_alpaca::broker::{JournalResponse, JournalStatus};
 use st0x_alpaca::st0x_finance::{FractionalShares, Positive, Symbol, Usdc};
-use st0x_alpaca::wallet::{
-    AlpacaTransferId, Network, TokenSymbol, TransferDirection, TransferStatus, WhitelistEntry,
-    WhitelistStatus,
-};
+use st0x_alpaca::wallet::{Network, TokenSymbol, Transfer, WhitelistEntry};
 use uuid::Uuid;
-
-/// One crypto transfer, in or out of the account's wallet.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Transfer {
-    pub id: AlpacaTransferId,
-    /// Onchain transaction hash, once Alpaca reports one.
-    pub tx_hash: Option<TxHash>,
-    pub direction: TransferDirection,
-    /// As Alpaca reported it (up to nine decimals); the library floors it
-    /// to USDC's six decimal onchain grid when it reads it.
-    pub amount: AlpacaAmount,
-    pub chain: String,
-    pub asset: TokenSymbol,
-    pub from_address: Address,
-    pub to_address: Address,
-    pub status: TransferStatus,
-    pub created_at: DateTime<Utc>,
-}
-
-impl From<st0x_alpaca::wallet::Transfer> for Transfer {
-    fn from(transfer: st0x_alpaca::wallet::Transfer) -> Self {
-        Self {
-            id: transfer.id,
-            tx_hash: transfer.tx,
-            direction: transfer.direction,
-            amount: transfer.amount,
-            chain: transfer.chain,
-            asset: transfer.asset,
-            from_address: transfer.from,
-            to_address: transfer.to,
-            status: transfer.status,
-            created_at: transfer.created_at,
-        }
-    }
-}
-
-impl From<Transfer> for st0x_alpaca::wallet::Transfer {
-    fn from(transfer: Transfer) -> Self {
-        Self {
-            id: transfer.id,
-            tx: transfer.tx_hash,
-            direction: transfer.direction,
-            amount: transfer.amount,
-            chain: transfer.chain,
-            asset: transfer.asset,
-            from: transfer.from_address,
-            to: transfer.to_address,
-            status: transfer.status,
-            created_at: transfer.created_at,
-        }
-    }
-}
 
 /// `wallet.withdraw` request. The address must hold an approved whitelist
 /// entry; the bot tier may only use the deployment's pinned destinations and
@@ -77,6 +21,7 @@ impl From<Transfer> for st0x_alpaca::wallet::Transfer {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WithdrawRequest {
     pub amount: Positive<Usdc>,
+    #[serde(deserialize_with = "asset")]
     pub asset: TokenSymbol,
     pub address: Address,
     /// Caller chosen id for the audit record. Alpaca does not dedupe
@@ -86,15 +31,8 @@ pub struct WithdrawRequest {
     pub reason: Option<String>,
 }
 
-/// `wallet.transfer` path.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct TransferIdPath {
-    pub transfer_id: Uuid,
-}
-
 /// `wallet.transfer`: one transfer with the fees Alpaca reports for it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TransferResponse {
     #[serde(flatten)]
@@ -105,43 +43,47 @@ pub struct TransferResponse {
 }
 
 /// `wallet.transfers`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TransfersResponse {
     pub transfers: Vec<Transfer>,
 }
 
-/// `wallet.find_deposit` and `wallet.find_transfer` path.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct TxHashPath {
-    pub tx_hash: TxHash,
-}
-
 /// `wallet.find_deposit`: `None` when the transfer list holds no incoming
 /// transfer with the hash. The list may be capped, so `None` is not proof
 /// the deposit does not exist.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DepositResponse {
     pub deposit: Option<Transfer>,
-}
-
-/// `wallet.find_transfer`: the first listed transfer, in either direction,
-/// carrying the hash; `None` when the transfer list holds none. The list
-/// may be capped, so `None` is not proof the transfer does not exist.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TransferLookupResponse {
-    pub transfer: Option<Transfer>,
 }
 
 /// `wallet.deposit_address` query.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DepositAddressQuery {
+    #[serde(deserialize_with = "asset")]
     pub asset: TokenSymbol,
+    #[serde(deserialize_with = "network")]
     pub network: Network,
+}
+
+/// Reads a requested asset ticker of at most [`super::SYMBOL_MAX`]
+/// characters.
+fn asset<'de, D>(deserializer: D) -> Result<TokenSymbol, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    super::bounded("asset", super::SYMBOL_MAX, deserializer).map(TokenSymbol)
+}
+
+/// Reads a requested network name of at most [`super::NETWORK_MAX`]
+/// characters.
+fn network<'de, D>(deserializer: D) -> Result<Network, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    super::bounded("network", super::NETWORK_MAX, deserializer).map(Network::from)
 }
 
 /// `wallet.deposit_address`.
@@ -151,80 +93,12 @@ pub struct DepositAddressResponse {
     pub address: Address,
 }
 
-/// Whitelist entry review state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum WhitelistState {
-    Pending,
-    Approved,
-    Rejected,
-}
-
-impl From<WhitelistStatus> for WhitelistState {
-    fn from(status: WhitelistStatus) -> Self {
-        match status {
-            WhitelistStatus::Pending => Self::Pending,
-            WhitelistStatus::Approved => Self::Approved,
-            WhitelistStatus::Rejected => Self::Rejected,
-        }
-    }
-}
-
-impl From<WhitelistState> for WhitelistStatus {
-    fn from(state: WhitelistState) -> Self {
-        match state {
-            WhitelistState::Pending => Self::Pending,
-            WhitelistState::Approved => Self::Approved,
-            WhitelistState::Rejected => Self::Rejected,
-        }
-    }
-}
-
-/// One withdrawal whitelist entry.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct WhitelistEntryResponse {
-    pub id: String,
-    pub address: Address,
-    pub asset: TokenSymbol,
-    /// The chain as Alpaca names it, for example `ETH`.
-    pub chain: Network,
-    pub status: WhitelistState,
-    pub created_at: DateTime<Utc>,
-}
-
-impl From<WhitelistEntry> for WhitelistEntryResponse {
-    fn from(entry: WhitelistEntry) -> Self {
-        Self {
-            id: entry.id,
-            address: entry.address,
-            asset: entry.asset,
-            chain: entry.chain,
-            status: entry.status.into(),
-            created_at: entry.created_at,
-        }
-    }
-}
-
-impl From<WhitelistEntryResponse> for WhitelistEntry {
-    fn from(entry: WhitelistEntryResponse) -> Self {
-        Self {
-            id: entry.id,
-            address: entry.address,
-            asset: entry.asset,
-            chain: entry.chain,
-            status: entry.status.into(),
-            created_at: entry.created_at,
-        }
-    }
-}
-
 /// `wallet.whitelist`, and the entries `wallet.whitelist_remove` and
 /// `wallet.whitelist_patch_travel_rule` touched.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WhitelistResponse {
-    pub entries: Vec<WhitelistEntryResponse>,
+    pub entries: Vec<WhitelistEntry>,
 }
 
 /// `wallet.whitelist_create` request. The Travel Rule beneficiary comes from
@@ -234,16 +108,10 @@ pub struct WhitelistResponse {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WhitelistCreateRequest {
     pub address: Address,
+    #[serde(deserialize_with = "asset")]
     pub asset: TokenSymbol,
     pub operation_id: Uuid,
     pub reason: Option<String>,
-}
-
-/// `wallet.whitelist_remove` path.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct AddressPath {
-    pub address: Address,
 }
 
 /// `wallet.whitelist_remove` request. Removes every entry for the address in
@@ -265,10 +133,12 @@ pub struct TravelRulePatchRequest {
 }
 
 /// `journals.create` request. `counterparty` is a name from the deployment's
-/// config; the account id behind it never crosses the wire.
+/// config, read by [`super::counterparty`]; the account id behind it never
+/// crosses the wire.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct JournalCreateRequest {
+    #[serde(deserialize_with = "super::counterparty")]
     pub counterparty: String,
     #[serde(deserialize_with = "super::symbol")]
     pub symbol: Symbol,
@@ -277,60 +147,13 @@ pub struct JournalCreateRequest {
     pub reason: Option<String>,
 }
 
-/// Alpaca journal status.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum JournalState {
-    Queued,
-    SentToClearing,
-    Pending,
-    Executed,
-    Rejected,
-    Canceled,
-    Refused,
-    Deleted,
-    Correct,
-}
-
-impl From<JournalStatus> for JournalState {
-    fn from(status: JournalStatus) -> Self {
-        match status {
-            JournalStatus::Queued => Self::Queued,
-            JournalStatus::SentToClearing => Self::SentToClearing,
-            JournalStatus::Pending => Self::Pending,
-            JournalStatus::Executed => Self::Executed,
-            JournalStatus::Rejected => Self::Rejected,
-            JournalStatus::Canceled => Self::Canceled,
-            JournalStatus::Refused => Self::Refused,
-            JournalStatus::Deleted => Self::Deleted,
-            JournalStatus::Correct => Self::Correct,
-        }
-    }
-}
-
-impl From<JournalState> for JournalStatus {
-    fn from(state: JournalState) -> Self {
-        match state {
-            JournalState::Queued => Self::Queued,
-            JournalState::SentToClearing => Self::SentToClearing,
-            JournalState::Pending => Self::Pending,
-            JournalState::Executed => Self::Executed,
-            JournalState::Rejected => Self::Rejected,
-            JournalState::Canceled => Self::Canceled,
-            JournalState::Refused => Self::Refused,
-            JournalState::Deleted => Self::Deleted,
-            JournalState::Correct => Self::Correct,
-        }
-    }
-}
-
 /// `journals.create`. Carries no account id, neither ours nor the
 /// counterparty's.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct JournalCreateResponse {
     pub id: Uuid,
-    pub status: JournalState,
+    pub status: JournalStatus,
     pub symbol: Symbol,
     pub quantity: Positive<FractionalShares>,
     #[serde(
@@ -346,7 +169,7 @@ impl From<JournalResponse> for JournalCreateResponse {
     fn from(journal: JournalResponse) -> Self {
         Self {
             id: journal.id,
-            status: journal.status.into(),
+            status: journal.status,
             symbol: journal.symbol,
             quantity: journal.quantity,
             price: journal.price,
@@ -359,74 +182,80 @@ impl From<JournalResponse> for JournalCreateResponse {
 mod tests {
     use serde_json::json;
 
-    use super::super::through_wire;
     use super::*;
 
-    #[test]
-    fn a_transfer_comes_back_from_the_wire_with_alpacas_raw_amount() {
-        let alpaca: st0x_alpaca::wallet::Transfer = serde_json::from_value(json!({
-            "id": "9a8b7c6d-5e4f-4a3b-9c2d-1e0f9a8b7c6d",
-            "tx_hash": format!("0x{}", "ab".repeat(32)),
-            "direction": "OUTGOING",
-            "amount": "250.123456789",
-            "chain": "ETH",
-            "asset": "USDC",
-            "from_address": "0x1111111111111111111111111111111111111111",
-            "to_address": "0x2222222222222222222222222222222222222222",
-            "status": "COMPLETE",
-            "created_at": "2026-10-06T10:00:00Z"
+    fn journal(counterparty: &str) -> serde_json::Result<JournalCreateRequest> {
+        serde_json::from_value(json!({
+            "counterparty": counterparty,
+            "symbol": "AAPL",
+            "qty": "5",
+            "operationId": "6a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d"
         }))
-        .unwrap();
-        let wire = Transfer::from(alpaca.clone());
-
-        let relayed = st0x_alpaca::wallet::Transfer::from(through_wire(&wire));
-
-        assert_eq!(relayed.amount, alpaca.amount);
-        assert_eq!(
-            serde_json::to_value(&wire).unwrap()["amount"],
-            "250.123456789"
-        );
-        assert_eq!(Transfer::from(relayed), wire);
     }
 
     #[test]
-    fn a_whitelist_entry_comes_back_from_the_wire_unchanged() {
-        for status in ["PENDING", "APPROVED", "REJECTED"] {
-            let alpaca: WhitelistEntry = serde_json::from_value(json!({
-                "id": "wl_1",
-                "address": "0x1111111111111111111111111111111111111111",
-                "asset": "USDC",
-                "chain": "ETH",
-                "status": status,
-                "created_at": "2026-10-06T10:00:00Z"
-            }))
-            .unwrap();
-            let wire = WhitelistEntryResponse::from(alpaca.clone());
-
-            let relayed = WhitelistEntry::from(through_wire(&wire));
-
-            assert_eq!(
-                serde_json::to_value(relayed).unwrap(),
-                serde_json::to_value(alpaca).unwrap()
-            );
+    fn a_journal_names_its_counterparty_in_config_key_form() {
+        let longest = "c".repeat(super::super::COUNTERPARTY_MAX);
+        for accepted in ["issuer", "Issuer_2", "market-maker", longest.as_str()] {
+            assert_eq!(journal(accepted).unwrap().counterparty, accepted);
+            assert!(super::super::is_counterparty_name(accepted), "{accepted:?}");
         }
-    }
 
-    #[test]
-    fn journal_states_keep_their_meaning() {
-        for state in [
-            "queued",
-            "sent_to_clearing",
-            "pending",
-            "executed",
-            "rejected",
-            "canceled",
-            "refused",
-            "deleted",
-            "correct",
+        let overlong = "c".repeat(super::super::COUNTERPARTY_MAX + 1);
+        for refused in [
+            "",
+            " ",
+            "issuer ",
+            "a.b",
+            "a/b",
+            "ïssuer",
+            overlong.as_str(),
         ] {
-            let state: JournalState = serde_json::from_value(json!(state)).unwrap();
-            assert_eq!(JournalState::from(JournalStatus::from(state)), state);
+            assert!(journal(refused).is_err(), "{refused:?} was accepted");
+            assert!(!super::super::is_counterparty_name(refused), "{refused:?}");
         }
+        let error = journal(&overlong).unwrap_err();
+        assert!(!error.to_string().contains(&overlong), "{error}");
+    }
+
+    #[test]
+    fn requested_assets_and_networks_are_bounded_in_length() {
+        let asset = |asset: &str| {
+            serde_json::from_value::<WithdrawRequest>(json!({
+                "amount": "1",
+                "asset": asset,
+                "address": "0x1111111111111111111111111111111111111111",
+                "operationId": "6a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d"
+            }))
+        };
+        let whitelisted = |asset: &str| {
+            serde_json::from_value::<WhitelistCreateRequest>(json!({
+                "address": "0x1111111111111111111111111111111111111111",
+                "asset": asset,
+                "operationId": "6a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d"
+            }))
+        };
+        let deposit = |asset: &str, network: &str| {
+            serde_json::from_value::<DepositAddressQuery>(
+                json!({ "asset": asset, "network": network }),
+            )
+        };
+        let longest = "U".repeat(super::super::SYMBOL_MAX);
+        let overlong = "U".repeat(super::super::SYMBOL_MAX + 1);
+        let longest_network = "E".repeat(super::super::NETWORK_MAX);
+        let overlong_network = "E".repeat(super::super::NETWORK_MAX + 1);
+
+        assert_eq!(asset(&longest).unwrap().asset.as_ref(), longest);
+        assert_eq!(whitelisted(&longest).unwrap().asset.as_ref(), longest);
+        let query = deposit(&longest, &longest_network).unwrap();
+        assert_eq!(query.asset.as_ref(), longest);
+        // The network is still read case insensitively.
+        assert_eq!(query.network.as_ref(), longest_network.to_lowercase());
+
+        assert!(asset(&overlong).is_err());
+        assert!(whitelisted(&overlong).is_err());
+        assert!(deposit(&overlong, "ethereum").is_err());
+        let error = deposit("USDC", &overlong_network).unwrap_err();
+        assert!(!error.to_string().contains(&overlong_network), "{error}");
     }
 }

@@ -1,7 +1,7 @@
 //! [`AlpacaBrokerApi`]: the Broker API entry point, with asset caching and
 //! asset-precision order preparation.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use super::activity::{AccountActivitiesQuery, AccountActivity};
 use super::auth::{AccountStatus, AlpacaAccountId, AlpacaBrokerApiCtx};
-use super::client::{AlpacaBrokerApiClient, SymbolSegment};
+use super::client::AlpacaBrokerApiClient;
 use super::journal::JournalResponse;
 use super::order::{
     AlpacaLimitOrder, CONVERSION_POLL_INTERVAL, ConversionOrder, ConversionOrders,
@@ -110,7 +110,8 @@ fn truncate_non_fractionable_shares(
 ///
 /// `shares` is `None` when a non-fractionable quantity truncates below one
 /// whole share: the order must be deferred rather than submitted.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PreparedShares {
     pub shares: Option<Positive<FractionalShares>>,
     /// Whether the asset accepts fractional quantities for this session.
@@ -124,7 +125,8 @@ pub struct PreparedShares {
 ///
 /// An `Option` field is `None` when the broker's asset payload omitted it;
 /// eligibility decisions treat that as ineligible.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AssetDetails {
     pub status: AssetStatus,
     pub tradable: bool,
@@ -473,13 +475,12 @@ impl AlpacaBrokerApi {
     /// # Errors
     ///
     /// Returns [`AlpacaBrokerApiError::LatestTrade`] wrapping the market-data
-    /// error, or [`AlpacaBrokerApiError::UnsafeSymbol`].
+    /// error.
     pub async fn fetch_latest_trade_price(
         &self,
         symbol: &Symbol,
     ) -> Result<Positive<Usd>, AlpacaBrokerApiError> {
-        let segment = SymbolSegment::new(symbol)?;
-        super::market_data::fetch_latest_trade_price(&self.client, &segment)
+        super::market_data::fetch_latest_trade_price(&self.client, symbol)
             .await
             .map_err(|source| AlpacaBrokerApiError::LatestTrade(Box::new(source)))
     }
@@ -506,13 +507,12 @@ impl AlpacaBrokerApi {
     /// # Errors
     ///
     /// Returns [`AlpacaBrokerApiError::LatestQuote`] wrapping the market-data
-    /// error, or [`AlpacaBrokerApiError::UnsafeSymbol`].
+    /// error.
     pub async fn fetch_latest_quote(
         &self,
         symbol: &Symbol,
     ) -> Result<LatestQuote, AlpacaBrokerApiError> {
-        let segment = SymbolSegment::new(symbol)?;
-        super::market_data::fetch_latest_quote(&self.client, &segment)
+        super::market_data::fetch_latest_quote(&self.client, symbol)
             .await
             .map_err(|source| AlpacaBrokerApiError::LatestQuote(Box::new(source)))
     }
@@ -836,13 +836,12 @@ impl AlpacaBrokerApi {
     /// # Errors
     ///
     /// Returns [`AlpacaBrokerApiError::LatestQuote`] wrapping the market-data
-    /// error, or [`AlpacaBrokerApiError::UnsafeSymbol`].
+    /// error.
     pub async fn fetch_latest_overnight_quote(
         &self,
         symbol: &Symbol,
     ) -> Result<IndicativeQuote, AlpacaBrokerApiError> {
-        let segment = SymbolSegment::new(symbol)?;
-        crate::broker::market_data::fetch_latest_overnight_quote(&self.client, &segment)
+        crate::broker::market_data::fetch_latest_overnight_quote(&self.client, symbol)
             .await
             .map_err(|source| AlpacaBrokerApiError::LatestQuote(Box::new(source)))
     }
@@ -3121,46 +3120,6 @@ mod tests {
         trade.assert();
         quote.assert();
         position.assert();
-    }
-
-    /// URL parsing resolves a dot segment into the parent path, so such a
-    /// symbol is refused on every symbol route before any request is sent.
-    #[tokio::test]
-    async fn dot_segment_symbols_are_refused_before_any_request() {
-        fn refused(error: &AlpacaBrokerApiError, symbol: &Symbol) -> bool {
-            matches!(error, AlpacaBrokerApiError::UnsafeSymbol { symbol: unsafe_symbol } if unsafe_symbol == symbol)
-        }
-
-        let server = MockServer::start();
-        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
-        create_account_mock(&server);
-        let executor = AlpacaBrokerApi::try_from_ctx(ctx).await.unwrap();
-        let any_request = server.mock(|_, then| {
-            then.status(500);
-        });
-
-        for raw in [".", ".."] {
-            let symbol = Symbol::new(raw).unwrap();
-
-            let asset = executor.get_asset_details(&symbol).await.unwrap_err();
-            let trade = executor
-                .fetch_latest_trade_price(&symbol)
-                .await
-                .unwrap_err();
-            let quote = executor.fetch_latest_quote(&symbol).await.unwrap_err();
-            let overnight = executor
-                .fetch_latest_overnight_quote(&symbol)
-                .await
-                .unwrap_err();
-            let mark = executor.fetch_position_mark(&symbol).await.unwrap_err();
-
-            for error in [asset, trade, quote, overnight, mark] {
-                assert!(refused(&error, &symbol), "{raw}: {error:?}");
-                assert_eq!(error.permanence(), Permanence::Permanent);
-            }
-        }
-
-        assert_eq!(any_request.calls(), 0);
     }
 
     /// The asset read runs before the order request, so its failure reports

@@ -280,11 +280,9 @@ impl IssuerApi for AlpacaClient {
         ];
 
         self.with_retry(|| async {
-            let builder = self.post(&path).await?.json(&request);
-            let response = crate::request_id::send(builder).await?;
-            let status = response.status();
-            crate::request_id::record(status, response.headers());
+            let response = self.post(&path).await?.json(&request).send().await?;
 
+            let status = response.status();
             let retry_after = retry_after_from_response_headers(response.headers());
 
             match status {
@@ -330,11 +328,9 @@ impl IssuerApi for AlpacaClient {
         ];
 
         self.with_retry(|| async {
-            let builder = self.post(&path).await?.json(&request);
-            let response = crate::request_id::send(builder).await?;
-            let status = response.status();
-            crate::request_id::record(status, response.headers());
+            let response = self.post(&path).await?.json(&request).send().await?;
 
+            let status = response.status();
             let retry_after = retry_after_from_response_headers(response.headers());
 
             match status {
@@ -377,11 +373,9 @@ impl IssuerApi for AlpacaClient {
         ];
 
         self.with_retry(|| async {
-            let builder = self.get(&path).await?;
-            let response = crate::request_id::send(builder).await?;
-            let status = response.status();
-            crate::request_id::record(status, response.headers());
+            let response = self.get(&path).await?.send().await?;
 
+            let status = response.status();
             let retry_after = retry_after_from_response_headers(response.headers());
 
             match status {
@@ -2228,40 +2222,6 @@ mod tests {
             })
         ));
         mock.assert_calls(3);
-    }
-
-    #[tokio::test]
-    async fn every_retried_attempt_counts_as_alpaca_traffic() {
-        let server = MockServer::start();
-
-        let mock = server.mock(|when, then| {
-            when.method(POST)
-                .path("/v1/accounts/test-account/tokenization/callback/redeem");
-            then.status(500)
-                .header("X-Request-ID", "issuer-request-id")
-                .body("Internal Server Error");
-        });
-
-        let client =
-            make_client(&server, "test-account", "test-key", "test-secret").with_max_retries(1);
-
-        let (result, traffic) =
-            crate::request_id::collect(client.call_redeem_endpoint(create_redeem_request())).await;
-
-        assert!(matches!(
-            result,
-            Err(AlpacaError::Api {
-                status_code: 500,
-                ..
-            })
-        ));
-        assert_eq!(
-            traffic.request_ids,
-            ["issuer-request-id", "issuer-request-id"]
-        );
-        assert_eq!(traffic.requests_sent, 2);
-        assert_eq!(traffic.last_status, Some(500));
-        mock.assert_calls(2);
     }
 
     #[tokio::test]

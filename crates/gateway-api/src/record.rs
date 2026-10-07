@@ -6,7 +6,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::access::{Profile, Tier};
+use crate::access::Tier;
 use crate::failure::{ErrorCode, Outcome, RejectionReason};
 use crate::ops::Operation;
 
@@ -18,9 +18,11 @@ pub const AUDIT_TARGET: &str = "st0x_alpaca_gateway_audit";
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AuditPhase {
-    /// The gateway answered the caller.
+    /// Written by the work when the handler took its result, or by the
+    /// handler when it answered without the result.
     Answered,
-    /// A mutation that outlived its answer finished at Alpaca.
+    /// Written by the work when the handler had stopped waiting (its
+    /// deadline, shutdown, its caller gone); carries the real result.
     Settled,
 }
 
@@ -43,7 +45,6 @@ pub struct AuditEvent {
     pub phase: AuditPhase,
     pub at: DateTime<Utc>,
     pub deployment: String,
-    pub profile: Profile,
     pub environment: String,
     pub account_id: String,
     /// Verified, stable subject id of the caller.
@@ -64,20 +65,21 @@ pub struct AuditEvent {
     /// Money moving fields: symbol, side, quantity, amount, asset, network,
     /// destination, counterparty, recipient.
     pub summary: BTreeMap<String, String>,
+    /// The failure's own Alpaca HTTP status, or the last Alpaca status a
+    /// success received.
     pub alpaca_status: Option<u16>,
-    /// `X-Request-ID` of every Alpaca response this request received, in
-    /// order. Join key with Alpaca support.
+    /// `X-Request-ID` of the Alpaca responses this request received, in
+    /// order: the first 100, each cut at 128 characters. Join key with
+    /// Alpaca support.
     #[serde(default)]
     pub alpaca_request_ids: Vec<String>,
-    /// Order, transfer, journal or tokenization request id from Alpaca.
+    /// The Alpaca object the record is about: the order, transfer, journal,
+    /// tokenization request or whitelist entries a mutation created or
+    /// touched.
     pub alpaca_object_id: Option<String>,
     pub outcome: Option<Outcome>,
     pub code: Option<ErrorCode>,
     pub rejection: Option<RejectionReason>,
     pub latency_ms: u64,
-    /// The caller went away before the answer, so none was delivered. The
-    /// record carries the Alpaca traffic sent until then.
-    #[serde(default)]
-    pub abandoned: bool,
     pub gateway_version: String,
 }

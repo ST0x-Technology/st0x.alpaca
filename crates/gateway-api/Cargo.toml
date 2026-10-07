@@ -31,7 +31,7 @@ uuid = { version = "1", features = ["serde", "v4"] }
 
 [dev-dependencies]
 httpmock = "0.8"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util", "time"] }
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "test-util", "time"] }
 
 [lints]
 workspace = true

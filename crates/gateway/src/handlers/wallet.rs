@@ -3,7 +3,7 @@
 //! Every destination a mutation here can move value to is pinned by the
 //! deployment's config and checked before anything is sent to Alpaca.
 
-use alloy_primitives::Address;
+use alloy_primitives::{Address, TxHash};
 use axum::extract::State;
 use axum::response::Response;
 use axum::routing::{MethodRouter, get, post};
@@ -13,16 +13,15 @@ use st0x_alpaca::wallet::{
     WhitelistEntry,
 };
 use st0x_alpaca_gateway_api::dto::wallet::{
-    AddressPath, DepositAddressQuery, DepositAddressResponse, DepositResponse,
-    JournalCreateRequest, JournalCreateResponse, Transfer, TransferIdPath, TransferLookupResponse,
-    TransferResponse, TransfersResponse, TravelRulePatchRequest, TxHashPath,
-    WhitelistCreateRequest, WhitelistEntryResponse, WhitelistRemoveRequest, WhitelistResponse,
-    WithdrawRequest,
+    DepositAddressQuery, DepositAddressResponse, DepositResponse, JournalCreateRequest,
+    JournalCreateResponse, TransferResponse, TransfersResponse, TravelRulePatchRequest,
+    WhitelistCreateRequest, WhitelistRemoveRequest, WhitelistResponse, WithdrawRequest,
 };
 use st0x_alpaca_gateway_api::{ErrorCode, Operation, Tier};
+use tokio::time::Instant;
+use uuid::Uuid;
 
 use crate::answer::{Failure, Sent, broker, wallet};
-use crate::budget::Charge;
 use crate::config::{JournalConfig, WalletConfig};
 use crate::extract::{Body, Params, Query};
 use crate::state::{AppState, Call, Done, Intent};
@@ -33,7 +32,6 @@ pub(super) fn route(operation: Operation) -> Option<MethodRouter<AppState>> {
         Operation::WalletTransfer => get(transfer),
         Operation::WalletTransfers => get(transfers),
         Operation::WalletFindDeposit => get(find_deposit),
-        Operation::WalletFindTransfer => get(find_transfer),
         Operation::WalletDepositAddress => get(deposit_address),
         Operation::WalletWhitelist => get(whitelist),
         Operation::WalletWhitelistCreate => post(whitelist_create),
@@ -46,12 +44,20 @@ pub(super) fn route(operation: Operation) -> Option<MethodRouter<AppState>> {
 
 /// Refuses a withdrawal destination outside the caller's lane: the bot may
 /// only withdraw to the pinned destinations, and a human never to one of
-/// them, so a human withdrawal can never pass for a bot one.
+/// them, so a human withdrawal can never pass for a bot one. A deployment
+/// that pins none has the bot's withdrawals switched off, and says so
+/// instead of refusing the bot's address.
 fn check_withdrawal_destination(
     tier: Tier,
     config: &WalletConfig,
     address: &Address,
 ) -> Result<(), Failure> {
+    if tier == Tier::Bot && config.bot_withdrawal_destinations.is_empty() {
+        return Err(Failure::new(
+            ErrorCode::CapabilityDisabled,
+            "no bot withdrawal destination is configured on this deployment",
+        ));
+    }
     let pinned = config.bot_withdrawal_destinations.contains(address);
     match (tier, pinned) {
         (Tier::Bot, false) => Err(Failure::destination_not_allowed(format!(
@@ -105,14 +111,23 @@ fn check_query_value(field: &str, value: &str) -> Result<(), Failure> {
 }
 
 /// Alpaca ids of the entries a whitelist mutation touched, for the audit.
-fn entry_ids(entries: &[WhitelistEntry]) -> Option<String> {
-    (!entries.is_empty()).then(|| {
-        entries
-            .iter()
-            .map(|entry| entry.id.as_str())
-            .collect::<Vec<_>>()
-            .join(",")
-    })
+fn entry_ids(entries: &[WhitelistEntry]) -> Vec<String> {
+    entries.iter().map(|entry| entry.id.clone()).collect()
+}
+
+/// Runs a wallet read a write depends on, cut off at `deadline`, so a read
+/// that stalls ends the work with nothing written.
+async fn read_before<T>(
+    deadline: Instant,
+    read: impl Future<Output = Result<T, AlpacaWalletError>>,
+) -> Result<T, Failure> {
+    match tokio::time::timeout_at(deadline, read).await {
+        Ok(read) => read.map_err(|error| wallet(&error, Sent::Read)),
+        Err(_) => Err(Failure::new(
+            ErrorCode::UpstreamTransient,
+            "the deadline passed before the write; it was not sent",
+        )),
+    }
 }
 
 /// The write a whitelist mutation sends to each entry.
@@ -136,83 +151,28 @@ impl EntryWrite<'_> {
     }
 }
 
-/// Takes the human budget for all `writes` of a whitelist loop before the
-/// first one is sent, so a loop the budget cannot finish is refused with
-/// nothing written. Bots are never charged.
-///
-/// A loop longer than one minute of budget beside its own read can never
-/// be admitted, so its refusal is not retryable and names the limit.
-fn reserve_writes(
-    state: &AppState,
-    tier: Tier,
-    operation: Operation,
-    writes: usize,
-) -> Result<Option<Charge>, Failure> {
-    if !tier.is_human() {
-        return Ok(None);
-    }
-    let cost = u32::try_from(writes).unwrap_or(u32::MAX);
-    state.budget.take(cost).map(Some).map_err(|wait| {
-        let limit = state.config.human_budget_per_minute;
-        if cost.saturating_add(operation.human_budget_cost()) > limit {
-            Failure {
-                retryable: false,
-                ..Failure::new(
-                    ErrorCode::Backpressure,
-                    format!(
-                        "{operation} needs {writes} whitelist writes, more than the human budget \
-                         of {limit} requests per minute can cover; nothing was written"
-                    ),
-                )
-            }
-        } else {
-            Failure {
-                retry_after: Some(wait),
-                ..Failure::new(
-                    ErrorCode::Backpressure,
-                    format!(
-                        "the human request budget left this minute cannot cover {writes} \
-                         whitelist writes; nothing was written"
-                    ),
-                )
-            }
-        }
-    })
-}
-
-/// Sends `write` to each of `entries` once the budget for all of them is
-/// reserved. Until the first write went through nothing has changed, so its
-/// own failure maps as one mutation. Any later failure is `outcome_unknown`
-/// naming the entries already changed. Writes never sent give their budget
-/// units back.
+/// Sends `write` to each of `entries`. The send gate holds back every write
+/// once the caller was answered without the result, as a write that never
+/// left. Until the first write went through nothing has changed, so its own
+/// failure maps as one mutation. Any later stop is `outcome_unknown` naming
+/// the entries already changed.
 async fn write_entries(
-    state: &AppState,
-    tier: Tier,
-    operation: Operation,
+    wallet_client: &AlpacaWalletService,
     entries: &[WhitelistEntry],
     write: &EntryWrite<'_>,
 ) -> Result<(), Failure> {
-    let charge = reserve_writes(state, tier, operation, entries.len())?;
     for (done, entry) in entries.iter().enumerate() {
-        let Err(error) = write.send(&state.wallet, entry).await else {
+        let Err(error) = write.send(wallet_client, entry).await else {
             continue;
         };
-        if let Some(charge) = charge {
-            state
-                .budget
-                .settle(charge, u32::try_from(done + 1).unwrap_or(u32::MAX));
-        }
         let failure = wallet(&error, Sent::Mutation);
         if done == 0 {
             return Err(failure);
         }
 
-        let written: Vec<String> = entries[..done]
-            .iter()
-            .map(|written| written.id.clone())
-            .collect();
+        let written = entry_ids(&entries[..done]);
         let message = format!(
-            "whitelist entries {} were already changed when entry {} failed: {}",
+            "whitelist entries {} were already changed when the loop stopped at entry {}: {}",
             written.join(","),
             entry.id,
             failure.message
@@ -239,24 +199,25 @@ async fn withdraw(
         .note("asset", &request.asset)
         .note("destination", &request.address);
     let tier = call.principal.tier;
-    let work = state.clone();
 
     state
-        .mutate(call, intent, async move {
-            check_withdrawal_destination(tier, &work.config.wallet, &request.address)?;
+        .run(call, intent, move |state, deadline| async move {
+            check_withdrawal_destination(tier, &state.config.wallet, &request.address)?;
+            read_before(
+                deadline,
+                state
+                    .wallet
+                    .check_withdrawal_whitelist(&request.asset, &request.address),
+            )
+            .await?;
 
-            work.wallet
-                .check_withdrawal_whitelist(&request.asset, &request.address)
-                .await
-                .map_err(|error| wallet(&error, Sent::Read))?;
-
-            let transfer = work
+            let transfer = state
                 .wallet
                 .submit_withdrawal(request.amount, &request.asset, &request.address)
                 .await
                 .map_err(|error| wallet(&error, Sent::Mutation))?;
             let id = transfer.id;
-            Ok(Done::new(Transfer::from(transfer), &id))
+            Ok(Done::new(transfer, &id))
         })
         .await
 }
@@ -264,14 +225,14 @@ async fn withdraw(
 async fn transfer(
     State(state): State<AppState>,
     call: Call,
-    Params(path): Params<TransferIdPath>,
+    Params(transfer_id): Params<Uuid>,
 ) -> Response {
-    let intent = Intent::default().key(&path.transfer_id);
+    let intent = Intent::default().key(&transfer_id);
     state
-        .read(call, intent, async {
+        .read(call, intent, |state| async move {
             let transfer = state
                 .wallet
-                .get_transfer(&path.transfer_id.into())
+                .get_transfer(&transfer_id.into())
                 .await
                 .map_err(|error| wallet(&error, Sent::Read))?;
             let reported_fees = match transfer.reported_fees() {
@@ -288,7 +249,7 @@ async fn transfer(
                 }
             };
             Ok(TransferResponse {
-                transfer: transfer.transfer.into(),
+                transfer: transfer.transfer,
                 reported_fees,
             })
         })
@@ -300,57 +261,33 @@ async fn transfer(
 /// must never conclude from a list that silently lost rows.
 async fn transfers(State(state): State<AppState>, call: Call) -> Response {
     state
-        .read(call, Intent::default(), async {
+        .read(call, Intent::default(), |state| async move {
             state
                 .wallet
                 .list_all_transfers()
                 .await
-                .map(|transfers| TransfersResponse {
-                    transfers: transfers.into_iter().map(Transfer::from).collect(),
-                })
+                .map(|transfers| TransfersResponse { transfers })
                 .map_err(|error| wallet(&error, Sent::Read))
         })
         .await
 }
 
-/// Looks a transfer up by its tx hash with the library's own scan, so a row
-/// that does not parse fails only the lookup of its own hash, exactly as the
-/// direct `find_transfer_by_tx_hash` does.
-async fn find_transfer(
-    State(state): State<AppState>,
-    call: Call,
-    Params(path): Params<TxHashPath>,
-) -> Response {
-    let intent = Intent::default().key(&path.tx_hash);
-    state
-        .read(call, intent, async {
-            state
-                .wallet
-                .find_transfer_by_tx_hash(&path.tx_hash)
-                .await
-                .map(|transfer| TransferLookupResponse {
-                    transfer: transfer.map(Transfer::from),
-                })
-                .map_err(|error| wallet(&error, Sent::Read))
-        })
-        .await
-}
-
+/// Looks an incoming transfer up by its tx hash with the library's own scan,
+/// so a row that does not parse fails only the lookup of its own hash,
+/// exactly as the direct `find_deposit_by_tx_hash` does.
 async fn find_deposit(
     State(state): State<AppState>,
     call: Call,
-    Params(path): Params<TxHashPath>,
+    Params(tx_hash): Params<TxHash>,
 ) -> Response {
-    let intent = Intent::default().key(&path.tx_hash);
+    let intent = Intent::default().key(&tx_hash);
     state
-        .read(call, intent, async {
+        .read(call, intent, |state| async move {
             state
                 .wallet
-                .find_deposit_by_tx_hash(&path.tx_hash)
+                .find_deposit_by_tx_hash(&tx_hash)
                 .await
-                .map(|deposit| DepositResponse {
-                    deposit: deposit.map(Transfer::from),
-                })
+                .map(|deposit| DepositResponse { deposit })
                 .map_err(|error| wallet(&error, Sent::Read))
         })
         .await
@@ -365,7 +302,7 @@ async fn deposit_address(
         .key(&query.asset)
         .note("network", &query.network);
     state
-        .read(call, intent, async {
+        .read(call, intent, |state| async move {
             check_query_value("asset", query.asset.as_ref())?;
             check_query_value("network", query.network.as_ref())?;
             state
@@ -380,14 +317,12 @@ async fn deposit_address(
 
 async fn whitelist(State(state): State<AppState>, call: Call) -> Response {
     state
-        .read(call, Intent::default(), async {
+        .read(call, Intent::default(), |state| async move {
             state
                 .wallet
                 .get_whitelisted_addresses()
                 .await
-                .map(|entries| WhitelistResponse {
-                    entries: entries.into_iter().map(Into::into).collect(),
-                })
+                .map(|entries| WhitelistResponse { entries })
                 .map_err(|error| wallet(&error, Sent::Read))
         })
         .await
@@ -403,12 +338,11 @@ async fn whitelist_create(
         .reason(request.reason.as_deref())
         .note("destination", &request.address)
         .note("asset", &request.asset);
-    let work = state.clone();
 
     state
-        .mutate(call, intent, async move {
-            let travel_rule = travel_rule(&work.config.wallet)?;
-            let entry = work
+        .run(call, intent, move |state, _| async move {
+            let travel_rule = travel_rule(&state.config.wallet)?;
+            let entry = state
                 .wallet
                 .create_whitelist_entry(
                     &request.address,
@@ -419,7 +353,7 @@ async fn whitelist_create(
                 .await
                 .map_err(|error| wallet(&error, Sent::Mutation))?;
             let id = entry.id.clone();
-            Ok(Done::new(WhitelistEntryResponse::from(entry), &id))
+            Ok(Done::new(entry, &id))
         })
         .await
 }
@@ -427,40 +361,31 @@ async fn whitelist_create(
 async fn whitelist_remove(
     State(state): State<AppState>,
     call: Call,
-    Params(path): Params<AddressPath>,
+    Params(address): Params<Address>,
     Body(request): Body<WhitelistRemoveRequest>,
 ) -> Response {
     let intent = Intent::of(&request)
-        .key(&path.address)
+        .key(&address)
         .reason(request.reason.as_deref())
-        .note("destination", &path.address);
-    let tier = call.principal.tier;
-    let operation = call.operation;
-    let work = state.clone();
+        .note("destination", &address);
 
     state
-        .mutate(call, intent, async move {
-            let entries: Vec<WhitelistEntry> = work
-                .wallet
-                .get_whitelisted_addresses()
-                .await
-                .map_err(|error| wallet(&error, Sent::Read))?
-                .into_iter()
-                .filter(|entry| entry.address == path.address)
-                .collect();
+        .run(call, intent, move |state, deadline| async move {
+            let entries: Vec<WhitelistEntry> =
+                read_before(deadline, state.wallet.get_whitelisted_addresses())
+                    .await?
+                    .into_iter()
+                    .filter(|entry| entry.address == address)
+                    .collect();
             if entries.is_empty() {
-                let error = AlpacaWalletError::NoWhitelistEntries {
-                    address: path.address,
-                };
+                let error = AlpacaWalletError::NoWhitelistEntries { address };
                 return Err(wallet(&error, Sent::Read));
             }
 
-            write_entries(&work, tier, operation, &entries, &EntryWrite::Delete).await?;
+            write_entries(&state.wallet, &entries, &EntryWrite::Delete).await?;
             Ok(Done {
-                alpaca_object_id: entry_ids(&entries),
-                body: WhitelistResponse {
-                    entries: entries.into_iter().map(Into::into).collect(),
-                },
+                alpaca_object_ids: entry_ids(&entries),
+                body: WhitelistResponse { entries },
             })
         })
         .await
@@ -474,32 +399,21 @@ async fn whitelist_patch_travel_rule(
     let intent = Intent::of(&request)
         .key(&request.operation_id)
         .reason(request.reason.as_deref());
-    let tier = call.principal.tier;
-    let operation = call.operation;
-    let work = state.clone();
 
     state
-        .mutate(call, intent, async move {
-            let travel_rule = travel_rule(&work.config.wallet)?;
-            let entries = work
-                .wallet
-                .get_whitelisted_addresses()
-                .await
-                .map_err(|error| wallet(&error, Sent::Read))?;
+        .run(call, intent, move |state, deadline| async move {
+            let travel_rule = travel_rule(&state.config.wallet)?;
+            let entries = read_before(deadline, state.wallet.get_whitelisted_addresses()).await?;
 
             write_entries(
-                &work,
-                tier,
-                operation,
+                &state.wallet,
                 &entries,
                 &EntryWrite::PatchTravelRule(&travel_rule),
             )
             .await?;
             Ok(Done {
-                alpaca_object_id: entry_ids(&entries),
-                body: WhitelistResponse {
-                    entries: entries.into_iter().map(Into::into).collect(),
-                },
+                alpaca_object_ids: entry_ids(&entries),
+                body: WhitelistResponse { entries },
             })
         })
         .await
@@ -516,12 +430,11 @@ async fn journal_create(
         .note("counterparty", &request.counterparty)
         .note("symbol", &request.symbol)
         .note("quantity", &request.qty);
-    let work = state.clone();
 
     state
-        .mutate(call, intent, async move {
-            let destination = counterparty_account(&work.config.journal, &request.counterparty)?;
-            let journal = work
+        .run(call, intent, move |state, _| async move {
+            let destination = counterparty_account(&state.config.journal, &request.counterparty)?;
+            let journal = state
                 .broker
                 .create_journal(destination, &request.symbol, request.qty)
                 .await
@@ -548,6 +461,16 @@ mod tests {
         let failure = travel_rule(&WalletConfig::default()).unwrap_err();
 
         assert_eq!(failure.code, ErrorCode::CapabilityDisabled);
+    }
+
+    #[test]
+    fn bot_withdrawals_are_switched_off_without_pinned_destinations_but_human_ones_are_not() {
+        let config = WalletConfig::default();
+        let address = Address::repeat_byte(0x33);
+
+        let failure = check_withdrawal_destination(Tier::Bot, &config, &address).unwrap_err();
+        assert_eq!(failure.code, ErrorCode::CapabilityDisabled);
+        check_withdrawal_destination(Tier::Write, &config, &address).unwrap();
     }
 
     #[test]

@@ -28,10 +28,9 @@ pub struct Failure {
     pub retry_after: Option<Duration>,
     pub reason: Option<RejectionReason>,
     pub alpaca_status: Option<u16>,
-    /// The network Alpaca reported, set with `wrong_network`.
-    pub network: Option<String>,
-    /// The Alpaca objects the answer names: those a failed mutation already
-    /// changed, or the tokenization request a network refusal is about.
+    /// The Alpaca objects the audit record names: those a failed mutation
+    /// already changed, or the tokenization request a network refusal is
+    /// about. Not part of the error body.
     pub alpaca_object_ids: Vec<String>,
     pub message: String,
     pub request_id: Uuid,
@@ -54,7 +53,6 @@ impl Failure {
             retry_after: None,
             reason: None,
             alpaca_status: None,
-            network: None,
             alpaca_object_ids: Vec::new(),
             message: message.into(),
             request_id: Uuid::new_v4(),
@@ -84,10 +82,14 @@ impl Failure {
         }
     }
 
-    /// Sets `outcome` for a mutation: anything that is not `outcome_unknown`
-    /// left Alpaca untouched.
+    /// Sets `outcome` when `operation` mutates: anything that is not
+    /// `outcome_unknown` left Alpaca untouched. A read's failure is kept
+    /// as it is.
     #[must_use]
     pub fn for_mutation(mut self, operation: Operation) -> Self {
+        if !operation.mutates() {
+            return self;
+        }
         if self.code == ErrorCode::OutcomeUnknown {
             self.outcome = Some(Outcome::Unknown);
             self.retryable = false;
@@ -96,19 +98,6 @@ impl Failure {
             self.outcome = Some(Outcome::NotApplied);
         }
         self
-    }
-
-    /// The answer for a mutation still running when its deadline passed.
-    #[must_use]
-    pub fn deadline_passed(operation: Operation) -> Self {
-        Self::new(
-            ErrorCode::OutcomeUnknown,
-            format!(
-                "{operation} did not finish within {}s; it may still complete at Alpaca",
-                operation.deadline().as_secs()
-            ),
-        )
-        .for_mutation(operation)
     }
 
     #[must_use]
@@ -121,8 +110,6 @@ impl Failure {
             retry_after_secs: self.retry_after.map(whole_seconds),
             reason: self.reason,
             alpaca_status: self.alpaca_status,
-            network: self.network.clone(),
-            alpaca_object_ids: self.alpaca_object_ids.clone(),
             request_id: self.request_id,
             message: self.message.clone(),
         }
@@ -174,6 +161,25 @@ fn untyped(sent: Sent, permanence: Permanence, message: String) -> Failure {
             ..Failure::new(ErrorCode::UpstreamTransient, message)
         },
         Sent::Mutation => Failure::new(ErrorCode::OutcomeUnknown, message),
+    }
+}
+
+/// Whether a request failed before it could leave: it never built, or no
+/// connection was made. The rule an order POST is called unwritten by, so
+/// the outcome an answer reports agrees with it.
+fn never_left(source: &reqwest::Error) -> bool {
+    source.is_builder() || source.is_connect()
+}
+
+/// The answer for a request that never left (see [`never_left`]), so
+/// nothing was applied: without a connection the gateway is `unavailable`;
+/// a request that never built fails the same way again, so it answers as a
+/// permanent read failure.
+fn unsent(source: &reqwest::Error, message: String) -> Failure {
+    if source.is_builder() {
+        untyped(Sent::Read, Permanence::Permanent, message)
+    } else {
+        Failure::new(ErrorCode::Unavailable, message)
     }
 }
 
@@ -251,7 +257,6 @@ pub fn broker(error: &AlpacaBrokerApiError, sent: Sent) -> Failure {
         | E::UsdcPrecisionExceeded { .. }
         | E::NotPositive(_)
         | E::NotPositiveLimitPrice(_)
-        | E::UnsafeSymbol { .. }
         | E::InvalidOrderId(_) => Failure::invalid(message),
         E::AccountActivitiesPageLimitExceeded { pages } => Failure::invalid(format!(
             "more than {pages} pages of account activities match; narrow the after and until \
@@ -261,9 +266,9 @@ pub fn broker(error: &AlpacaBrokerApiError, sent: Sent) -> Failure {
         E::KmsJwt(_) | E::InvalidEndpoint(_) | E::InvalidHeader(_) => {
             Failure::new(ErrorCode::Unavailable, message)
         }
-        E::HttpClient(source) if source.is_connect() => {
-            Failure::new(ErrorCode::Unavailable, message)
-        }
+        // The send gate held it back: it never left.
+        E::NotSent(_) => Failure::new(ErrorCode::UpstreamTransient, message),
+        E::HttpClient(source) if never_left(source) => unsent(source, message),
         E::ApiError { status, .. } => api_failure(*status, sent, error.permanence(), message),
         _ => untyped(sent, error.permanence(), message),
     }
@@ -289,8 +294,10 @@ fn market_data(
     }
 
     match error {
+        // The request never left: no credential, no connection.
         E::Auth(_) => Failure::new(ErrorCode::Unavailable, message),
-        E::Http(source) if source.is_connect() => Failure::new(ErrorCode::Unavailable, message),
+        E::NotSent(_) => Failure::new(ErrorCode::UpstreamTransient, message),
+        E::Http(source) if never_left(source) => unsent(source, message),
         _ => match status {
             Some(status) => api_failure(status, sent, permanence, message),
             None => untyped(sent, permanence, message),
@@ -312,8 +319,15 @@ pub fn placement(failure: &PlacementError) -> Failure {
         AlpacaBrokerApiError::ApiError { status, .. } => Some(status.as_u16()),
         _ => None,
     };
+    // The order may exist, so it stays `outcome_unknown`, but a resend
+    // under the same key still waits out the hold Alpaca or the credential
+    // mint asked for, as every other mapper keeps it.
     Failure {
         alpaca_status,
+        retry_after: failure
+            .error
+            .backpressure()
+            .and_then(|pressure| pressure.retry_after),
         ..Failure::new(ErrorCode::OutcomeUnknown, failure.error.to_string())
     }
 }
@@ -336,15 +350,17 @@ pub fn wallet(error: &AlpacaWalletError, sent: Sent) -> Failure {
         E::AddressNotWhitelisted { .. } | E::NoWhitelistEntries { .. } => {
             Failure::rejected(RejectionReason::AddressNotWhitelisted, message)
         }
-        // The request never left: no credential, no endpoint, no connection.
+        // The request never left: no credential, no endpoint, no connection,
+        // or the send gate held it back.
+        E::Reqwest(source) if never_left(source) => unsent(source, message),
+        E::NotSent(_) => Failure::new(ErrorCode::UpstreamTransient, message),
         E::Auth(_) | E::InvalidBaseUrl(_) => Failure::new(ErrorCode::Unavailable, message),
-        E::Reqwest(source) if source.is_connect() => Failure::new(ErrorCode::Unavailable, message),
         E::TransferNotFound { .. } => Failure {
             alpaca_status: Some(404),
             ..Failure::rejected(RejectionReason::RequestNotFound, message)
         },
-        E::ApiError { status, .. } => api_failure(*status, sent, Permanence::Transient, message),
-        _ => untyped(sent, Permanence::Transient, message),
+        E::ApiError { status, .. } => api_failure(*status, sent, error.permanence(), message),
+        _ => untyped(sent, error.permanence(), message),
     }
 }
 
@@ -379,46 +395,37 @@ pub fn tokenization(error: &AlpacaTokenizationError, sent: Sent) -> Failure {
         E::Auth(_) | E::InvalidBaseUrl(_) | E::PrivateKeyJwtUnsupported => {
             Failure::new(ErrorCode::Unavailable, message)
         }
-        E::Reqwest(source) if source.is_connect() => Failure::new(ErrorCode::Unavailable, message),
+        E::NotSent(_) => Failure::new(ErrorCode::UpstreamTransient, message),
+        E::Reqwest(source) if never_left(source) => unsent(source, message),
         // Raised after scanning a list Alpaca answered with 200, so no
-        // Alpaca status goes with it.
+        // Alpaca status goes with the answer.
         E::RequestNotFound { .. } => Failure::rejected(RejectionReason::RequestNotFound, message),
         // Asking again returns the same answer.
-        E::WrongNetwork { id, actual, .. } => network_refusal(
-            sent,
-            RejectionReason::WrongNetwork,
-            Some(actual.to_string()),
-            id.to_string(),
-            message,
-        ),
+        E::WrongNetwork { id, .. } => {
+            network_refusal(sent, RejectionReason::WrongNetwork, id.to_string(), message)
+        }
         E::NetworkMissing { id } => network_refusal(
             sent,
             RejectionReason::NetworkMissing,
-            None,
             id.to_string(),
             message,
         ),
-        E::DuplicateMintIssuerRequestId { .. } => untyped(sent, Permanence::Permanent, message),
-        E::ApiError { status, .. } => api_failure(*status, sent, Permanence::Transient, message),
-        _ => untyped(sent, Permanence::Transient, message),
+        E::ApiError { status, .. } => api_failure(*status, sent, error.permanence(), message),
+        _ => untyped(sent, error.permanence(), message),
     }
 }
 
 /// A request Alpaca reported off the bound network, named by its id. A read
-/// is a definite rejection carrying the network Alpaca reported; on a mint
-/// the request was already written, so it stays `outcome_unknown`.
+/// is a definite rejection; on a mint the request was already written, so
+/// it stays `outcome_unknown`.
 fn network_refusal(
     sent: Sent,
     reason: RejectionReason,
-    network: Option<String>,
     request_id: String,
     message: String,
 ) -> Failure {
     let failure = match sent {
-        Sent::Read => Failure {
-            network,
-            ..Failure::rejected(reason, message)
-        },
+        Sent::Read => Failure::rejected(reason, message),
         Sent::Mutation => untyped(sent, Permanence::Permanent, message),
     };
     Failure {
@@ -441,16 +448,15 @@ mod tests {
         }
     }
 
-    /// A reqwest error from a port nothing listens on.
+    /// A reqwest error from a port nothing listens on: port 1 is reserved and
+    /// never bound, so a parallel test cannot take it the way it can reuse an
+    /// ephemeral port a dropped listener gave back.
     async fn connect_error() -> reqwest::Error {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        drop(listener);
         let error = reqwest::Client::builder()
             .no_proxy()
             .build()
             .unwrap()
-            .post(format!("http://{address}"))
+            .post("http://127.0.0.1:1")
             .send()
             .await
             .unwrap_err();
@@ -506,6 +512,140 @@ mod tests {
             assert_eq!(failure.code, ErrorCode::Unavailable, "{failure:?}");
             assert_eq!(failure.outcome, Some(Outcome::NotApplied), "{failure:?}");
         }
+    }
+
+    #[test]
+    fn a_mutation_whose_request_never_built_was_not_applied() {
+        let unbuilt = || reqwest::Client::new().get("not a url").build().unwrap_err();
+        let failures = [
+            broker(&AlpacaBrokerApiError::HttpClient(unbuilt()), Sent::Mutation)
+                .for_mutation(Operation::OrdersCancel),
+            wallet(&AlpacaWalletError::Reqwest(unbuilt()), Sent::Mutation)
+                .for_mutation(Operation::WalletWithdraw),
+            tokenization(&AlpacaTokenizationError::Reqwest(unbuilt()), Sent::Mutation)
+                .for_mutation(Operation::TokenizationMint),
+        ];
+
+        for failure in failures {
+            assert_eq!(failure.outcome, Some(Outcome::NotApplied), "{failure:?}");
+            // Building it again fails the same way.
+            assert!(!failure.retryable, "{failure:?}");
+        }
+    }
+
+    /// A request or a credential mint the send gate held back never left.
+    #[test]
+    fn a_mutation_whose_request_the_send_gate_held_back_was_not_applied() {
+        use st0x_alpaca::request_id::GateClosed;
+
+        let mint = || KmsJwtError::NotSent(GateClosed);
+        let failures = [
+            broker(&AlpacaBrokerApiError::NotSent(GateClosed), Sent::Mutation)
+                .for_mutation(Operation::OrdersCancel),
+            broker(&AlpacaBrokerApiError::KmsJwt(mint()), Sent::Mutation)
+                .for_mutation(Operation::OrdersCancel),
+            wallet(&AlpacaWalletError::NotSent(GateClosed), Sent::Mutation)
+                .for_mutation(Operation::WalletWithdraw),
+            wallet(&AlpacaWalletError::Auth(mint()), Sent::Mutation)
+                .for_mutation(Operation::WalletWithdraw),
+            tokenization(
+                &AlpacaTokenizationError::NotSent(GateClosed),
+                Sent::Mutation,
+            )
+            .for_mutation(Operation::TokenizationMint),
+            tokenization(&AlpacaTokenizationError::Auth(mint()), Sent::Mutation)
+                .for_mutation(Operation::TokenizationMint),
+        ];
+
+        for failure in failures {
+            assert_eq!(failure.outcome, Some(Outcome::NotApplied), "{failure:?}");
+            assert_eq!(failure.alpaca_status, None, "{failure:?}");
+            // Nothing reached Alpaca, so sending it again is safe.
+            assert!(failure.retryable, "{failure:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_market_data_read_that_never_left_answers_as_a_broker_read_does() {
+        use AlpacaMarketDataError as Market;
+
+        let unbuilt = || reqwest::Client::new().get("not a url").build().unwrap_err();
+        for failure in [
+            broker(&AlpacaBrokerApiError::HttpClient(unbuilt()), Sent::Read),
+            broker(
+                &AlpacaBrokerApiError::LatestTrade(Box::new(Market::Http(unbuilt()))),
+                Sent::Read,
+            ),
+            broker(
+                &AlpacaBrokerApiError::LatestQuote(Box::new(Market::Http(unbuilt()))),
+                Sent::Read,
+            ),
+        ] {
+            // Building it again fails the same way.
+            assert_eq!(failure.code, ErrorCode::UpstreamTransient, "{failure:?}");
+            assert!(!failure.retryable, "{failure:?}");
+        }
+
+        for failure in [
+            broker(
+                &AlpacaBrokerApiError::HttpClient(connect_error().await),
+                Sent::Read,
+            ),
+            broker(
+                &AlpacaBrokerApiError::LatestQuote(Box::new(Market::Http(connect_error().await))),
+                Sent::Read,
+            ),
+        ] {
+            assert_eq!(failure.code, ErrorCode::Unavailable, "{failure:?}");
+            assert_eq!(failure.alpaca_status, None, "{failure:?}");
+        }
+    }
+
+    #[test]
+    fn an_alpaca_answer_that_does_not_decode_is_not_retryable() {
+        let undecodable = || serde_json::from_str::<u8>("\"not a number\"").unwrap_err();
+        let failures = [
+            wallet(&AlpacaWalletError::ParseError(undecodable()), Sent::Read),
+            tokenization(
+                &AlpacaTokenizationError::JsonParse(undecodable()),
+                Sent::Read,
+            ),
+        ];
+
+        for failure in failures {
+            assert_eq!(failure.code, ErrorCode::UpstreamTransient, "{failure:?}");
+            assert!(!failure.body().retryable, "{failure:?}");
+        }
+
+        // An Alpaca outage still clears on its own.
+        let outage = wallet(
+            &AlpacaWalletError::ApiError {
+                status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                message: "unavailable".to_string(),
+                retry_after: None,
+            },
+            Sent::Read,
+        );
+        assert!(outage.body().retryable, "{outage:?}");
+    }
+
+    #[test]
+    fn a_placement_throttled_after_it_may_have_been_written_keeps_the_hold() {
+        let failure = placement(&PlacementError {
+            written: true,
+            error: AlpacaBrokerApiError::ApiError {
+                status: reqwest::StatusCode::TOO_MANY_REQUESTS,
+                alpaca_code: None,
+                message: "rate limit exceeded".to_string(),
+                retry_after: Some(Duration::from_secs(30)),
+            },
+        })
+        .for_mutation(Operation::OrdersPlaceMarket);
+
+        let body = failure.body();
+        assert_eq!(body.code, ErrorCode::OutcomeUnknown);
+        assert_eq!(body.alpaca_status, Some(429));
+        assert_eq!(body.retry_after_secs, Some(30));
     }
 
     #[test]

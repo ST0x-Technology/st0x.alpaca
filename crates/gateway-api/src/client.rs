@@ -2,67 +2,32 @@
 //!
 //! One client talks to one deployment on one tier. Bots use [`Tier::Bot`]
 //! with [`MetadataIdToken`]; operator tools use a human tier with the ID
-//! token their OAuth flow produced ([`StaticToken`]). Every operation has
-//! one method, with its request and response types fixed by the method. The
-//! client never retries a request: retry decisions belong to the caller,
-//! guided by [`ErrorBody::retryable`] and
-//! [`ErrorBody::retryable_with_same_key`].
-//!
-//! Calling an operation the deployment does not serve on the client's tier
-//! answers [`ClientError::Gateway`] with `unknown_operation`.
+//! token their OAuth flow produced ([`StaticToken`]). The client never
+//! retries a request: retry decisions belong to the caller, guided by
+//! [`ErrorBody::retryable`] and [`ErrorBody::retryable_with_same_key`].
 //!
 //! Every call, token included, is bounded by the operation's deadline plus a
-//! margin, so the gateway's own deadline answer arrives first. For a
-//! mutation, [`ClientError::Transport`], [`ClientError::Timeout`] and
+//! margin, so the gateway's own deadline answer arrives first. No redirect is
+//! followed. For a mutation, [`ClientError::Transport`] (unless the request
+//! never built or never connected), [`ClientError::Timeout`] and
 //! [`ClientError::Unexpected`] are as ambiguous as `outcome_unknown`: the
 //! request may have reached Alpaca.
 //!
 //! [`GatewayClient::broker`], [`GatewayClient::wallet`] and
-//! [`GatewayClient::tokenization`] wrap the client in adapters that speak the
-//! library's own types and errors, so the library's poll loops run over the
-//! gateway unchanged.
+//! [`GatewayClient::tokenization`] are the operations, shaped like the
+//! library's own services with its types and errors, so the library's poll
+//! loops run over the gateway unchanged.
 
 use std::time::Duration;
 
-use alloy_primitives::{Address, TxHash};
 use reqwest::header::{AUTHORIZATION, HeaderName, HeaderValue};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use st0x_alpaca::broker::ClientOrderId;
-use st0x_alpaca::core::Network;
 use st0x_alpaca::endpoint::{EndpointError, validate_credential_origin};
-use st0x_alpaca::st0x_finance::Symbol;
-use st0x_alpaca::tokenization::{IssuerRequestId, TokenizationRequestId};
 use url::Url;
-use uuid::Uuid;
 
 use crate::ON_BEHALF_OF_HEADER;
 use crate::access::Tier;
-use crate::dto::account::{
-    ActivitiesQuery, ActivitiesResponse, FundsResponse, InventoryResponse, PositionMarkResponse,
-    WithdrawableCashResponse,
-};
-use crate::dto::market::{
-    AssetResponse, CounterTradeSharesRequest, CounterTradeSharesResponse, IsOpenResponse,
-    LatestTradeResponse, OvernightQuoteResponse, QuoteResponse, SessionResponse,
-    SessionStatusResponse,
-};
-use crate::dto::orders::{
-    CancelOrderRequest, CancelOrderResponse, ConversionOrderResponse, ConversionRequest,
-    ExactLimitOrderRequest, FindConversionResponse, FindOrderResponse, LimitOrderRequest,
-    MarketOrderRequest, OrderStateResponse, PlacementResponse, RecoverOrderRequest,
-    RecoverOrderResponse,
-};
-use crate::dto::tokenization::{
-    LookupResponse, MintRequest, NetworkQuery, RequestsQuery, RequestsResponse,
-    TokenizationRequestResponse,
-};
-use crate::dto::wallet::{
-    DepositAddressQuery, DepositAddressResponse, DepositResponse, JournalCreateRequest,
-    JournalCreateResponse, Transfer, TransferLookupResponse, TransferResponse, TransfersResponse,
-    TravelRulePatchRequest, WhitelistCreateRequest, WhitelistEntryResponse, WhitelistRemoveRequest,
-    WhitelistResponse, WithdrawRequest,
-};
 use crate::failure::ErrorBody;
 use crate::ops::{Method, Operation};
 
@@ -73,6 +38,15 @@ pub use adapter::{GatewayBroker, GatewayTokenization, GatewayWallet};
 /// Margin above an operation's deadline before the client gives up, so the
 /// gateway's own deadline answer arrives first.
 const DEADLINE_MARGIN: Duration = Duration::from_secs(15);
+
+/// How long the gateway client waits for a connection, the connect bound
+/// the wallet, broker and tokenization clients use. A connection that never
+/// opens means the request never left, and the error it ends in is a
+/// [`ClientError::Transport`] that reads as never left, so the caller may
+/// send again. Without it a blackholed connect would run into the
+/// operation's whole bound and end as [`ClientError::Timeout`], which for a
+/// mutation reads as an unknown outcome.
+const GATEWAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 const METADATA_IDENTITY_URL: &str =
     "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/identity";
@@ -174,13 +148,23 @@ pub enum ClientError {
     /// credential bearing origin, so no token was attached to it.
     #[error("refusing to send a gateway token to this URL: {0}")]
     Origin(#[from] EndpointError),
+    /// The HTTP client could not be built, so nothing was sent.
+    #[error("could not build the HTTP client: {0}")]
+    HttpClient(#[source] reqwest::Error),
     /// A method did not supply a parameter its path names. A bug in the
     /// client, caught before anything is sent.
     #[error("missing path parameter {0}")]
     MissingParameter(&'static str),
-    /// The request did not get an answer: connect failure or transport
-    /// error. For a mutation this is as ambiguous as `outcome_unknown`: the
-    /// request may have reached the gateway and Alpaca.
+    /// A path parameter value is empty or a dot segment.
+    /// `PathSegmentsMut::extend` drops `.` and `..` segments, and an empty
+    /// one leaves an empty segment, so such a value could address another
+    /// route. Caught before anything is sent.
+    #[error("path parameter {name} value {value:?} is empty or a dot segment")]
+    InvalidParameter { name: &'static str, value: String },
+    /// The request did not get an answer. A connect failure, the connect
+    /// bound included, never left. Any other transport error, for a
+    /// mutation, is as ambiguous as `outcome_unknown`: the request may have
+    /// reached the gateway and Alpaca.
     #[error("no answer from the gateway: {0}")]
     Transport(#[source] reqwest::Error),
     /// No answer within the operation's deadline plus the client's margin,
@@ -219,19 +203,34 @@ impl<Token: TokenSource> GatewayClient<Token> {
     /// tier, the load balancer URL for the human tiers. A path on it is kept
     /// as the prefix of every request path.
     ///
+    /// The client builds its own HTTP client, which follows no redirect: a
+    /// redirected answer is [`ClientError::Unexpected`], never a hop. reqwest
+    /// strips only `Authorization` and cookies when a redirect leaves the
+    /// origin, so following one would hand a token in any other header to
+    /// that origin, and a 307 or 308 would send a mutation a second time.
+    ///
+    /// It bounds the connect by `GATEWAY_CONNECT_TIMEOUT` and sets no total
+    /// request timeout, so the only total bound is the operation's own, in
+    /// `send`. A connect that never opens never left, so cutting it reads as
+    /// retryable; a client wide total timeout shorter than an operation's
+    /// bound could cut a mutation that already left, which then reads as an
+    /// unknown outcome.
+    ///
     /// # Errors
     ///
     /// [`ClientError::Origin`] for a base URL that does not parse, is not
     /// HTTPS (plain HTTP only on a loopback host), has no host, or carries
-    /// credentials, a query or a fragment.
-    pub fn new(
-        base: &str,
-        tier: Tier,
-        http: reqwest::Client,
-        token: Token,
-    ) -> Result<Self, ClientError> {
+    /// credentials, a query or a fragment. [`ClientError::HttpClient`] when
+    /// the HTTP client cannot be built.
+    pub fn new(base: &str, tier: Tier, token: Token) -> Result<Self, ClientError> {
+        let base = validate_credential_origin(base)?;
+        let http = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(GATEWAY_CONNECT_TIMEOUT)
+            .build()
+            .map_err(ClientError::HttpClient)?;
         Ok(Self {
-            base: validate_credential_origin(base)?,
+            base,
             tier,
             http,
             token,
@@ -253,580 +252,9 @@ impl<Token: TokenSource> GatewayClient<Token> {
         }
     }
 
-    // account.* and activities.list
-
-    /// `account.funds`.
-    ///
-    /// # Errors
-    ///
-    /// [`ClientError`]; see the type for each case.
-    pub async fn account_funds(&self) -> Result<FundsResponse, ClientError> {
-        self.send(Operation::AccountFunds, &[], NONE, NONE).await
-    }
-
-    /// `account.withdrawable_cash`.
-    ///
-    /// # Errors
-    ///
-    /// [`ClientError`]; see the type for each case.
-    pub async fn withdrawable_cash(&self) -> Result<WithdrawableCashResponse, ClientError> {
-        self.send(Operation::AccountWithdrawableCash, &[], NONE, NONE)
-            .await
-    }
-
-    /// `account.inventory`.
-    ///
-    /// # Errors
-    ///
-    /// [`ClientError`]; see the type for each case.
-    pub async fn inventory(&self) -> Result<InventoryResponse, ClientError> {
-        self.send(Operation::AccountInventory, &[], NONE, NONE)
-            .await
-    }
-
-    /// `account.position_mark`.
-    ///
-    /// # Errors
-    ///
-    /// [`ClientError`]; see the type for each case.
-    pub async fn position_mark(
-        &self,
-        symbol: &Symbol,
-    ) -> Result<PositionMarkResponse, ClientError> {
-        self.send(
-            Operation::AccountPositionMark,
-            &[("symbol", symbol.to_string())],
-            NONE,
-            NONE,
-        )
-        .await
-    }
-
-    /// `activities.list`.
-    ///
-    /// # Errors
-    ///
-    /// [`ClientError`]; see the type for each case.
-    pub async fn activities(
-        &self,
-        query: &ActivitiesQuery,
-    ) -> Result<ActivitiesResponse, ClientError> {
-        self.send(Operation::ActivitiesList, &[], Some(query), NONE)
-            .await
-    }
-
-    // market.* and assets.*
-
-    /// `market.is_open`.
-    ///
-    /// # Errors
-    ///
-    /// [`ClientError`]; see the type for each case.
-    pub async fn market_is_open(&self) -> Result<IsOpenResponse, ClientError> {
-        self.send(Operation::MarketIsOpen, &[], NONE, NONE).await
-    }
-
-    /// `market.session`.
-    ///
-    /// # Errors
-    ///
-    /// [`ClientError`]; see the type for each case.
-    pub async fn market_session(&self) -> Result<SessionResponse, ClientError> {
-        self.send(Operation::MarketSession, &[], NONE, NONE).await
-    }
-
-    /// `market.session_status`.
-    ///
-    /// # Errors
-    ///
-    /// [`ClientError`]; see the type for each case.
-    pub async fn market_session_status(&self) -> Result<SessionStatusResponse, ClientError> {
-        self.send(Operation::MarketSessionStatus, &[], NONE, NONE)
-            .await
-    }
-
-    /// `market.latest_trade`.
-    ///
-    /// # Errors
-    ///
-    /// [`ClientError`]; see the type for each case.
-    pub async fn latest_trade(&self, symbol: &Symbol) -> Result<LatestTradeResponse, ClientError> {
-        self.send(
-            Operation::MarketLatestTrade,
-            &[("symbol", symbol.to_string())],
-            NONE,
-            NONE,
-        )
-        .await
-    }
-
-    /// `market.latest_quote`.
-    ///
-    /// # Errors
-    ///
-    /// [`ClientError`]; see the type for each case.
-    pub async fn latest_quote(&self, symbol: &Symbol) -> Result<QuoteResponse, ClientError> {
-        self.send(
-            Operation::MarketLatestQuote,
-            &[("symbol", symbol.to_string())],
-            NONE,
-            NONE,
-        )
-        .await
-    }
-
-    /// `market.latest_overnight_quote`.
-    ///
-    /// # Errors
-    ///
-    /// [`ClientError`]; see the type for each case.
-    pub async fn latest_overnight_quote(
-        &self,
-        symbol: &Symbol,
-    ) -> Result<OvernightQuoteResponse, ClientError> {
-        self.send(
-            Operation::MarketLatestOvernightQuote,
-            &[("symbol", symbol.to_string())],
-            NONE,
-            NONE,
-        )
-        .await
-    }
-
-    /// `assets.get`.
-    ///
-    /// # Errors
-    ///
-    /// [`ClientError`]; see the type for each case.
-    pub async fn asset(&self, symbol: &Symbol) -> Result<AssetResponse, ClientError> {
-        self.send(
-            Operation::AssetsGet,
-            &[("symbol", symbol.to_string())],
-            NONE,
-            NONE,
-        )
-        .await
-    }
-
-    /// `assets.counter_trade_shares`.
-    ///
-    /// # Errors
-    ///
-    /// [`ClientError`]; see the type for each case.
-    pub async fn counter_trade_shares(
-        &self,
-        symbol: &Symbol,
-        request: &CounterTradeSharesRequest,
-    ) -> Result<CounterTradeSharesResponse, ClientError> {
-        self.send(
-            Operation::AssetsCounterTradeShares,
-            &[("symbol", symbol.to_string())],
-            NONE,
-            Some(request),
-        )
-        .await
-    }
-
-    // orders.* and conversions.*
-
-    /// `orders.place_market`.
-    ///
-    /// # Errors
-    ///
-    /// [`ClientError`]; see the type for each case.
-    pub async fn place_market_order(
-        &self,
-        request: &MarketOrderRequest,
-    ) -> Result<PlacementResponse, ClientError> {
-        self.send(Operation::OrdersPlaceMarket, &[], NONE, Some(request))
-            .await
-    }
-
-    /// `orders.place_limit`.
-    ///
-    /// # Errors
-    ///
-    /// [`ClientError`]; see the type for each case.
-    pub async fn place_limit_order(
-        &self,
-        request: &LimitOrderRequest,
-    ) -> Result<PlacementResponse, ClientError> {
-        self.send(Operation::OrdersPlaceLimit, &[], NONE, Some(request))
-            .await
-    }
-
-    /// `orders.place_exact_limit`.
-    ///
-    /// # Errors
-    ///
-    /// [`ClientError`]; see the type for each case.
-    pub async fn place_exact_limit_order(
-        &self,
-        request: &ExactLimitOrderRequest,
-    ) -> Result<PlacementResponse, ClientError> {
-        self.send(Operation::OrdersPlaceExactLimit, &[], NONE, Some(request))
-            .await
-    }
-
-    /// `orders.get`.
-    ///
-    /// # Errors
-    ///
-    /// [`ClientError`]; see the type for each case.
-    pub async fn order(&self, order_id: Uuid) -> Result<OrderStateResponse, ClientError> {
-        self.send(
-            Operation::OrdersGet,
-            &[("order_id", order_id.to_string())],
-            NONE,
-            NONE,
-        )
-        .await
-    }
-
-    /// `orders.find`.
-    ///
-    /// # Errors
-    ///
-    /// [`ClientError`]; see the type for each case.
-    pub async fn find_order(
-        &self,
-        client_order_id: &ClientOrderId,
-    ) -> Result<FindOrderResponse, ClientError> {
-        self.send(
-            Operation::OrdersFind,
-            &[("client_order_id", client_order_id.to_string())],
-            NONE,
-            NONE,
-        )
-        .await
-    }
-
-    /// `orders.recover`.
-    ///
-    /// # Errors
-    ///
-    /// [`ClientError`]; see the type for each case.
-    pub async fn recover_order(
-        &self,
-        request: &RecoverOrderRequest,
-    ) -> Result<RecoverOrderResponse, ClientError> {
-        self.send(Operation::OrdersRecover, &[], NONE, Some(request))
-            .await
-    }
-
-    /// `orders.cancel`.
-    ///
-    /// # Errors
-    ///
-    /// [`ClientError`]; see the type for each case.
-    pub async fn cancel_order(
-        &self,
-        order_id: Uuid,
-        request: &CancelOrderRequest,
-    ) -> Result<CancelOrderResponse, ClientError> {
-        self.send(
-            Operation::OrdersCancel,
-            &[("order_id", order_id.to_string())],
-            NONE,
-            Some(request),
-        )
-        .await
-    }
-
-    /// `conversions.submit`.
-    ///
-    /// # Errors
-    ///
-    /// [`ClientError`]; see the type for each case.
-    pub async fn submit_conversion(
-        &self,
-        request: &ConversionRequest,
-    ) -> Result<ConversionOrderResponse, ClientError> {
-        self.send(Operation::ConversionsSubmit, &[], NONE, Some(request))
-            .await
-    }
-
-    /// `conversions.get`.
-    ///
-    /// # Errors
-    ///
-    /// [`ClientError`]; see the type for each case.
-    pub async fn conversion(&self, order_id: Uuid) -> Result<ConversionOrderResponse, ClientError> {
-        self.send(
-            Operation::ConversionsGet,
-            &[("order_id", order_id.to_string())],
-            NONE,
-            NONE,
-        )
-        .await
-    }
-
-    /// `conversions.find`.
-    ///
-    /// # Errors
-    ///
-    /// [`ClientError`]; see the type for each case.
-    pub async fn find_conversion(
-        &self,
-        client_order_id: &ClientOrderId,
-    ) -> Result<FindConversionResponse, ClientError> {
-        self.send(
-            Operation::ConversionsFind,
-            &[("client_order_id", client_order_id.to_string())],
-            NONE,
-            NONE,
-        )
-        .await
-    }
-
-    // journals.create
-
-    /// `journals.create`.
-    ///
-    /// # Errors
-    ///
-    /// [`ClientError`]; see the type for each case.
-    pub async fn create_journal(
-        &self,
-        request: &JournalCreateRequest,
-    ) -> Result<JournalCreateResponse, ClientError> {
-        self.send(Operation::JournalsCreate, &[], NONE, Some(request))
-            .await
-    }
-
-    // wallet.*
-
-    /// `wallet.withdraw`. Never resend after an unknown outcome; reconcile
-    /// from [`Self::transfers`].
-    ///
-    /// # Errors
-    ///
-    /// [`ClientError`]; see the type for each case.
-    pub async fn withdraw(&self, request: &WithdrawRequest) -> Result<Transfer, ClientError> {
-        self.send(Operation::WalletWithdraw, &[], NONE, Some(request))
-            .await
-    }
-
-    /// `wallet.transfer`.
-    ///
-    /// # Errors
-    ///
-    /// [`ClientError`]; see the type for each case.
-    pub async fn transfer(&self, transfer_id: Uuid) -> Result<TransferResponse, ClientError> {
-        self.send(
-            Operation::WalletTransfer,
-            &[("transfer_id", transfer_id.to_string())],
-            NONE,
-            NONE,
-        )
-        .await
-    }
-
-    /// `wallet.transfers`.
-    ///
-    /// # Errors
-    ///
-    /// [`ClientError`]; see the type for each case.
-    pub async fn transfers(&self) -> Result<TransfersResponse, ClientError> {
-        self.send(Operation::WalletTransfers, &[], NONE, NONE).await
-    }
-
-    /// `wallet.find_deposit`.
-    ///
-    /// # Errors
-    ///
-    /// [`ClientError`]; see the type for each case.
-    pub async fn find_deposit(&self, tx_hash: &TxHash) -> Result<DepositResponse, ClientError> {
-        self.send(
-            Operation::WalletFindDeposit,
-            &[("tx_hash", tx_hash.to_string())],
-            NONE,
-            NONE,
-        )
-        .await
-    }
-
-    /// `wallet.find_transfer`.
-    ///
-    /// # Errors
-    ///
-    /// [`ClientError`]; see the type for each case.
-    pub async fn find_transfer(
-        &self,
-        tx_hash: &TxHash,
-    ) -> Result<TransferLookupResponse, ClientError> {
-        self.send(
-            Operation::WalletFindTransfer,
-            &[("tx_hash", tx_hash.to_string())],
-            NONE,
-            NONE,
-        )
-        .await
-    }
-
-    /// `wallet.deposit_address`.
-    ///
-    /// # Errors
-    ///
-    /// [`ClientError`]; see the type for each case.
-    pub async fn deposit_address(
-        &self,
-        query: &DepositAddressQuery,
-    ) -> Result<DepositAddressResponse, ClientError> {
-        self.send(Operation::WalletDepositAddress, &[], Some(query), NONE)
-            .await
-    }
-
-    /// `wallet.whitelist`.
-    ///
-    /// # Errors
-    ///
-    /// [`ClientError`]; see the type for each case.
-    pub async fn whitelist(&self) -> Result<WhitelistResponse, ClientError> {
-        self.send(Operation::WalletWhitelist, &[], NONE, NONE).await
-    }
-
-    /// `wallet.whitelist_create`. Never resend after an unknown outcome;
-    /// reconcile from [`Self::whitelist`].
-    ///
-    /// # Errors
-    ///
-    /// [`ClientError`]; see the type for each case.
-    pub async fn create_whitelist_entry(
-        &self,
-        request: &WhitelistCreateRequest,
-    ) -> Result<WhitelistEntryResponse, ClientError> {
-        self.send(Operation::WalletWhitelistCreate, &[], NONE, Some(request))
-            .await
-    }
-
-    /// `wallet.whitelist_remove`.
-    ///
-    /// # Errors
-    ///
-    /// [`ClientError`]; see the type for each case.
-    pub async fn remove_whitelist_entries(
-        &self,
-        address: &Address,
-        request: &WhitelistRemoveRequest,
-    ) -> Result<WhitelistResponse, ClientError> {
-        self.send(
-            Operation::WalletWhitelistRemove,
-            &[("address", address.to_string())],
-            NONE,
-            Some(request),
-        )
-        .await
-    }
-
-    /// `wallet.whitelist_patch_travel_rule`.
-    ///
-    /// # Errors
-    ///
-    /// [`ClientError`]; see the type for each case.
-    pub async fn patch_travel_rule(
-        &self,
-        request: &TravelRulePatchRequest,
-    ) -> Result<WhitelistResponse, ClientError> {
-        self.send(
-            Operation::WalletWhitelistPatchTravelRule,
-            &[],
-            NONE,
-            Some(request),
-        )
-        .await
-    }
-
-    // tokenization.*
-
-    /// `tokenization.mint`.
-    ///
-    /// # Errors
-    ///
-    /// [`ClientError`]; see the type for each case.
-    pub async fn request_mint(
-        &self,
-        request: &MintRequest,
-    ) -> Result<TokenizationRequestResponse, ClientError> {
-        self.send(Operation::TokenizationMint, &[], NONE, Some(request))
-            .await
-    }
-
-    /// `tokenization.requests`.
-    ///
-    /// # Errors
-    ///
-    /// [`ClientError`]; see the type for each case.
-    pub async fn tokenization_requests(
-        &self,
-        query: &RequestsQuery,
-    ) -> Result<RequestsResponse, ClientError> {
-        self.send(Operation::TokenizationRequests, &[], Some(query), NONE)
-            .await
-    }
-
-    /// `tokenization.request`.
-    ///
-    /// # Errors
-    ///
-    /// [`ClientError`]; see the type for each case.
-    pub async fn tokenization_request(
-        &self,
-        tokenization_request_id: &TokenizationRequestId,
-        network: Network,
-    ) -> Result<TokenizationRequestResponse, ClientError> {
-        self.send(
-            Operation::TokenizationRequest,
-            &[(
-                "tokenization_request_id",
-                tokenization_request_id.to_string(),
-            )],
-            Some(&NetworkQuery { network }),
-            NONE,
-        )
-        .await
-    }
-
-    /// `tokenization.find_mint`.
-    ///
-    /// # Errors
-    ///
-    /// [`ClientError`]; see the type for each case.
-    pub async fn find_mint(
-        &self,
-        issuer_request_id: &IssuerRequestId,
-    ) -> Result<LookupResponse, ClientError> {
-        self.send(
-            Operation::TokenizationFindMint,
-            &[("issuer_request_id", issuer_request_id.to_string())],
-            NONE,
-            NONE,
-        )
-        .await
-    }
-
-    /// `tokenization.find_redemption`.
-    ///
-    /// # Errors
-    ///
-    /// [`ClientError`]; see the type for each case.
-    pub async fn find_redemption(
-        &self,
-        tx_hash: &TxHash,
-        network: Network,
-    ) -> Result<LookupResponse, ClientError> {
-        self.send(
-            Operation::TokenizationFindRedemption,
-            &[("tx_hash", tx_hash.to_string())],
-            Some(&NetworkQuery { network }),
-            NONE,
-        )
-        .await
-    }
-
     /// Sends one operation, bounded as a whole (token included) by the
     /// operation's deadline plus [`DEADLINE_MARGIN`].
-    async fn send<Query, Request, Response>(
+    pub(crate) async fn send<Query, Request, Response>(
         &self,
         operation: Operation,
         params: &[(&'static str, String)],
@@ -910,7 +338,9 @@ impl<Token: TokenSource> GatewayClient<Token> {
     }
 
     /// Builds the URL from the base URL's path, the tier prefix and the
-    /// operation's path, each parameter encoded as one path segment.
+    /// operation's path, each parameter encoded as one path segment. Like
+    /// `st0x_alpaca`'s own path building, it refuses an empty or dot
+    /// segment value, even percent encoded.
     fn url(
         &self,
         operation: Operation,
@@ -931,11 +361,21 @@ impl<Token: TokenSource> GatewayClient<Token> {
                 .strip_prefix('{')
                 .and_then(|rest| rest.strip_suffix('}'))
             {
-                Some(name) => params
-                    .iter()
-                    .find(|(param, _)| *param == name)
-                    .map(|(_, value)| value.as_str())
-                    .ok_or(ClientError::MissingParameter(name))?,
+                Some(name) => {
+                    let value = params
+                        .iter()
+                        .find(|(param, _)| *param == name)
+                        .map(|(_, value)| value.as_str())
+                        .ok_or(ClientError::MissingParameter(name))?;
+                    let decoded = value.to_ascii_lowercase().replace("%2e", ".");
+                    if value.is_empty() || decoded == "." || decoded == ".." {
+                        return Err(ClientError::InvalidParameter {
+                            name,
+                            value: value.to_string(),
+                        });
+                    }
+                    value
+                }
                 None => segment,
             };
             segments.push(value);
@@ -953,13 +393,15 @@ impl<Token: TokenSource> GatewayClient<Token> {
 
 #[cfg(test)]
 mod tests {
+    use uuid::Uuid;
+
     use super::*;
+    use crate::dto::wallet::WithdrawRequest;
 
     fn client(tier: Tier) -> GatewayClient<StaticToken> {
         GatewayClient::new(
             "https://t0-alpaca.example.com",
             tier,
-            reqwest::Client::new(),
             StaticToken("token".into()),
         )
         .unwrap()
@@ -973,13 +415,7 @@ mod tests {
             "http://127.0.0.1:8080",
             "http://[::1]:8080",
         ] {
-            GatewayClient::new(
-                accepted,
-                Tier::Bot,
-                reqwest::Client::new(),
-                StaticToken("token".into()),
-            )
-            .unwrap();
+            GatewayClient::new(accepted, Tier::Bot, StaticToken("token".into())).unwrap();
         }
 
         for refused in [
@@ -990,12 +426,8 @@ mod tests {
             "unix:/run/gateway.sock",
             "not a url",
         ] {
-            let Err(error) = GatewayClient::new(
-                refused,
-                Tier::Bot,
-                reqwest::Client::new(),
-                StaticToken("token".into()),
-            ) else {
+            let Err(error) = GatewayClient::new(refused, Tier::Bot, StaticToken("token".into()))
+            else {
                 panic!("{refused} was accepted");
             };
             assert!(
@@ -1036,6 +468,72 @@ mod tests {
         target.assert_calls_async(0).await;
     }
 
+    /// A token in a header of its own, as the IAP assertion travels.
+    struct HeaderToken;
+
+    impl TokenSource for HeaderToken {
+        async fn token(&self) -> Result<String, ClientError> {
+            Ok("assertion".into())
+        }
+
+        fn header_name(&self) -> HeaderName {
+            HeaderName::from_static("x-goog-iap-jwt-assertion")
+        }
+    }
+
+    /// reqwest drops only `Authorization` and cookies on a cross origin
+    /// hop, and resends a POST on a 307, so a followed redirect would hand
+    /// the token to another origin and could apply the mutation twice.
+    #[tokio::test]
+    async fn a_redirected_mutation_is_not_followed_to_another_origin() {
+        let gateway = httpmock::MockServer::start_async().await;
+        let elsewhere = httpmock::MockServer::start_async().await;
+        let redirect = gateway
+            .mock_async(|when, then| {
+                when.path("/alpaca-write/v1/wallet/withdrawals")
+                    .header("x-goog-iap-jwt-assertion", "assertion");
+                then.status(307).header(
+                    "Location",
+                    format!(
+                        "{}/alpaca-write/v1/wallet/withdrawals",
+                        elsewhere.base_url()
+                    ),
+                );
+            })
+            .await;
+        let target = elsewhere
+            .mock_async(|when, then| {
+                when.any_request();
+                then.status(200).body("{}");
+            })
+            .await;
+        let client = GatewayClient::new(&gateway.base_url(), Tier::Write, HeaderToken).unwrap();
+        let withdrawal: WithdrawRequest = serde_json::from_value(serde_json::json!({
+            "amount": "10",
+            "asset": "USDC",
+            "address": "0x3333333333333333333333333333333333333333",
+            "operationId": Uuid::new_v4(),
+        }))
+        .unwrap();
+
+        let error = client
+            .send::<(), _, serde_json::Value>(
+                Operation::WalletWithdraw,
+                &[],
+                NONE,
+                Some(&withdrawal),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, ClientError::Unexpected { status: 307, .. }),
+            "{error}"
+        );
+        redirect.assert_async().await;
+        target.assert_calls_async(0).await;
+    }
+
     #[test]
     fn path_parameters_are_encoded_into_the_tier_prefix() {
         let url = client(Tier::Bot)
@@ -1050,6 +548,37 @@ mod tests {
         );
     }
 
+    /// `PathSegmentsMut::extend` drops `.` and `..` segments, so `..` as a
+    /// request id would turn the keyed read into the list route.
+    #[test]
+    fn an_empty_or_dot_segment_parameter_is_refused() {
+        for value in ["..", "%2E%2e", "."] {
+            let error = client(Tier::Bot)
+                .url(
+                    Operation::TokenizationRequest,
+                    &[("tokenization_request_id", value.to_string())],
+                )
+                .unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    ClientError::InvalidParameter {
+                        name: "tokenization_request_id",
+                        ..
+                    }
+                ),
+                "{value}: {error}"
+            );
+        }
+        let error = client(Tier::Bot)
+            .url(Operation::AccountPositionMark, &[("symbol", String::new())])
+            .unwrap_err();
+        assert!(
+            matches!(error, ClientError::InvalidParameter { name: "symbol", .. }),
+            "{error}"
+        );
+    }
+
     /// A load balancer routing by path prefix serves the gateway below it.
     #[test]
     fn a_path_on_the_base_url_prefixes_every_request() {
@@ -1057,15 +586,10 @@ mod tests {
             "https://lb.example.com/t0-alpaca",
             "https://lb.example.com/t0-alpaca/",
         ] {
-            let url = GatewayClient::new(
-                base,
-                Tier::Read,
-                reqwest::Client::new(),
-                StaticToken("token".into()),
-            )
-            .unwrap()
-            .url(Operation::AccountFunds, &[])
-            .unwrap();
+            let url = GatewayClient::new(base, Tier::Read, StaticToken("token".into()))
+                .unwrap()
+                .url(Operation::AccountFunds, &[])
+                .unwrap();
             assert_eq!(
                 url.as_str(),
                 "https://lb.example.com/t0-alpaca/alpaca-read/v1/account/funds",

@@ -1,7 +1,7 @@
 //! Position fetching for Alpaca Broker API.
 
 use rain_math_float::Float;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tracing::{debug, error, trace, warn};
 
 use st0x_finance::{HasZero, NotPositive, Usdc};
@@ -9,22 +9,29 @@ use st0x_float_macro::float;
 use st0x_float_serde::{DebugFloat, DebugOptionFloat};
 
 use super::AlpacaBrokerApiError;
-use super::client::{AlpacaBrokerApiClient, SymbolSegment};
+use super::client::AlpacaBrokerApiClient;
 use crate::broker::{
     AlpacaAmount, FractionalShares, Positive, Symbol, Usd, deserialize_float_from_number_or_string,
     deserialize_option_float_from_number_or_string,
 };
 
 /// An equity position with symbol, quantity, and optional market value.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct EquityPosition {
     pub symbol: Symbol,
     pub quantity: FractionalShares,
+    #[serde(
+        default,
+        serialize_with = "st0x_float_serde::serialize_option_float",
+        deserialize_with = "deserialize_option_float_from_number_or_string"
+    )]
     pub market_value: Option<Float>,
 }
 
 /// Account state from the broker.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Inventory {
     pub positions: Vec<EquityPosition>,
     /// USDC held at Alpaca after USD/USDC conversion and before withdrawal.
@@ -44,7 +51,8 @@ pub struct Inventory {
 }
 
 /// Account-level USD figures from the broker, all denominated in cents.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AccountFunds {
     pub balance: i64,
     pub buying_power: i64,
@@ -263,11 +271,11 @@ pub(super) async fn fetch_position_mark(
     client: &AlpacaBrokerApiClient,
     symbol: &Symbol,
 ) -> Result<Option<Positive<Usd>>, AlpacaBrokerApiError> {
-    let segment = SymbolSegment::new(symbol)?;
     let url = format!(
-        "{}/v1/trading/accounts/{}/positions/{segment}",
+        "{}/v1/trading/accounts/{}/positions/{}",
         client.base_url(),
         client.account_id(),
+        urlencoding::encode(symbol.as_str())
     );
 
     debug!(%symbol, "Fetching open broker position mark from {url}");

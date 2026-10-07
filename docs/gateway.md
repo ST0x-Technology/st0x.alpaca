@@ -24,23 +24,24 @@ Outside the app, Cloud Run `run.invoker` is granted only to the bot service acco
 ## Request rules
 
 - Request bodies and queries refuse unknown fields.
-- Symbols in paths and bodies are restricted to letters, digits, `.`, `/` and `-`; anything else answers `400 invalid_request` before Alpaca is called.
+- Symbols in paths and bodies are restricted to letters, digits, `.`, `/` and `-`, at most 32 characters; anything else answers `400 invalid_request` before Alpaca is called. A journal `counterparty` is 1 to 64 letters, digits, `_` or `-`, and a wallet `asset` and a deposit address `network` carry at most 32 characters; a longer value is refused by its length alone.
 - Client order ids must have the form of the caller's tier: a bare UUID for bots, `cli-` followed by a UUID for human writers. Bot `orders.recover`, `orders.find` and `conversions.find` accept only bot keys and answer `400 invalid_request` to a `cli-` key, so the bot never adopts a human order as its own. Humans may look up any key.
 - `activities.list` needs a non blank `types`. A human call reads at most 10 pages from Alpaca (a bot call 1000); a longer history answers `400 invalid_request`, so narrow the `after` and `until` window.
-- The read and write tiers share `human_budget_per_minute`, counted in requests sent to Alpaca (the token mint is not counted). Admission reserves the most requests the operation can send (`Operation::human_budget_cost`, for example 2 for `wallet.withdraw` and 4 for an order placement); a cache hit can make it send fewer, never more. Config validation refuses a `human_budget_per_minute` below the largest reservation of an operation the human tiers may call (10, for `activities.list`, unless it is in `disabled_operations`) and names that operation. When the work ends (for a read, the end of its work or the moment its caller goes away; for a mutation, the end of its work at Alpaca, even after a deadline answer), the gateway keeps one unit per request sent and gives the rest back, whatever the outcome, so a request refused before anything was sent gets all its units back. Units go back only while the one minute window they were taken from is still current. A human `activities.list` reserves 10 units, its page cap. The keyed reads that client poll loops repeat (`orders.get`, `conversions.get`, `wallet.transfer`, `wallet.find_transfer`, `tokenization.request`, `tokenization.find_redemption`) are free. `wallet.whitelist_remove` and `wallet.whitelist_patch_travel_rule` reserve one unit for the whitelist read and, after it, one unit per entry they will write, all at once before the first write. A budget that cannot cover every write answers `429 backpressure` with `not_applied` and writes nothing; when the writes plus the read exceed `human_budget_per_minute` that answer is not retryable and carries no `Retry-After`. If the loop stops early, the units of the writes it never sent go back. A spent budget answers `429 backpressure` with `Retry-After`. Every `Retry-After` and `retryAfterSecs` is the hold rounded up to whole seconds, at least 1, so a caller that waits it out never retries early. Bots are never charged.
+- The read and write tiers share `human_budget_per_minute`, counted in calls: each human call takes one unit, except the keyed reads that client poll loops repeat (`orders.get`, `conversions.get`, `wallet.transfer`, `wallet.find_deposit`, `tokenization.request`, `tokenization.find_redemption`), which are free. A spent budget answers `429 backpressure` with `Retry-After`. Every `Retry-After` and `retryAfterSecs` is the hold rounded up to whole seconds, at least 1, so a caller that waits it out never retries early. Bots are never charged. Each gateway process keeps its own budget, and a rollout runs two side by side (see [Rollouts](#rollouts)).
+- Every call runs its work on a detached task and answers by its deadline (`Operation::deadline`), or at once on shutdown; a deadline, shutdown or a caller that goes away never aborts a request already sent to Alpaca. The work runs under a send gate that closes at the deadline, at shutdown, and before the caller is answered without the result. The library asks the gate before each credential mint starts and as each Alpaca API request would leave, so a request is either in flight before that answer, which its `outcome_unknown` covers as one that may still land, or held back and never sent; a mutation that sent nothing settles `not_applied`. Without the result a mutation answers `504 outcome_unknown` and a read `502 upstream_transient`, which is retryable. `wallet.withdraw`, `wallet.whitelist_remove` and `wallet.whitelist_patch_travel_rule` read the whitelist before they write, and that read is cut at the deadline, so a stalled read ends the work with nothing written. A whitelist loop stopped after its first write answers `outcome_unknown` with a message naming the entries it already changed; read `wallet.whitelist` to see the current state. Detached work runs until its last Alpaca request answers: the wallet client has no total request timeout, so a wallet request Alpaca never answers holds its task until the process ends.
 
 ## Config
 
-The service reads the TOML file named by `ST0X_ALPACA_GATEWAY_CONFIG` (the image sets `/run/t0-alpaca/gateway.toml`). Unknown keys are refused at every level, including inside `[broker]`, so a misspelled `mode` or auth field fails validation instead of falling back to a default. `[broker]` takes exactly one credential shape: `api_key` and `api_secret` (Basic), `client_id` and `kms_key_version` (Cloud KMS), or `client_id` and `private_key_pem` (local key). `environment` is exactly `production` or `staging`; any other value, `prod` or `Production` included, fails to parse. With `environment = "production"` only the Cloud KMS shape passes validation, so no production key material lives in the config. `identity.google_jwks_url` and `identity.iap_jwks_url` default to Google's key URLs; an override must be HTTPS, or HTTP on a loopback host. `st0x-alpaca-gateway --validate-config <path>` checks a file without contacting anything.
+The service reads the TOML file named by `ST0X_ALPACA_GATEWAY_CONFIG` (the image sets `/run/t0-alpaca/gateway.toml`). Unknown keys are refused at the top level and in the gateway's own tables; `[broker]` is read with the library's `AlpacaBrokerApiCtx`, which ignores keys it does not know, so a misspelled key there takes the library default and the startup account check is what catches a wrong endpoint. `environment` is exactly `production` or `staging`; any other value, `prod` or `Production` included, fails to parse. With `environment = "production"`, or with `mode = "production"` in `[broker]` (the real money Broker API, whatever the environment), only the Cloud KMS credential (`client_id` and `kms_key_version`) passes validation, so no key material for the real money endpoint lives in the config; a staging deployment against the sandbox may also use `api_key` and `api_secret`. The bot, read and write audiences must differ. `identity.google_jwks_url` and `identity.iap_jwks_url` default to Google's key URLs; an override must be HTTPS, or HTTP on a loopback host. `st0x-alpaca-gateway --validate-config <path>` checks a file without contacting anything. A file that does not parse is reported with the parser's message, never the offending line itself, so a malformed credential line stays out of the startup log and the validation output.
 
 ```toml
-profile = "t0"
 environment = "staging"
 listen = "0.0.0.0:8080"
 # Startup refuses to serve unless Alpaca reports this number for broker.account_id.
 expected_account_number = "<T0 account number>"
 # Operations switched off without a redeploy of the image (403 capability_disabled).
 disabled_operations = []
+# Per process, and a rollout runs two: half the human share of the credential's rate limit.
 human_budget_per_minute = 60
 
 [broker]
@@ -57,11 +58,14 @@ read_audience = "/projects/<number>/global/backendServices/<read backend id>"
 write_audience = "/projects/<number>/global/backendServices/<write backend id>"
 
 [wallet]
+# Empty: the bot's wallet.withdraw answers 403 capability_disabled and the write tier's keeps serving; disabled_operations switches wallet.withdraw off on the write tier too.
 bot_withdrawal_destinations = ["<liquidity market maker wallet>"]
 travel_rule_beneficiary = "<beneficiary entity name>"
 
 [tokenization]
+# Empty: every tokenization operation answers 422 unsupported_network or 403 capability_disabled.
 networks = ["base"]
+# Empty: every mint answers 403 destination_not_allowed.
 mint_recipients = ["<liquidity bot wallet>"]
 
 # Empty: journals.create answers 403 capability_disabled.
@@ -74,13 +78,13 @@ The account id, the account number and every pinned address live in this reviewe
 
 1. Parse and validate config. Invalid config exits nonzero.
 2. Verify the account with Alpaca (`GET /v1/trading/accounts/{id}/account`), require status ACTIVE and the configured account number. Any failure exits nonzero, so Cloud Run never routes traffic to a gateway bound to the wrong account or unable to reach Alpaca.
-3. Serve. `/healthz` and `/readyz` answer without credentials; `/readyz` reports profile, environment and version.
+3. Serve. `/healthz` and `/readyz` answer without credentials; `/readyz` reports environment and version.
 
-On SIGTERM the listener stops taking requests, and one 8 second budget starts, inside Cloud Run's 10 second termination grace. Every mutation still waiting for Alpaca answers its caller `504 outcome_unknown` at once and writes its `answered` audit record; its work at Alpaca continues as a detached task. A read in flight answers `502 upstream_transient`, which is retryable. A request arriving after the signal answers `503 unavailable` (`not_applied` for a mutation). The process then waits for the detached tasks until 8 seconds after the signal and exits. A detached task still running at that point is cut and leaves no `settled` record; callers reconcile from reads.
+On SIGTERM the listener stops taking requests, and one 8 second budget starts, inside Cloud Run's 10 second termination grace. Every call in flight answers at once without its result, as described under [Request rules](#request-rules), and a request arriving after the signal answers `503 unavailable` (`not_applied` for a mutation). The process then waits for the detached tasks until 8 seconds after the signal and exits. A detached task still running at that point is cut and leaves no `settled` record; callers reconcile from reads.
 
 ## Audit
 
-Every request on a catalog operation's route writes one JSON line to stdout with `logging.googleapis.com/labels.log = "st0x_alpaca_gateway_audit"` and the event under `audit` (`st0x_alpaca_gateway_api::AuditEvent`). That includes a request the gateway refuses before any work: a credential that does not verify (caller subject `unverified`), a bot subject outside `identity.bot_principals`, and a body, path or query that does not parse; a refused mutation answers `not_applied`. A path no operation serves answers `404 unknown_operation` and writes no record. Fields: request id, deployment, environment, account id, caller subject and email, tier, `X-On-Behalf-Of`, operation, key, reason, request digest, money moving fields, Alpaca status (a failure's own Alpaca status, otherwise the status of the last Alpaca answer, so a body that does not parse after a 200 still records the 200), `alpacaRequestIds` (the `X-Request-ID` of every Alpaca response the request received, in order, which is the join key with Alpaca support), Alpaca object id (on a failure, the error body's `alpacaObjectIds` comma joined: the entries a whitelist loop had already changed, or the tokenization request a network refusal is about), outcome, error code, latency, `abandoned`, and the gateway version. The version is the package version, the commit the image was built from (the flake passes it at build time; `unknown` in a build outside the flake) and, under Cloud Run, the revision serving the request (`K_REVISION`), as `0.1.0+<commit>@<revision>`. A read whose caller goes away before the answer still writes its `answered` record, with `abandoned: true` and the Alpaca traffic sent until then. A mutation that finishes after its answer was sent writes a second record with phase `settled`. Records never contain credentials, tokens, Travel Rule names or response bodies.
+Every request on a catalog operation's route writes one JSON line to stdout with `logging.googleapis.com/labels.log = "st0x_alpaca_gateway_audit"` and the event under `audit` (`st0x_alpaca_gateway_api::AuditEvent`). That includes a request the gateway refuses before any work: a credential that does not verify (caller subject `unverified`), a bot subject outside `identity.bot_principals`, and a body, path or query that does not parse; a refused mutation answers `not_applied`. A path no operation serves answers `404 unknown_operation` and writes no record. Fields: request id, deployment, environment, account id, caller subject and email, tier, `X-On-Behalf-Of`, operation, key, reason, request digest, money moving fields, Alpaca status (on a success the status of the last Alpaca API answer, on a failure the failure's own Alpaca status, none when it has none), `alpacaRequestIds` (the `X-Request-ID` of the Alpaca responses the work received, token mint answers included, in order, the join key with Alpaca support: the first 100, each cut at 128 characters), Alpaca object id (the order, transfer, journal, tokenization request or whitelist entries the call created or touched, comma joined; on a failure the entries a whitelist loop had already changed, or the tokenization request a network refusal is about), outcome, error code, latency and the gateway version, `<package version>+<commit>` (`unknown` in a build outside the flake). The key, the reason, each money moving field and `X-On-Behalf-Of` keep at most their first 256 characters, so one record stays one bounded log line whatever the caller sends; the request digest still covers the whole request. The detached task writes the record that carries the result and its Alpaca traffic: phase `answered` when the caller got that result, `settled` when the gateway had already answered without it (at the deadline or on shutdown) or the caller had gone away. An answer without the result writes its own `answered` record, without Alpaca traffic. The order of the two records is not guaranteed. Records never contain credentials, tokens, Travel Rule names or response bodies.
 
 Query the audit stream in Cloud Logging with `labels.log="st0x_alpaca_gateway_audit"`.
 
@@ -108,19 +112,33 @@ Then:
 
 1. Build and push the image to `europe-west3-docker.pkg.dev/t0-artifacts/t0-alpaca/t0-alpaca` and sign its Binary Authorization attestation.
 2. Validate and publish the staging config: `docker run --rm -v $PWD/staging.toml:/candidate.toml t0-alpaca:latest --validate-config /candidate.toml`, then add it as a new Secret Manager version.
-3. Deploy the digest. Check the startup log line `Gateway bound to its Alpaca account` and `/readyz`.
+3. Deploy the digest with no traffic, check its startup log line `Gateway bound to its Alpaca account`, then move all traffic to it at once and check `/readyz` (see [Rollouts](#rollouts)).
 4. From the staging liquidity VM, call `GET /bot/v1/account/funds` with the VM's ID token; from a laptop, call `/alpaca-read/v1/account/funds` through the load balancer. Both write audit records.
 
 ## Deploying to production
 
 Same steps in `t0-alpaca`, with the production BrokerDash credential and account, behind the app deploy PAM grant like every other T0 service. The production config sets `environment = "production"` and must use the Cloud KMS credential; validation refuses any other shape. Production `bot_principals` lists only the production liquidity runtime service account.
 
+## Rollouts
+
+Min and max instances 1 does not make the gateway a single process. Cloud Run caps instances per revision, so the old and the new revision run side by side while traffic moves and while the old one finishes the requests it already admitted (up to the 300 s request timeout) and their detached work; a platform replacement of the instance overlaps two processes the same way. Each process keeps its own human budget and its own `Retry-After` hold after a throttled credential mint, so a hold one process takes does not stop the other, and together they can admit twice `human_budget_per_minute` in one minute. Two rules keep the humans within their share of the credential's Alpaca rate limit:
+
+1. Set `human_budget_per_minute` to half the intended human share, so two processes together stay within it.
+2. Deploy every revision (a new digest, a new config version, a rollback) with no traffic, then move all traffic to it at once. A revision without traffic admits nothing, so the overlap lasts only while the old revision drains. Never split traffic between two revisions: both keep admitting for as long as the split lasts. A config roll runs the same two commands with `--update-secrets` in place of `--image`.
+
+```bash
+gcloud run services update t0-alpaca --project <project> --region <region> --image <digest> --no-traffic
+# Check the new revision's startup log line `Gateway bound to its Alpaca account`.
+gcloud run services update-traffic t0-alpaca --project <project> --region <region> --to-latest
+```
+
 ## Rollback
 
 | Problem | Action | Effect |
 | --- | --- | --- |
-| A bad gateway release | Redeploy the previous attested digest | Callers see the previous behavior; the `/v1` contract only ever adds operations and optional response fields |
-| One operation misbehaves | Add it to `disabled_operations`, publish the config, roll the revision | That operation answers `403 capability_disabled`; the rest keep serving |
+| A bad gateway release | Redeploy the previous attested digest as in [Rollouts](#rollouts) | Callers see the previous behavior; the `/v1` contract only ever adds operations and optional response fields |
+| One operation misbehaves | Add it to `disabled_operations`, publish the config, roll the revision | That operation answers `403 capability_disabled` on every tier; the rest keep serving |
+| The bot must stop withdrawing while operators keep withdrawing | Empty `wallet.bot_withdrawal_destinations`, publish the config, roll the revision | The bot's `wallet.withdraw` answers `403 capability_disabled`; operator withdrawals and every other bot operation keep serving |
 | A caller must lose access | Remove its `run.invoker` binding (bots) or group membership (humans) | Its requests stop at the platform |
 | All human access must stop | Remove the IAP service agent's `run.invoker` binding | Every human request stops; bots keep serving |
 | The credential is suspect | Revoke the BrokerDash credential | All Alpaca traffic for the account stops at Alpaca |

@@ -449,6 +449,7 @@ mod tests {
     const BOT_AUDIENCE: &str = "https://t0-alpaca.example.run.app";
     const BOT_SUBJECT: &str = "100000000000000000001";
     const READ_AUDIENCE: &str = "/projects/1/global/backendServices/11";
+    const WRITE_AUDIENCE: &str = "/projects/1/global/backendServices/22";
     const RSA_PEM: &str = include_str!("../tests/gateway/fixtures/bot-signing-key.pem");
     /// Fixed bytes rather than a random key: a test that generates its own
     /// key can pass while the code under test ignores the key entirely.
@@ -575,6 +576,16 @@ mod tests {
             KeyKind::Ec => TokenVerifier::iap(Tier::Read, READ_AUDIENCE, url, http),
             KeyKind::Rsa => TokenVerifier::bot(BOT_AUDIENCE, &[BOT_SUBJECT.to_string()], url, http),
         })
+    }
+
+    /// The IAP verifier of the write tier.
+    fn write_verifier(keys: &MockServer) -> Arc<TokenVerifier> {
+        Arc::new(TokenVerifier::iap(
+            Tier::Write,
+            WRITE_AUDIENCE,
+            keys.url("/keys"),
+            reqwest::Client::new(),
+        ))
     }
 
     /// Presents `token` where a caller of `tier` puts its credential and
@@ -826,5 +837,34 @@ mod tests {
         let (status, _) = present(bot, Tier::Bot, &assertion).await;
 
         assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    /// The property the human tiers rest on: IAP binds an assertion to the
+    /// backend that admitted it, so a read tier caller replaying theirs
+    /// against the write tier is refused even though its signature, issuer
+    /// and expiry are all valid.
+    #[tokio::test]
+    async fn rejects_a_token_minted_for_another_role() {
+        let keys = key_server(&[jwk(KeyKind::Ec)]);
+        let read_assertion = token(KeyKind::Ec, KID, READ_AUDIENCE, IAP_ISSUER, 300);
+        let write_assertion = token(KeyKind::Ec, KID, WRITE_AUDIENCE, IAP_ISSUER, 300);
+
+        let (status, _) = present(verifier(KeyKind::Ec, &keys), Tier::Read, &read_assertion).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the read tier admits its own assertion"
+        );
+        let (status, _) = present(write_verifier(&keys), Tier::Write, &write_assertion).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the write tier admits its own assertion"
+        );
+
+        let (status, code) = present(write_verifier(&keys), Tier::Write, &read_assertion).await;
+
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(code.as_deref(), Some("unauthenticated"));
     }
 }

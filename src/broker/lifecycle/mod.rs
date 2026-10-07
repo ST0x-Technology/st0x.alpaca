@@ -172,7 +172,8 @@ pub enum ClientOrderIdError {
     InvalidUuid(#[from] uuid::Error),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct OrderPlacement<OrderId> {
     pub order_id: OrderId,
     pub symbol: Symbol,
@@ -197,7 +198,8 @@ pub struct OrderPlacement<OrderId> {
 /// Unlike a fresh placement response, a lookup can omit optional echoed order
 /// terms. Callers must then recover those terms from the durable local intent
 /// rather than fabricate regular-session values.
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RecoveredOrderPlacement<OrderId> {
     pub order_id: OrderId,
     pub symbol: Symbol,
@@ -257,7 +259,8 @@ impl<OrderId: Debug> Debug for OrderUpdate<OrderId> {
 /// confirmation the broker will never produce) nor as a retryable error
 /// (re-sending the cancel can never succeed). Callers resolve `OrderNotFound`
 /// by treating the order as already terminal at the broker.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CancellationOutcome {
     /// The broker accepted the cancel request; the order will reach a
     /// terminal state observable via `get_order_status`.

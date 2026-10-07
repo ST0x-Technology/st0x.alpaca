@@ -1,4 +1,4 @@
-//! Who may call the gateway, and which account a deployment serves.
+//! Who may call the gateway, and which deployment it is.
 
 use serde::{Deserialize, Serialize};
 
@@ -34,21 +34,5 @@ impl Tier {
     }
 }
 
-/// The account a deployment is bound to. Chosen once at startup from config;
-/// no request can name another one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Profile {
-    /// `t0-alpaca`: the T0 hedging account used by st0x.liquidity.
-    T0,
-}
-
-impl Profile {
-    /// Deployment name used in audit records.
-    #[must_use]
-    pub const fn deployment(self) -> &'static str {
-        match self {
-            Self::T0 => "t0-alpaca",
-        }
-    }
-}
+/// Deployment name used in audit records.
+pub const DEPLOYMENT: &str = "t0-alpaca";

@@ -43,6 +43,7 @@ use tracing::{info, warn};
 use crate::core::AlpacaAuth;
 use crate::endpoint::{EndpointError, EndpointRole, validate_origin};
 use crate::rate_limit::{MAX_RETRY_AFTER_HOLD, retry_after_from_response_headers};
+use crate::request_id::GateClosed;
 
 /// Alpaca's token endpoint for live broker partners. Doubles as the
 /// assertion audience, per RFC 7523.
@@ -98,7 +99,8 @@ pub enum KmsJwtError {
     KmsStatus {
         status: u16,
         body: String,
-        /// KMS's `Retry-After` hint on a 429, kept for backpressure.
+        /// KMS's `Retry-After` hint on a 429, kept for backpressure, capped
+        /// at `MAX_RETRY_AFTER_HOLD` like every hold taken from it.
         retry_after: Option<Duration>,
     },
     #[error("Alpaca token endpoint returned HTTP {status}: {body}")]
@@ -106,7 +108,8 @@ pub enum KmsJwtError {
         status: u16,
         body: String,
         /// The endpoint's `Retry-After` hint, captured so a token 429
-        /// keeps its backpressure signal through the error chain.
+        /// keeps its backpressure signal through the error chain, capped at
+        /// `MAX_RETRY_AFTER_HOLD` like every hold taken from it.
         retry_after: Option<Duration>,
     },
     #[error("base64 decode of KMS response failed: {0}")]
@@ -131,6 +134,10 @@ pub enum KmsJwtError {
     ClockBeforeEpoch,
     #[error(transparent)]
     InvalidTokenUrl(#[from] EndpointError),
+    /// The caller's send gate was closed when a mint would have started, so
+    /// no credential request left.
+    #[error(transparent)]
+    NotSent(#[from] GateClosed),
 }
 
 impl KmsJwtError {
@@ -158,7 +165,9 @@ impl KmsJwtError {
             | Self::Claims(_)
             | Self::InvalidHeader(_)
             | Self::ClockBeforeEpoch
-            | Self::InvalidTokenUrl(_) => true,
+            | Self::InvalidTokenUrl(_)
+            // A closed send gate stays closed for the rest of its scope.
+            | Self::NotSent(_) => true,
             Self::Http(_) => false,
         }
     }
@@ -437,6 +446,10 @@ impl KmsJwtAuth {
             });
         }
 
+        // The last point before the mint's first request: a mint whose
+        // caller's send gate closed, while it waited on `mint_lock` or
+        // before, never starts.
+        crate::request_id::ensure_open()?;
         match self.mint().await {
             Ok(token) => Ok(token),
             Err(error) => {
@@ -498,12 +511,12 @@ impl KmsJwtAuth {
             ])
             .send()
             .await?;
-        // Alpaca answered: record its request id and status for the audit,
-        // but do not count the mint as an API request.
+        // Alpaca answered: its request id goes to the audit, but its status
+        // is not the operation's answer.
         let status = resp.status();
-        crate::request_id::record(status, resp.headers());
+        crate::request_id::record_id(resp.headers());
         if !status.is_success() {
-            let retry_after = retry_after_from_response_headers(resp.headers());
+            let retry_after = throttle_hint(resp.headers());
             return Err(KmsJwtError::TokenStatus {
                 status: status.as_u16(),
                 body: truncate_error_body(resp.text().await.unwrap_or_default()),
@@ -639,7 +652,7 @@ impl KmsJwtAuth {
             .await?;
         let status = resp.status();
         if !status.is_success() {
-            let retry_after = retry_after_from_response_headers(resp.headers());
+            let retry_after = throttle_hint(resp.headers());
             return Err(KmsJwtError::KmsStatus {
                 status: status.as_u16(),
                 body: truncate_error_body(resp.text().await.unwrap_or_default()),
@@ -649,6 +662,14 @@ impl KmsJwtAuth {
         let signed: SignResponse = resp.json().await?;
         Ok(BASE64_STD.decode(signed.signature)?)
     }
+}
+
+/// The `Retry-After` hint a failed KMS sign or token exchange carries,
+/// capped at [`MAX_RETRY_AFTER_HOLD`]: the header is server supplied and
+/// unbounded, and a caller (or a gateway relaying it) must not be told to
+/// hold off longer than the mint hold itself lasts.
+fn throttle_hint(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    retry_after_from_response_headers(headers).map(|wait| wait.min(MAX_RETRY_AFTER_HOLD))
 }
 
 /// Error bodies are Google/Alpaca error JSON, but nothing guarantees an
@@ -1151,10 +1172,10 @@ mod tests {
     }
 
     /// A refused mint is the only Alpaca answer an operation gets when authx
-    /// rejects the credential, so its request id must reach the audit. It is
-    /// not an API request and does not count as one.
+    /// rejects the credential, so its request id must reach the audit. Its
+    /// status does not pass for an API answer.
     #[tokio::test]
-    async fn a_refused_mint_records_its_answer_without_counting_a_request() {
+    async fn a_refused_mint_records_its_request_id_but_not_its_status() {
         let server = MockServer::start_async().await;
         let token_mock = server.mock(|when, then| {
             when.method(httpmock::Method::POST).path("/token");
@@ -1182,11 +1203,64 @@ mod tests {
             traffic,
             crate::request_id::Traffic {
                 request_ids: vec!["mint-refused".to_string()],
-                requests_sent: 0,
-                last_status: Some(401),
+                last_status: None,
             }
         );
         token_mock.assert_calls(1);
+    }
+
+    /// A caller that waited on another caller's mint and finds no token
+    /// after it (that mint failed) starts its own mint only while its send
+    /// gate is still open: the gate it passed before waiting does not count.
+    #[tokio::test]
+    async fn a_caller_whose_gate_closed_while_it_waited_on_a_mint_starts_none() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+
+        let server = MockServer::start_async().await;
+        let token_mock = server.mock(|when, then| {
+            when.method(httpmock::Method::POST).path("/token");
+            then.status(500)
+                .delay(Duration::from_millis(300))
+                .body("unavailable");
+        });
+        let (_, pem) = test_key_pem();
+        let auth = KmsJwtAuth::local_pem(
+            "CKWAIT",
+            &pem,
+            reqwest::Client::new(),
+            &server.url("/token"),
+        )
+        .unwrap();
+        let open = Arc::new(AtomicBool::new(true));
+        let gate = {
+            let open = Arc::clone(&open);
+            crate::request_id::SendGate::new(move || open.load(AtomicOrdering::SeqCst))
+        };
+
+        let minting = auth.access_token();
+        let waiting = async {
+            while token_mock.calls_async().await == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            let second = crate::request_id::gated(gate, auth.access_token());
+            let close = async {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                open.store(false, AtomicOrdering::SeqCst);
+            };
+            tokio::join!(second, close).0
+        };
+        let (minted, waited) = tokio::join!(minting, waiting);
+
+        assert!(
+            matches!(minted, Err(KmsJwtError::TokenStatus { status: 500, .. })),
+            "{minted:?}"
+        );
+        assert!(
+            matches!(waited, Err(KmsJwtError::NotSent(GateClosed))),
+            "{waited:?}"
+        );
+        token_mock.assert_calls_async(1).await;
     }
 
     #[tokio::test]
@@ -1492,9 +1566,11 @@ mod tests {
             then.status(429).header("Retry-After", "86400");
         });
         let auth = stub_auth(&server);
-        assert!(auth.access_token().await.unwrap_err().is_rate_limited());
-        let error = auth.access_token().await.unwrap_err();
-        assert!(error.retry_after().unwrap() <= MAX_RETRY_AFTER_HOLD);
+        let first = auth.access_token().await.unwrap_err();
+        assert!(first.is_rate_limited());
+        assert_eq!(first.retry_after(), Some(MAX_RETRY_AFTER_HOLD));
+        let held = auth.access_token().await.unwrap_err();
+        assert!(held.retry_after().unwrap() <= MAX_RETRY_AFTER_HOLD);
         exchange.assert_calls(1);
     }
 }

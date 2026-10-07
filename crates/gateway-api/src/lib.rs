@@ -14,7 +14,7 @@ pub mod failure;
 pub mod ops;
 pub mod record;
 
-pub use access::{Profile, Tier};
+pub use access::{DEPLOYMENT, Tier};
 pub use failure::{ErrorBody, ErrorCode, Outcome, RejectionReason};
 pub use ops::{Method, Operation};
 pub use record::{AUDIT_TARGET, AuditEvent, AuditPhase};

@@ -3,14 +3,14 @@
 use axum::extract::State;
 use axum::response::Response;
 use axum::routing::{MethodRouter, get, post};
-use st0x_alpaca::broker::{AlpacaLimitOrder, ClientOrderId, ConversionOrder};
+use st0x_alpaca::broker::{AlpacaLimitOrder, ClientOrderId, ConversionOrder, OrderPlacement};
 use st0x_alpaca_gateway_api::dto::orders::{
-    CancelOrderRequest, CancelOrderResponse, ClientOrderIdPath, Conversion,
-    ConversionOrderResponse, ConversionRequest, ExactLimitOrderRequest, FindConversionResponse,
-    FindOrderResponse, LimitOrderRequest, MarketOrderRequest, OrderIdPath, OrderStateResponse,
-    PlacementResponse, RecoverOrderRequest, RecoverOrderResponse,
+    CancelOrderRequest, CancelOrderResponse, Conversion, ConversionRequest, FindConversionResponse,
+    FindOrderResponse, LimitOrderRequest, MarketOrderRequest, RecoverOrderRequest,
+    RecoverOrderResponse,
 };
 use st0x_alpaca_gateway_api::{Operation, Tier};
+use uuid::Uuid;
 
 use crate::answer::{Failure, Sent, broker, placement};
 use crate::extract::{Body, Params};
@@ -62,6 +62,12 @@ fn require_bot_lookup_key(tier: Tier, key: &ClientOrderId) -> Result<(), Failure
     }
 }
 
+/// The answer of a placement: the order, which the audit record names.
+fn placed(placement: OrderPlacement<String>) -> Done<OrderPlacement<String>> {
+    let order_id = placement.order_id.clone();
+    Done::new(placement, &order_id)
+}
+
 async fn place_market(
     State(state): State<AppState>,
     call: Call,
@@ -74,17 +80,15 @@ async fn place_market(
         .note("side", &request.direction)
         .note("quantity", &request.shares);
     let tier = call.principal.tier;
-    let work_state = state.clone();
     state
-        .mutate(call, intent, async move {
+        .run(call, intent, move |state, _| async move {
             require_key_form(tier, &request.client_order_id)?;
-            let placed = work_state
+            state
                 .broker
                 .place_market_order_reporting(request.into())
                 .await
-                .map_err(|failure| placement(&failure))?;
-            let order_id = placed.order_id.clone();
-            Ok(Done::new(PlacementResponse::from(placed), &order_id))
+                .map(placed)
+                .map_err(|failure| placement(&failure))
         })
         .await
 }
@@ -102,17 +106,15 @@ async fn place_limit(
         .note("quantity", &request.shares)
         .note("limitPrice", &request.limit_price);
     let tier = call.principal.tier;
-    let work_state = state.clone();
     state
-        .mutate(call, intent, async move {
+        .run(call, intent, move |state, _| async move {
             require_key_form(tier, &request.client_order_id)?;
-            let placed = work_state
+            state
                 .broker
                 .place_limit_order_reporting(request.into())
                 .await
-                .map_err(|failure| placement(&failure))?;
-            let order_id = placed.order_id.clone();
-            Ok(Done::new(PlacementResponse::from(placed), &order_id))
+                .map(placed)
+                .map_err(|failure| placement(&failure))
         })
         .await
 }
@@ -120,7 +122,7 @@ async fn place_limit(
 async fn place_exact_limit(
     State(state): State<AppState>,
     call: Call,
-    Body(request): Body<ExactLimitOrderRequest>,
+    Body(request): Body<LimitOrderRequest>,
 ) -> Response {
     let intent = Intent::of(&request)
         .key(&request.client_order_id)
@@ -130,20 +132,18 @@ async fn place_exact_limit(
         .note("quantity", &request.shares)
         .note("limitPrice", &request.limit_price);
     let tier = call.principal.tier;
-    let work_state = state.clone();
     state
-        .mutate(call, intent, async move {
+        .run(call, intent, move |state, _| async move {
             require_key_form(tier, &request.client_order_id)?;
             // Nothing is sent when the limit price does not convert.
             let order =
                 AlpacaLimitOrder::try_from(request).map_err(|error| broker(&error, Sent::Read))?;
-            let placed = work_state
+            state
                 .broker
                 .place_alpaca_limit_order_reporting(order)
                 .await
-                .map_err(|failure| placement(&failure))?;
-            let order_id = placed.order_id.clone();
-            Ok(Done::new(PlacementResponse::from(placed), &order_id))
+                .map(placed)
+                .map_err(|failure| placement(&failure))
         })
         .await
 }
@@ -151,16 +151,15 @@ async fn place_exact_limit(
 async fn order(
     State(state): State<AppState>,
     call: Call,
-    Params(path): Params<OrderIdPath>,
+    Params(order_id): Params<Uuid>,
 ) -> Response {
-    let intent = Intent::default().key(&path.order_id);
+    let intent = Intent::default().key(&order_id);
     state
-        .read(call, intent, async {
+        .read(call, intent, |state| async move {
             state
                 .broker
-                .get_order_status(&path.order_id.to_string())
+                .get_order_status(&order_id.to_string())
                 .await
-                .map(OrderStateResponse::from)
                 .map_err(|error| broker(&error, Sent::Read))
         })
         .await
@@ -169,20 +168,18 @@ async fn order(
 async fn find_order(
     State(state): State<AppState>,
     call: Call,
-    Params(path): Params<ClientOrderIdPath>,
+    Params(client_order_id): Params<ClientOrderId>,
 ) -> Response {
     let tier = call.principal.tier;
-    let intent = Intent::default().key(&path.client_order_id);
+    let intent = Intent::default().key(&client_order_id);
     state
-        .read(call, intent, async {
-            require_bot_lookup_key(tier, &path.client_order_id)?;
+        .read(call, intent, |state| async move {
+            require_bot_lookup_key(tier, &client_order_id)?;
             state
                 .broker
-                .get_order_by_client_order_id(&path.client_order_id)
+                .get_order_by_client_order_id(&client_order_id)
                 .await
-                .map(|order| FindOrderResponse {
-                    order: order.map(Into::into),
-                })
+                .map(|order| FindOrderResponse { order })
                 .map_err(|error| broker(&error, Sent::Read))
         })
         .await
@@ -196,15 +193,13 @@ async fn recover_order(
     let tier = call.principal.tier;
     let intent = Intent::default().key(&request.client_order_id);
     state
-        .read(call, intent, async {
+        .read(call, intent, |state| async move {
             require_bot_lookup_key(tier, &request.client_order_id)?;
             state
                 .broker
                 .recover_order_by_client_id(&request.into())
                 .await
-                .map(|order| RecoverOrderResponse {
-                    order: order.map(Into::into),
-                })
+                .map(|order| RecoverOrderResponse { order })
                 .map_err(|error| broker(&error, Sent::Read))
         })
         .await
@@ -213,27 +208,21 @@ async fn recover_order(
 async fn cancel(
     State(state): State<AppState>,
     call: Call,
-    Params(path): Params<OrderIdPath>,
+    Params(order_id): Params<Uuid>,
     Body(request): Body<CancelOrderRequest>,
 ) -> Response {
-    let order_id = path.order_id.to_string();
+    let order_id = order_id.to_string();
     let intent = Intent::of(&request)
         .key(&order_id)
         .reason(request.reason.as_deref());
-    let work_state = state.clone();
     state
-        .mutate(call, intent, async move {
-            let outcome = work_state
+        .run(call, intent, move |state, _| async move {
+            let outcome = state
                 .broker
                 .cancel_order(&order_id)
                 .await
                 .map_err(|error| broker(&error, Sent::Mutation))?;
-            Ok(Done::new(
-                CancelOrderResponse {
-                    outcome: outcome.into(),
-                },
-                &order_id,
-            ))
+            Ok(Done::new(CancelOrderResponse { outcome }, &order_id))
         })
         .await
 }
@@ -255,11 +244,10 @@ async fn submit_conversion(
         .note("asset", &asset)
         .note("amount", &amount);
     let tier = call.principal.tier;
-    let work_state = state.clone();
     state
-        .mutate(call, intent, async move {
+        .run(call, intent, move |state, _| async move {
             require_key_form(tier, &request.client_order_id)?;
-            let order = work_state
+            let order = state
                 .broker
                 .submit_conversion(
                     ConversionOrder::from(request.conversion),
@@ -268,7 +256,7 @@ async fn submit_conversion(
                 .await
                 .map_err(|error| broker(&error, Sent::Mutation))?;
             let order_id = order.id;
-            Ok(Done::new(ConversionOrderResponse::from(order), &order_id))
+            Ok(Done::new(order, &order_id))
         })
         .await
 }
@@ -276,16 +264,15 @@ async fn submit_conversion(
 async fn conversion(
     State(state): State<AppState>,
     call: Call,
-    Params(path): Params<OrderIdPath>,
+    Params(order_id): Params<Uuid>,
 ) -> Response {
-    let intent = Intent::default().key(&path.order_id);
+    let intent = Intent::default().key(&order_id);
     state
-        .read(call, intent, async {
+        .read(call, intent, |state| async move {
             state
                 .broker
-                .get_conversion_order(path.order_id)
+                .get_conversion_order(order_id)
                 .await
-                .map(ConversionOrderResponse::from)
                 .map_err(|error| broker(&error, Sent::Read))
         })
         .await
@@ -294,20 +281,18 @@ async fn conversion(
 async fn find_conversion(
     State(state): State<AppState>,
     call: Call,
-    Params(path): Params<ClientOrderIdPath>,
+    Params(client_order_id): Params<ClientOrderId>,
 ) -> Response {
     let tier = call.principal.tier;
-    let intent = Intent::default().key(&path.client_order_id);
+    let intent = Intent::default().key(&client_order_id);
     state
-        .read(call, intent, async {
-            require_bot_lookup_key(tier, &path.client_order_id)?;
+        .read(call, intent, |state| async move {
+            require_bot_lookup_key(tier, &client_order_id)?;
             state
                 .broker
-                .find_conversion_order(&path.client_order_id)
+                .find_conversion_order(&client_order_id)
                 .await
-                .map(|order| FindConversionResponse {
-                    order: order.map(Into::into),
-                })
+                .map(|order| FindConversionResponse { order })
                 .map_err(|error| broker(&error, Sent::Read))
         })
         .await

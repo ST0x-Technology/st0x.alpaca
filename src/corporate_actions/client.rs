@@ -135,11 +135,9 @@ impl CorporateActionStreamClient {
             request.query(&query)
         };
 
-        let response = crate::request_id::send(request).await?;
-        let status = response.status();
-        crate::request_id::record(status, response.headers());
-        if !status.is_success() {
-            return Err(CorporateActionStreamError::HttpStatus(status));
+        let response = request.send().await?;
+        if !response.status().is_success() {
+            return Err(CorporateActionStreamError::HttpStatus(response.status()));
         }
         let content_type = response
             .headers()

@@ -377,24 +377,6 @@ impl AlpacaWalletService {
     pub async fn list_all_transfers(&self) -> Result<Vec<Transfer>, AlpacaWalletError> {
         transfer::list_all_transfers(&self.client).await
     }
-
-    /// Finds a transfer in either direction by its onchain transaction hash
-    /// with a single scan of the account's transfer list, no polling. Only
-    /// the matched row is parsed as a full [`Transfer`]: a row on another
-    /// chain, a row without a direction, or an unparsable row carrying
-    /// another hash cannot fail the lookup. Returns `None` when no listed
-    /// transfer carries the hash.
-    ///
-    /// # Errors
-    ///
-    /// Returns the HTTP error, or the parse error of the list or of the
-    /// matched row.
-    pub async fn find_transfer_by_tx_hash(
-        &self,
-        tx_hash: &TxHash,
-    ) -> Result<Option<Transfer>, AlpacaWalletError> {
-        transfer::find_transfer_by_tx_hash(&self.client, tx_hash).await
-    }
 }
 
 /// Reads Alpaca directly through the service's own client.
@@ -406,11 +388,11 @@ impl WalletTransfers for AlpacaWalletService {
         WalletTransfers::get_transfer(&*self.client, transfer_id)
     }
 
-    fn find_transfer_by_tx_hash(
+    fn find_deposit_by_tx_hash(
         &self,
         tx_hash: &TxHash,
     ) -> impl Future<Output = Result<Option<Transfer>, AlpacaWalletError>> + Send {
-        transfer::find_transfer_by_tx_hash(&self.client, tx_hash)
+        transfer::find_deposit_by_tx_hash(&self.client, tx_hash)
     }
 }
 
@@ -869,7 +851,6 @@ mod tests {
             traffic.request_ids,
             ["req-list", "req-delete-aaa", "req-delete-bbb"]
         );
-        assert_eq!(traffic.requests_sent, 3);
         assert_eq!(traffic.last_status, Some(404));
     }
 
@@ -877,7 +858,7 @@ mod tests {
     /// without a direction and an unparsable row carrying another EVM hash
     /// are all invisible, so they cannot fail a lookup they do not match.
     #[tokio::test]
-    async fn find_transfer_by_tx_hash_ignores_rows_it_does_not_match() {
+    async fn find_deposit_by_tx_hash_ignores_rows_it_does_not_match() {
         let server = MockServer::start();
         let service = create_test_service(&server);
         let tx_hash =
@@ -885,7 +866,7 @@ mod tests {
         let transfer_id = Uuid::new_v4();
         let evm_row = |id: Uuid, hash: TxHash, amount: &str| {
             json!({
-                "id": id, "direction": "OUTGOING", "amount": amount,
+                "id": id, "direction": "INCOMING", "amount": amount,
                 "chain": "ethereum", "asset": "USDC",
                 "from_address": "0x0000000000000000000000000000000000000001",
                 "to_address": "0x1234567890abcdef1234567890abcdef12345678",
@@ -917,18 +898,18 @@ mod tests {
         });
 
         let found = service
-            .find_transfer_by_tx_hash(&tx_hash)
+            .find_deposit_by_tx_hash(&tx_hash)
             .await
             .unwrap()
             .expect("the matching transfer behind the rows it does not match");
         let missing = service
-            .find_transfer_by_tx_hash(&TxHash::repeat_byte(0x22))
+            .find_deposit_by_tx_hash(&TxHash::repeat_byte(0x22))
             .await
             .unwrap();
 
         assert_eq!(found.id, transfer_id.into());
         assert_eq!(found.tx, Some(tx_hash));
-        assert_eq!(found.direction, TransferDirection::Outgoing);
+        assert_eq!(found.direction, TransferDirection::Incoming);
         assert_eq!(missing.map(|transfer| transfer.id), None);
         transfers.assert_calls(2);
     }

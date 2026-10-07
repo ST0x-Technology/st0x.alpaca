@@ -4,12 +4,11 @@ use axum::extract::State;
 use axum::response::Response;
 use axum::routing::{MethodRouter, get};
 use st0x_alpaca::broker::AccountActivitiesQuery;
-use st0x_alpaca_gateway_api::Operation;
 use st0x_alpaca_gateway_api::dto::SymbolPath;
 use st0x_alpaca_gateway_api::dto::account::{
-    ActivitiesQuery, ActivitiesResponse, FundsResponse, InventoryResponse, PositionMarkResponse,
-    WithdrawableCashResponse,
+    ActivitiesQuery, ActivitiesResponse, PositionMarkResponse, WithdrawableCashResponse,
 };
+use st0x_alpaca_gateway_api::{Operation, Tier};
 
 use crate::answer::{Sent, broker};
 use crate::extract::{Params, Query};
@@ -28,12 +27,11 @@ pub(super) fn route(operation: Operation) -> Option<MethodRouter<AppState>> {
 
 async fn funds(State(state): State<AppState>, call: Call) -> Response {
     state
-        .read(call, Intent::default(), async {
+        .read(call, Intent::default(), |state| async move {
             state
                 .broker
                 .account_funds()
                 .await
-                .map(FundsResponse::from)
                 .map_err(|error| broker(&error, Sent::Read))
         })
         .await
@@ -41,7 +39,7 @@ async fn funds(State(state): State<AppState>, call: Call) -> Response {
 
 async fn withdrawable_cash(State(state): State<AppState>, call: Call) -> Response {
     state
-        .read(call, Intent::default(), async {
+        .read(call, Intent::default(), |state| async move {
             state
                 .broker
                 .withdrawable_cash_cents()
@@ -54,12 +52,11 @@ async fn withdrawable_cash(State(state): State<AppState>, call: Call) -> Respons
 
 async fn inventory(State(state): State<AppState>, call: Call) -> Response {
     state
-        .read(call, Intent::default(), async {
+        .read(call, Intent::default(), |state| async move {
             state
                 .broker
                 .fetch_inventory()
                 .await
-                .map(InventoryResponse::from)
                 .map_err(|error| broker(&error, Sent::Read))
         })
         .await
@@ -72,7 +69,7 @@ async fn position_mark(
 ) -> Response {
     let intent = Intent::default().key(&path.symbol);
     state
-        .read(call, intent, async {
+        .read(call, intent, |state| async move {
             state
                 .broker
                 .fetch_position_mark(&path.symbol)
@@ -83,18 +80,11 @@ async fn position_mark(
         .await
 }
 
-/// Page cap of a bot `activities.list`, the direct context method's cap.
-const BOT_ACTIVITY_PAGES: usize = 1000;
-
-/// Pages `activities.list` may read for `call`. A human call reads at most
-/// the units its admission charged, one per Alpaca request, so the shared
-/// human budget counts every page it can send.
-fn activity_pages(call: &Call) -> usize {
-    if call.principal.tier.is_human() {
-        usize::try_from(call.operation.human_budget_cost()).unwrap_or(0)
-    } else {
-        BOT_ACTIVITY_PAGES
-    }
+/// Pages `activities.list` may read: the direct context method's cap for
+/// the bot, and a small one for a human call, which takes one unit of the
+/// human budget.
+fn activity_pages(tier: Tier) -> usize {
+    if tier.is_human() { 10 } else { 1000 }
 }
 
 async fn activities(
@@ -115,17 +105,15 @@ async fn activities(
         after: query.after,
         until: query.until,
     };
-    let max_pages = activity_pages(&call);
+    let max_pages = activity_pages(call.principal.tier);
 
     state
-        .read(call, Intent::default(), async {
+        .read(call, Intent::default(), move |state| async move {
             state
                 .broker
                 .fetch_account_activities(&query, max_pages)
                 .await
-                .map(|activities| ActivitiesResponse {
-                    activities: activities.into_iter().map(Into::into).collect(),
-                })
+                .map(|activities| ActivitiesResponse { activities })
                 .map_err(|error| broker(&error, Sent::Read))
         })
         .await

@@ -9,12 +9,13 @@
 use alloy_primitives::TxHash;
 use backon::{ExponentialBuilder, Retryable};
 use std::time::Duration;
-use tokio::time::{Instant, sleep, timeout};
+use tokio::time::{Instant, sleep};
 use tracing::{info, warn};
 
 use super::client::AlpacaWalletError;
 use super::transfer::{AlpacaTransferId, Transfer, TransferStatus, WalletTransfers};
-use crate::core::{Permanence, response_status_permanence};
+use crate::core::Permanence;
+use crate::rate_limit::{next_poll_delay, poll_deadline, read_before};
 
 pub struct PollingConfig {
     pub interval: Duration,
@@ -38,15 +39,15 @@ impl Default for PollingConfig {
 
 /// Polls a transfer until it reaches a terminal state (Complete or Failed).
 ///
-/// Server errors (5xx) and transient gateway hop failures are retried with
-/// exponential backoff; any other read error ends the poll.
+/// A failed read the poll retries (`is_retried`) is read again with
+/// exponential backoff; any other read error ends the poll. No read starts
+/// at or after the timeout, and a read still running there is dropped.
 ///
 /// # Errors
 ///
-/// - `TransferTimeout` once `config.timeout` passes.
-/// - `InvalidStatusTransition` when the status moves backwards.
-/// - The read error once retries run out, or at once when it is not
-///   retried.
+/// `TransferTimeout` once `config.timeout` passes, `InvalidStatusTransition`
+/// when the status moves backwards, or the read error once retries run out
+/// or at once when it is not retried.
 pub async fn poll_transfer_until_complete_with(
     transfers: &impl WalletTransfers,
     transfer_id: &AlpacaTransferId,
@@ -55,6 +56,11 @@ pub async fn poll_transfer_until_complete_with(
     info!(target: "wallet", %transfer_id, timeout = ?config.timeout, "Polling transfer status");
 
     let start = Instant::now();
+    let deadline = poll_deadline(start, config.timeout);
+    let timed_out = || AlpacaWalletError::TransferTimeout {
+        transfer_id: *transfer_id,
+        elapsed: start.elapsed(),
+    };
     let mut last_status = None;
 
     let retry_strategy = ExponentialBuilder::default()
@@ -63,12 +69,11 @@ pub async fn poll_transfer_until_complete_with(
         .with_max_delay(config.max_retry_delay);
 
     loop {
-        check_timeout(&start, config.timeout, *transfer_id)?;
-
-        let transfer = (|| transfers.get_transfer(transfer_id))
-            .retry(retry_strategy)
-            .when(retryable_poll_read_error)
-            .await?;
+        let transfer =
+            (|| read_before(deadline, || transfers.get_transfer(transfer_id), timed_out))
+                .retry(retry_strategy)
+                .when(is_retried)
+                .await?;
 
         validate_and_log_status_change(*transfer_id, last_status, &transfer)?;
 
@@ -79,26 +84,23 @@ pub async fn poll_transfer_until_complete_with(
             }
             TransferStatus::Pending | TransferStatus::Processing => {
                 last_status = Some(transfer.status);
-                sleep(config.interval).await;
+                sleep(next_poll_delay(config.interval, deadline)).await;
             }
         }
     }
 }
 
 /// Polls a transfer until it is `Complete` and Alpaca reports its onchain tx
-/// hash. A hash on a transfer that is not yet `Complete` is ignored.
+/// hash. A hash on a transfer that is not yet `Complete` is ignored. A failed
+/// read the poll retries (`is_retried`) is read again at the next interval,
+/// or after the `Retry-After` it relayed when that is longer. No read starts
+/// at or after the timeout, and a read still running there is dropped.
 ///
 /// # Errors
 ///
-/// - `TransferTimeout` if no completed hash is reported within the polling
-///   timeout. Transient read failures (5xx, 408, 429, transport errors,
-///   transient gateway hop failures, auth errors that are not deterministic)
-///   are retried until then, honoring `Retry-After`.
-/// - `TransferFailed` or `FailedTransferHasTx` as soon as the transfer is
-///   `Failed`.
-/// - Permanent read errors, returned without retry: `TransferNotFound`,
-///   other HTTP statuses that do not clear on their own, deterministic auth
-///   errors, permanent gateway refusals, and response decoding errors.
+/// `TransferTimeout` once `config.timeout` passes, `TransferFailed` or
+/// `FailedTransferHasTx` as soon as the transfer is `Failed`, or a read
+/// error that is not retried.
 pub async fn poll_transfer_tx_hash_with(
     transfers: &impl WalletTransfers,
     transfer_id: &AlpacaTransferId,
@@ -107,58 +109,41 @@ pub async fn poll_transfer_tx_hash_with(
     info!(target: "wallet", %transfer_id, timeout = ?config.timeout, "Polling transfer tx hash");
 
     let start = Instant::now();
+    let deadline = poll_deadline(start, config.timeout);
+    let timed_out = || AlpacaWalletError::TransferTimeout {
+        transfer_id: *transfer_id,
+        elapsed: start.elapsed(),
+    };
 
     loop {
-        check_timeout(&start, config.timeout, *transfer_id)?;
-
-        let remaining = config.timeout.saturating_sub(start.elapsed());
-        let read = timeout(remaining, transfers.get_transfer(transfer_id))
-            .await
-            .map_err(|_| AlpacaWalletError::TransferTimeout {
-                transfer_id: *transfer_id,
-                elapsed: start.elapsed(),
-            })?;
+        let read = read_before(deadline, || transfers.get_transfer(transfer_id), timed_out).await;
 
         let delay = match read {
             Ok(transfer) => match transfer_tx_hash_state(&transfer, *transfer_id)? {
                 Some(tx_hash) => return Ok(tx_hash),
                 None => config.interval,
             },
-            Err(error) => {
-                if !retryable_transfer_read_error(&error) {
-                    return Err(error);
-                }
-
-                let retry_after = error.backpressure().and_then(|hint| hint.retry_after);
+            Err(error) if is_retried(&error) => {
                 warn!(target: "wallet", %transfer_id, %error, "Transfer read failed while waiting for its tx hash");
-                retry_after.map_or(config.interval, |hint| hint.max(config.interval))
+                error
+                    .backpressure()
+                    .and_then(|hint| hint.retry_after)
+                    .map_or(config.interval, |hint| hint.max(config.interval))
             }
+            Err(error) => return Err(error),
         };
 
-        sleep(delay.min(config.timeout.saturating_sub(start.elapsed()))).await;
+        sleep(next_poll_delay(delay, deadline)).await;
     }
 }
 
-/// Retry check of the two backoff polls: a server error, or a gateway hop
-/// failure the gateway classified as transient.
-fn retryable_poll_read_error(error: &AlpacaWalletError) -> bool {
-    match error {
-        AlpacaWalletError::ApiError { status, .. } => status.is_server_error(),
-        AlpacaWalletError::Gateway(hop) => hop.permanence() == Permanence::Transient,
-        _ => false,
-    }
-}
-
-fn retryable_transfer_read_error(error: &AlpacaWalletError) -> bool {
-    match error {
-        AlpacaWalletError::ApiError { status, .. } => {
-            response_status_permanence(*status) == Permanence::Transient
-        }
-        AlpacaWalletError::Auth(error) => !error.is_deterministic(),
-        AlpacaWalletError::Reqwest(_) => true,
-        AlpacaWalletError::Gateway(hop) => hop.permanence() == Permanence::Transient,
-        _ => false,
-    }
+/// The one retry rule of the three wallet polls: a read error a later read
+/// can clear by [`AlpacaWalletError::permanence`] (a 5xx, 408 or 429, a
+/// transport failure, a mint failure that is not deterministic, a gateway
+/// hop the gateway classified as transient) is read again; any other
+/// error, the poll's own timeout included, ends the poll.
+fn is_retried(error: &AlpacaWalletError) -> bool {
+    error.permanence() == Permanence::Transient
 }
 
 fn transfer_tx_hash_state(
@@ -176,23 +161,6 @@ fn transfer_tx_hash_state(
             Ok(None)
         }
     }
-}
-
-fn check_timeout(
-    start: &Instant,
-    timeout: Duration,
-    transfer_id: AlpacaTransferId,
-) -> Result<(), AlpacaWalletError> {
-    let elapsed = start.elapsed();
-
-    if elapsed >= timeout {
-        return Err(AlpacaWalletError::TransferTimeout {
-            transfer_id,
-            elapsed,
-        });
-    }
-
-    Ok(())
 }
 
 /// Represents a validated status transition.
@@ -266,19 +234,18 @@ fn log_transfer_final_status(transfer_id: AlpacaTransferId, status: TransferStat
     }
 }
 
-/// Polls for a deposit transfer matching the given tx hash until it is
-/// detected and reaches a terminal state.
-///
-/// This is used to wait for Alpaca to detect an incoming deposit by its
-/// onchain tx hash. Server errors (5xx) and transient gateway hop failures of
-/// the lookup are retried with exponential backoff.
+/// Polls for an incoming deposit transfer matching the given tx hash, through
+/// [`WalletTransfers::find_deposit_by_tx_hash`], until it is detected and
+/// reaches a terminal state. A failed lookup the poll retries
+/// (`is_retried`) is looked up again with exponential backoff. No lookup
+/// starts at or after the timeout, and a lookup still running there is
+/// dropped.
 ///
 /// # Errors
 ///
-/// - `DepositTimeout` once `config.timeout` passes.
-/// - `InvalidDepositTransition` when the status moves backwards.
-/// - The lookup error once retries run out, or at once when it is not
-///   retried.
+/// `DepositTimeout` once `config.timeout` passes, `InvalidDepositTransition`
+/// when the status moves backwards, or the lookup error once retries run out
+/// or at once when it is not retried.
 pub async fn poll_deposit_by_tx_hash_with(
     transfers: &impl WalletTransfers,
     tx_hash: &TxHash,
@@ -287,6 +254,11 @@ pub async fn poll_deposit_by_tx_hash_with(
     info!(target: "wallet", %tx_hash, timeout = ?config.timeout, "Polling deposit status");
 
     let start = Instant::now();
+    let deadline = poll_deadline(start, config.timeout);
+    let timed_out = || AlpacaWalletError::DepositTimeout {
+        tx_hash: *tx_hash,
+        elapsed: start.elapsed(),
+    };
     let mut last_status: Option<TransferStatus> = None;
 
     let retry_strategy = ExponentialBuilder::default()
@@ -295,16 +267,20 @@ pub async fn poll_deposit_by_tx_hash_with(
         .with_max_delay(config.max_retry_delay);
 
     loop {
-        check_deposit_timeout(&start, config.timeout, *tx_hash)?;
-
-        let maybe_transfer = (|| transfers.find_transfer_by_tx_hash(tx_hash))
-            .retry(retry_strategy)
-            .when(retryable_poll_read_error)
-            .await?;
+        let maybe_transfer = (|| {
+            read_before(
+                deadline,
+                || transfers.find_deposit_by_tx_hash(tx_hash),
+                timed_out,
+            )
+        })
+        .retry(retry_strategy)
+        .when(is_retried)
+        .await?;
 
         let Some(transfer) = maybe_transfer else {
             info!(target: "wallet", %tx_hash, "Deposit not yet detected, polling...");
-            sleep(config.interval).await;
+            sleep(next_poll_delay(config.interval, deadline)).await;
             continue;
         };
 
@@ -317,24 +293,10 @@ pub async fn poll_deposit_by_tx_hash_with(
             }
             TransferStatus::Pending | TransferStatus::Processing => {
                 last_status = Some(transfer.status);
-                sleep(config.interval).await;
+                sleep(next_poll_delay(config.interval, deadline)).await;
             }
         }
     }
-}
-
-fn check_deposit_timeout(
-    start: &Instant,
-    timeout: Duration,
-    tx_hash: TxHash,
-) -> Result<(), AlpacaWalletError> {
-    let elapsed = start.elapsed();
-
-    if elapsed >= timeout {
-        return Err(AlpacaWalletError::DepositTimeout { tx_hash, elapsed });
-    }
-
-    Ok(())
 }
 
 fn validate_and_log_deposit_status_change(
@@ -396,7 +358,6 @@ mod tests {
     use crate::broker::AlpacaAccountId;
     use crate::core::{AlpacaAuth, GatewayHopError};
     use crate::wallet::client::AlpacaWalletClient;
-    use crate::wallet::transfer::TransferDirection;
 
     const TEST_ACCOUNT_ID: AlpacaAccountId =
         AlpacaAccountId::new(uuid!("904837e3-3b76-47ec-b432-046db621571b"));
@@ -1335,36 +1296,26 @@ mod tests {
         transfers_mock.assert();
     }
 
-    /// Answers each transfer read and each tx hash lookup with the next
-    /// scripted result, the way a gateway client would.
+    /// Answers each transfer read and each deposit lookup with the next
+    /// scripted result.
     struct ScriptedTransfers {
         reads: RefCell<VecDeque<Result<Transfer, AlpacaWalletError>>>,
-        lookups: RefCell<VecDeque<Result<Option<Transfer>, AlpacaWalletError>>>,
+        deposits: RefCell<VecDeque<Result<Option<Transfer>, AlpacaWalletError>>>,
     }
 
     impl ScriptedTransfers {
-        fn reading(reads: impl IntoIterator<Item = Result<Transfer, AlpacaWalletError>>) -> Self {
-            Self {
-                reads: RefCell::new(reads.into_iter().collect()),
-                lookups: RefCell::default(),
-            }
-        }
-
-        fn looking_up(
-            lookups: impl IntoIterator<Item = Result<Option<Transfer>, AlpacaWalletError>>,
+        fn new(
+            reads: Vec<Result<Transfer, AlpacaWalletError>>,
+            deposits: Vec<Result<Option<Transfer>, AlpacaWalletError>>,
         ) -> Self {
             Self {
-                reads: RefCell::default(),
-                lookups: RefCell::new(lookups.into_iter().collect()),
+                reads: RefCell::new(reads.into()),
+                deposits: RefCell::new(deposits.into()),
             }
         }
 
-        fn reads_left(&self) -> usize {
-            self.reads.borrow().len()
-        }
-
-        fn lookups_left(&self) -> usize {
-            self.lookups.borrow().len()
+        fn left(&self) -> usize {
+            self.reads.borrow().len() + self.deposits.borrow().len()
         }
     }
 
@@ -1377,252 +1328,114 @@ mod tests {
             async move { next.expect("the poll read more transfers than scripted") }
         }
 
-        fn find_transfer_by_tx_hash(
+        fn find_deposit_by_tx_hash(
             &self,
             _tx_hash: &TxHash,
         ) -> impl Future<Output = Result<Option<Transfer>, AlpacaWalletError>> + Send {
-            let next = self.lookups.borrow_mut().pop_front();
-            async move { next.expect("the poll looked up more transfers than scripted") }
+            let next = self.deposits.borrow_mut().pop_front();
+            async move { next.expect("the poll looked up more deposits than scripted") }
         }
     }
 
-    fn gateway_failure() -> AlpacaWalletError {
-        AlpacaWalletError::Gateway(GatewayHopError::transport("gateway unreachable"))
-    }
-
-    /// A refusal the gateway decided itself, `forbidden` say: retrying it
-    /// cannot succeed.
-    fn gateway_refusal() -> AlpacaWalletError {
-        AlpacaWalletError::Gateway(GatewayHopError {
-            retryable: false,
-            ..GatewayHopError::transport("forbidden")
-        })
-    }
-
-    fn api_error(status: StatusCode) -> AlpacaWalletError {
-        AlpacaWalletError::ApiError {
-            status,
-            message: String::new(),
-            retry_after: None,
-        }
-    }
-
-    fn deposit(transfer_id: Uuid, status: &str, tx_hash: TxHash) -> Transfer {
-        let mut transfer = transfer_for_hash_poll(transfer_id, status, Some(tx_hash));
-        transfer.direction = TransferDirection::Incoming;
-        transfer
-    }
-
-    fn fast_polling() -> PollingConfig {
+    fn fast_polling(timeout: Duration) -> PollingConfig {
         PollingConfig {
             interval: Duration::from_millis(1),
-            timeout: Duration::from_secs(5),
+            timeout,
             max_retries: 3,
             min_retry_delay: Duration::from_millis(1),
             max_retry_delay: Duration::from_millis(5),
         }
     }
 
+    /// The retry rule the three polls share: a read error `permanence` calls
+    /// transient is read again, and any other ends the poll on that read.
     #[tokio::test]
-    async fn generic_transfer_poll_retries_gateway_failures_like_server_errors() {
-        let transfer_id = Uuid::new_v4();
-        let transfers = ScriptedTransfers::reading([
-            Err(gateway_failure()),
-            Err(api_error(StatusCode::SERVICE_UNAVAILABLE)),
-            Ok(transfer_for_hash_poll(transfer_id, "PENDING", None)),
-            Err(gateway_failure()),
-            Ok(transfer_for_hash_poll(transfer_id, "COMPLETE", None)),
-        ]);
+    async fn wallet_polls_retry_only_a_transient_read_error() {
+        fn api_error(status: StatusCode) -> AlpacaWalletError {
+            AlpacaWalletError::ApiError {
+                status,
+                message: String::new(),
+                retry_after: None,
+            }
+        }
 
-        let transfer =
-            poll_transfer_until_complete_with(&transfers, &transfer_id.into(), &fast_polling())
-                .await
-                .unwrap();
+        fn hop(retryable: bool) -> AlpacaWalletError {
+            AlpacaWalletError::Gateway(GatewayHopError {
+                retryable,
+                ..GatewayHopError::transport("gateway unreachable")
+            })
+        }
 
-        assert_eq!(transfer.status, TransferStatus::Complete);
-        assert_eq!(transfers.reads_left(), 0);
-    }
-
-    #[tokio::test]
-    async fn generic_transfer_poll_returns_a_client_error_without_retry() {
-        let transfer_id = Uuid::new_v4();
-        let transfers = ScriptedTransfers::reading([
-            Err(api_error(StatusCode::BAD_REQUEST)),
-            Ok(transfer_for_hash_poll(transfer_id, "COMPLETE", None)),
-        ]);
-
-        let error =
-            poll_transfer_until_complete_with(&transfers, &transfer_id.into(), &fast_polling())
-                .await
-                .unwrap_err();
-
-        assert!(
-            matches!(error, AlpacaWalletError::ApiError { status, .. } if status == StatusCode::BAD_REQUEST),
-            "{error:?}"
-        );
-        assert_eq!(transfers.reads_left(), 1);
-    }
-
-    #[tokio::test]
-    async fn generic_transfer_poll_returns_a_gateway_refusal_without_retry() {
-        let transfer_id = Uuid::new_v4();
-        let transfers = ScriptedTransfers::reading([
-            Err(gateway_refusal()),
-            Ok(transfer_for_hash_poll(transfer_id, "COMPLETE", None)),
-        ]);
-
-        let error =
-            poll_transfer_until_complete_with(&transfers, &transfer_id.into(), &fast_polling())
-                .await
-                .unwrap_err();
-
-        assert!(
-            matches!(&error, AlpacaWalletError::Gateway(hop) if !hop.retryable),
-            "{error:?}"
-        );
-        assert_eq!(transfers.reads_left(), 1);
-    }
-
-    #[tokio::test]
-    async fn generic_transfer_poll_rejects_a_status_regression() {
-        let transfer_id = Uuid::new_v4();
-        let transfers = ScriptedTransfers::reading([
-            Ok(transfer_for_hash_poll(transfer_id, "PROCESSING", None)),
-            Ok(transfer_for_hash_poll(transfer_id, "PENDING", None)),
-        ]);
-
-        let error =
-            poll_transfer_until_complete_with(&transfers, &transfer_id.into(), &fast_polling())
-                .await
-                .unwrap_err();
-
-        assert!(
-            matches!(
-                error,
-                AlpacaWalletError::InvalidStatusTransition {
-                    transfer_id: id,
-                    previous: TransferStatus::Processing,
-                    next: TransferStatus::Pending,
-                } if id == transfer_id.into()
-            ),
-            "{error:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn generic_tx_hash_poll_retries_a_gateway_failure() {
+        let rows: [(fn() -> AlpacaWalletError, bool); 4] = [
+            (|| hop(true), true),
+            (|| hop(false), false),
+            (|| api_error(StatusCode::TOO_MANY_REQUESTS), true),
+            (|| api_error(StatusCode::BAD_REQUEST), false),
+        ];
         let transfer_id = Uuid::new_v4();
         let tx_hash =
             fixed_bytes!("abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890");
-        let transfers = ScriptedTransfers::reading([
-            Err(gateway_failure()),
-            Ok(transfer_for_hash_poll(
-                transfer_id,
-                "COMPLETE",
-                Some(tx_hash),
-            )),
-        ]);
+        let complete = transfer_for_hash_poll(transfer_id, "COMPLETE", Some(tx_hash));
+        let config = fast_polling(Duration::from_secs(5));
 
-        let found = poll_transfer_tx_hash_with(&transfers, &transfer_id.into(), &fast_polling())
-            .await
-            .unwrap();
+        for (error, retried) in rows {
+            let reading =
+                || ScriptedTransfers::new(vec![Err(error()), Ok(complete.clone())], vec![]);
+            let (transfers, hashes) = (reading(), reading());
+            let deposits =
+                ScriptedTransfers::new(vec![], vec![Err(error()), Ok(Some(complete.clone()))]);
 
-        assert_eq!(found, tx_hash);
-        assert_eq!(transfers.reads_left(), 0);
-    }
+            let failures = [
+                poll_transfer_until_complete_with(&transfers, &transfer_id.into(), &config)
+                    .await
+                    .err(),
+                poll_transfer_tx_hash_with(&hashes, &transfer_id.into(), &config)
+                    .await
+                    .err(),
+                poll_deposit_by_tx_hash_with(&deposits, &tx_hash, &config)
+                    .await
+                    .err(),
+            ];
 
-    /// The tx hash poll retries until its timeout with no attempt cap, so a
-    /// refusal it retried would be re-sent for the whole timeout and then
-    /// reported as a timeout instead of the refusal.
-    #[tokio::test]
-    async fn generic_tx_hash_poll_returns_a_gateway_refusal_without_retry() {
-        let transfer_id = Uuid::new_v4();
-        let tx_hash =
-            fixed_bytes!("abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890");
-        let transfers = ScriptedTransfers::reading([
-            Err(gateway_refusal()),
-            Ok(transfer_for_hash_poll(
-                transfer_id,
-                "COMPLETE",
-                Some(tx_hash),
-            )),
-        ]);
-
-        let error = poll_transfer_tx_hash_with(&transfers, &transfer_id.into(), &fast_polling())
-            .await
-            .unwrap_err();
-
-        assert!(
-            matches!(&error, AlpacaWalletError::Gateway(hop) if !hop.retryable),
-            "{error:?}"
-        );
-        assert_eq!(transfers.reads_left(), 1);
-    }
-
-    /// The tx hash poll holds its next read off for the wait a gateway hop
-    /// relays, as it does for Alpaca's own `Retry-After`, instead of reading
-    /// again at the poll interval.
-    #[tokio::test]
-    async fn generic_tx_hash_poll_holds_off_for_the_wait_a_gateway_hop_relays() {
-        let transfer_id = Uuid::new_v4();
-        let tx_hash =
-            fixed_bytes!("abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890");
-        let wait = Duration::from_millis(200);
-        let transfers = ScriptedTransfers::reading([
-            Err(AlpacaWalletError::Gateway(GatewayHopError {
-                retry_after: Some(wait),
-                ..GatewayHopError::transport("credential mint throttled")
-            })),
-            Ok(transfer_for_hash_poll(
-                transfer_id,
-                "COMPLETE",
-                Some(tx_hash),
-            )),
-        ]);
-
-        let started = Instant::now();
-        let found = poll_transfer_tx_hash_with(&transfers, &transfer_id.into(), &fast_polling())
-            .await
-            .unwrap();
-
-        assert_eq!(found, tx_hash);
-        assert!(started.elapsed() >= wait, "{:?}", started.elapsed());
+            let expected = error().to_string();
+            for (failure, scripted) in failures.into_iter().zip([&transfers, &hashes, &deposits]) {
+                assert_eq!(
+                    failure.map(|failure| failure.to_string()),
+                    (!retried).then(|| expected.clone()),
+                );
+                assert_eq!(scripted.left(), usize::from(!retried), "{expected}");
+            }
+        }
     }
 
     #[tokio::test]
-    async fn generic_deposit_poll_retries_a_gateway_failure_until_the_deposit_completes() {
+    async fn deposit_poll_rejects_a_status_regression() {
         let deposit_id = Uuid::new_v4();
         let tx_hash =
             fixed_bytes!("abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890");
-        let transfers = ScriptedTransfers::looking_up([
-            Err(gateway_failure()),
-            Ok(None),
-            Ok(Some(deposit(deposit_id, "PENDING", tx_hash))),
-            Ok(Some(deposit(deposit_id, "COMPLETE", tx_hash))),
-        ]);
+        let transfers = ScriptedTransfers::new(
+            vec![],
+            vec![
+                Ok(Some(transfer_for_hash_poll(
+                    deposit_id,
+                    "PROCESSING",
+                    Some(tx_hash),
+                ))),
+                Ok(Some(transfer_for_hash_poll(
+                    deposit_id,
+                    "PENDING",
+                    Some(tx_hash),
+                ))),
+            ],
+        );
 
-        let found = poll_deposit_by_tx_hash_with(&transfers, &tx_hash, &fast_polling())
-            .await
-            .unwrap();
-
-        assert_eq!(found.id, deposit_id.into());
-        assert_eq!(found.status, TransferStatus::Complete);
-        assert_eq!(transfers.lookups_left(), 0);
-    }
-
-    #[tokio::test]
-    async fn generic_deposit_poll_rejects_a_status_regression() {
-        let deposit_id = Uuid::new_v4();
-        let tx_hash =
-            fixed_bytes!("abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890");
-        let transfers = ScriptedTransfers::looking_up([
-            Ok(Some(deposit(deposit_id, "PROCESSING", tx_hash))),
-            Ok(Some(deposit(deposit_id, "PENDING", tx_hash))),
-        ]);
-
-        let error = poll_deposit_by_tx_hash_with(&transfers, &tx_hash, &fast_polling())
-            .await
-            .unwrap_err();
+        let error = poll_deposit_by_tx_hash_with(
+            &transfers,
+            &tx_hash,
+            &fast_polling(Duration::from_secs(5)),
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             matches!(
@@ -1635,5 +1448,78 @@ mod tests {
             ),
             "{error:?}"
         );
+    }
+
+    /// Answers every read and lookup with one that never completes,
+    /// counting how many were started.
+    #[derive(Default)]
+    struct StalledTransfers {
+        started: std::cell::Cell<usize>,
+    }
+
+    impl WalletTransfers for StalledTransfers {
+        fn get_transfer(
+            &self,
+            _transfer_id: &AlpacaTransferId,
+        ) -> impl Future<Output = Result<Transfer, AlpacaWalletError>> + Send {
+            self.started.set(self.started.get() + 1);
+            std::future::pending()
+        }
+
+        fn find_deposit_by_tx_hash(
+            &self,
+            _tx_hash: &TxHash,
+        ) -> impl Future<Output = Result<Option<Transfer>, AlpacaWalletError>> + Send {
+            self.started.set(self.started.get() + 1);
+            std::future::pending()
+        }
+    }
+
+    /// A read still running at the deadline is dropped there: each poll
+    /// ends as its timeout at the deadline, not whenever the read would
+    /// have answered.
+    #[tokio::test(start_paused = true)]
+    async fn every_wallet_poll_drops_a_read_still_running_at_its_deadline() {
+        let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
+        let tx_hash =
+            fixed_bytes!("abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890");
+        let deadline = Duration::from_secs(10);
+        let config = fast_polling(deadline);
+
+        let transfers = StalledTransfers::default();
+        let started = Instant::now();
+        let error = poll_transfer_until_complete_with(&transfers, &transfer_id, &config)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, AlpacaWalletError::TransferTimeout { .. }),
+            "{error:?}"
+        );
+        assert_eq!(started.elapsed(), deadline);
+        assert_eq!(transfers.started.get(), 1);
+
+        let transfers = StalledTransfers::default();
+        let started = Instant::now();
+        let error = poll_transfer_tx_hash_with(&transfers, &transfer_id, &config)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, AlpacaWalletError::TransferTimeout { .. }),
+            "{error:?}"
+        );
+        assert_eq!(started.elapsed(), deadline);
+        assert_eq!(transfers.started.get(), 1);
+
+        let transfers = StalledTransfers::default();
+        let started = Instant::now();
+        let error = poll_deposit_by_tx_hash_with(&transfers, &tx_hash, &config)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, AlpacaWalletError::DepositTimeout { .. }),
+            "{error:?}"
+        );
+        assert_eq!(started.elapsed(), deadline);
+        assert_eq!(transfers.started.get(), 1);
     }
 }

@@ -1,12 +1,11 @@
 //! The operation catalog: every route the gateway serves, and which tiers may
-//! call it in each profile. There is no other way to reach Alpaca through the
-//! gateway.
+//! call it. There is no other way to reach Alpaca through the gateway.
 
 use std::time::Duration;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::access::{Profile, Tier};
+use crate::access::Tier;
 
 /// HTTP method of an operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,7 +45,6 @@ pub enum Operation {
     WalletTransfer,
     WalletTransfers,
     WalletFindDeposit,
-    WalletFindTransfer,
     WalletDepositAddress,
     WalletWhitelist,
     WalletWhitelistCreate,
@@ -72,7 +70,7 @@ const ACTIVITY_PAGES: Duration = Duration::from_secs(120);
 const WITHDRAWAL_ANSWER: Duration = Duration::from_secs(60);
 
 impl Operation {
-    pub const ALL: [Self; 39] = [
+    pub const ALL: [Self; 38] = [
         Self::AccountFunds,
         Self::AccountWithdrawableCash,
         Self::AccountInventory,
@@ -101,7 +99,6 @@ impl Operation {
         Self::WalletTransfer,
         Self::WalletTransfers,
         Self::WalletFindDeposit,
-        Self::WalletFindTransfer,
         Self::WalletDepositAddress,
         Self::WalletWhitelist,
         Self::WalletWhitelistCreate,
@@ -146,7 +143,6 @@ impl Operation {
             Self::WalletTransfer => "wallet.transfer",
             Self::WalletTransfers => "wallet.transfers",
             Self::WalletFindDeposit => "wallet.find_deposit",
-            Self::WalletFindTransfer => "wallet.find_transfer",
             Self::WalletDepositAddress => "wallet.deposit_address",
             Self::WalletWhitelist => "wallet.whitelist",
             Self::WalletWhitelistCreate => "wallet.whitelist_create",
@@ -192,7 +188,6 @@ impl Operation {
             Self::WalletTransfer => "/wallet/transfers/{transfer_id}",
             Self::WalletTransfers => "/wallet/transfers",
             Self::WalletFindDeposit => "/wallet/deposits/by-tx/{tx_hash}",
-            Self::WalletFindTransfer => "/wallet/transfers/by-tx/{tx_hash}",
             Self::WalletDepositAddress => "/wallet/deposit-address",
             Self::WalletWhitelist => "/wallet/whitelist",
             Self::WalletWhitelistCreate => "/wallet/whitelist/entries",
@@ -276,78 +271,9 @@ impl Operation {
         }
     }
 
-    /// Units this operation takes from the shared human budget: the most
-    /// Broker API requests one call can send. The gateway gives back what a
-    /// call did not send (an asset read the cache answered, a placement
-    /// without the duplicate key lookup). Exceptions:
-    ///
-    /// - the keyed reads the crate poll loops repeat cost nothing, though
-    ///   each sends one request (`wallet.find_transfer`,
-    ///   `tokenization.request` and `tokenization.find_redemption` read a
-    ///   whole Alpaca list): a `429` there would end a poll loop before its
-    ///   deadline cancel;
-    /// - `activities.list` costs its human page cap, one request per page;
-    /// - the whitelist removal and Travel Rule patch cost their list read;
-    ///   the gateway charges their entry writes once the list shows how many
-    ///   there are.
+    /// Tiers allowed to call this operation in the T0 deployment.
     #[must_use]
-    pub const fn human_budget_cost(self) -> u32 {
-        match self {
-            Self::OrdersGet
-            | Self::ConversionsGet
-            | Self::WalletTransfer
-            | Self::WalletFindTransfer
-            | Self::TokenizationRequest
-            | Self::TokenizationFindRedemption => 0,
-            Self::AccountFunds
-            | Self::AccountWithdrawableCash
-            | Self::AccountPositionMark
-            | Self::MarketIsOpen
-            | Self::MarketSession
-            | Self::MarketLatestTrade
-            | Self::MarketLatestQuote
-            | Self::MarketLatestOvernightQuote
-            | Self::AssetsGet
-            | Self::AssetsCounterTradeShares
-            | Self::OrdersFind
-            | Self::OrdersCancel
-            | Self::ConversionsSubmit
-            | Self::ConversionsFind
-            | Self::JournalsCreate
-            | Self::WalletTransfers
-            | Self::WalletFindDeposit
-            | Self::WalletDepositAddress
-            | Self::WalletWhitelist
-            | Self::WalletWhitelistCreate
-            | Self::WalletWhitelistRemove
-            | Self::WalletWhitelistPatchTravelRule
-            | Self::TokenizationMint
-            | Self::TokenizationRequests
-            | Self::TokenizationFindMint => 1,
-            // The positions and the account; the order read back by key and
-            // its placement time when the order omits it; the extended
-            // session's next calendar; the whitelist read and the withdrawal.
-            Self::AccountInventory
-            | Self::OrdersRecover
-            | Self::MarketSessionStatus
-            | Self::WalletWithdraw => 2,
-            // The asset, the order, the order Alpaca already holds under a
-            // duplicate key, and its placement time when the answer omits it.
-            Self::OrdersPlaceMarket | Self::OrdersPlaceLimit | Self::OrdersPlaceExactLimit => 4,
-            Self::ActivitiesList => 10,
-        }
-    }
-
-    /// Tiers allowed to call this operation in `profile`. Empty when the
-    /// profile does not serve it.
-    #[must_use]
-    pub const fn tiers(self, profile: Profile) -> &'static [Tier] {
-        match profile {
-            Profile::T0 => self.t0_tiers(),
-        }
-    }
-
-    const fn t0_tiers(self) -> &'static [Tier] {
+    pub const fn tiers(self) -> &'static [Tier] {
         match self {
             Self::AccountFunds
             | Self::AccountWithdrawableCash
@@ -367,7 +293,6 @@ impl Operation {
             | Self::WalletTransfer
             | Self::WalletTransfers
             | Self::WalletFindDeposit
-            | Self::WalletFindTransfer
             | Self::WalletDepositAddress
             | Self::TokenizationRequests
             | Self::TokenizationRequest
@@ -388,10 +313,10 @@ impl Operation {
         }
     }
 
-    /// Whether `tier` may call this operation in `profile`.
+    /// Whether `tier` may call this operation.
     #[must_use]
-    pub fn allows(self, profile: Profile, tier: Tier) -> bool {
-        self.tiers(profile).contains(&tier)
+    pub fn allows(self, tier: Tier) -> bool {
+        self.tiers().contains(&tier)
     }
 
     /// Looks an operation up by its catalog name.
@@ -513,14 +438,14 @@ mod tests {
     fn mutations_are_posts_and_never_offered_to_readers() {
         for operation in Operation::ALL.into_iter().filter(|op| op.mutates()) {
             assert_eq!(operation.method(), Method::Post, "{operation}");
-            assert!(!operation.allows(Profile::T0, Tier::Read), "{operation}");
+            assert!(!operation.allows(Tier::Read), "{operation}");
         }
     }
 
     #[test]
     fn every_t0_operation_is_served_on_some_tier() {
         for operation in Operation::ALL {
-            assert_ne!(operation.tiers(Profile::T0), &[] as &[Tier], "{operation}");
+            assert_ne!(operation.tiers(), &[] as &[Tier], "{operation}");
         }
     }
 
@@ -533,7 +458,7 @@ mod tests {
             Operation::WalletWhitelistRemove,
             Operation::WalletWhitelistPatchTravelRule,
         ] {
-            assert!(!operation.allows(Profile::T0, Tier::Bot), "{operation}");
+            assert!(!operation.allows(Tier::Bot), "{operation}");
         }
     }
 }

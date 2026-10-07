@@ -34,6 +34,8 @@ pub mod endpoint;
 mod rate_limit;
 #[cfg(any(feature = "issuer", feature = "broker", feature = "corporate-actions"))]
 pub mod request_id;
+#[cfg(test)]
+mod test_fixtures;
 
 #[cfg(feature = "broker")]
 pub mod broker;
