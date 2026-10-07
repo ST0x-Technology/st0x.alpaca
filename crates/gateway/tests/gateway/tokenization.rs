@@ -153,8 +153,9 @@ async fn a_mint_outside_the_pinned_recipients_is_refused_on_every_tier() {
     }
 }
 
-/// A definitive rejection of the mint left Alpaca untouched; a server error
-/// may have minted, so it is resendable under the same key.
+/// A definitive rejection of the mint left Alpaca untouched. A server error
+/// may have minted, and so may a mint resent under an issuer request id
+/// Alpaca already holds, so both are resendable under the same key.
 #[tokio::test]
 async fn a_failed_mint_is_not_applied_when_rejected_and_outcome_unknown_otherwise() {
     for (alpaca_status, answer, status, code, outcome, same_key) in [
@@ -169,6 +170,14 @@ async fn a_failed_mint_is_not_applied_when_rejected_and_outcome_unknown_otherwis
         (
             500,
             json!({ "message": "internal error" }),
+            StatusCode::GATEWAY_TIMEOUT,
+            ErrorCode::OutcomeUnknown,
+            Outcome::Unknown,
+            true,
+        ),
+        (
+            422,
+            json!({ "message": "issuer request id has already been used" }),
             StatusCode::GATEWAY_TIMEOUT,
             ErrorCode::OutcomeUnknown,
             Outcome::Unknown,

@@ -269,6 +269,15 @@ pub fn broker(error: &AlpacaBrokerApiError, sent: Sent) -> Failure {
         // The send gate held it back: it never left.
         E::NotSent(_) => Failure::new(ErrorCode::UpstreamTransient, message),
         E::HttpClient(source) if never_left(source) => unsent(source, message),
+        // The key already names an order, so the first request was applied.
+        E::ApiError { status, .. }
+            if sent == Sent::Mutation && error.is_duplicate_client_order_id() =>
+        {
+            Failure {
+                alpaca_status: Some(status.as_u16()),
+                ..untyped(sent, error.permanence(), message)
+            }
+        }
         E::ApiError { status, .. } => api_failure(*status, sent, error.permanence(), message),
         _ => untyped(sent, error.permanence(), message),
     }
@@ -410,6 +419,13 @@ pub fn tokenization(error: &AlpacaTokenizationError, sent: Sent) -> Failure {
             id.to_string(),
             message,
         ),
+        // A mint resent under its issuer request id gets a 4xx when the
+        // first one was applied, so only a definitive rejection (above) says
+        // nothing was minted.
+        E::ApiError { status, .. } if sent == Sent::Mutation => Failure {
+            alpaca_status: Some(status.as_u16()),
+            ..untyped(sent, error.permanence(), message)
+        },
         E::ApiError { status, .. } => api_failure(*status, sent, error.permanence(), message),
         _ => untyped(sent, error.permanence(), message),
     }

@@ -617,6 +617,37 @@ async fn a_human_reads_the_overnight_quote_with_its_broker_timestamp() {
     );
 }
 
+/// A resend under a `client_order_id` Alpaca already holds means the first
+/// conversion was placed, so it is never `not_applied`.
+#[tokio::test]
+async fn a_conversion_resent_under_a_key_alpaca_holds_is_outcome_unknown() {
+    let harness = Harness::start().await;
+    let place = harness.alpaca.mock(|when, then| {
+        when.method(POST).path(orders_path());
+        then.status(422)
+            .json_body(json!({ "message": "client_order_id must be unique" }));
+    });
+
+    let (status, body) = harness
+        .call(
+            Tier::Bot,
+            "POST",
+            "/conversions",
+            Some(json!({
+                "clientOrderId": CLIENT_UUID,
+                "conversion": { "direction": "buy_with_usd", "notional": "1000" }
+            })),
+        )
+        .await;
+
+    assert_eq!(status, StatusCode::GATEWAY_TIMEOUT, "{body}");
+    assert_eq!(body["code"], "outcome_unknown");
+    assert_eq!(body["outcome"], "unknown");
+    assert_eq!(body["alpacaStatus"], 422);
+    place.assert_calls(1);
+    assert_eq!(harness.audit_events()[0].outcome, Some(Outcome::Unknown));
+}
+
 #[tokio::test]
 async fn a_conversion_refused_for_insufficient_balance_is_not_applied() {
     let harness = Harness::start().await;

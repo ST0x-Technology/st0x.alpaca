@@ -312,15 +312,15 @@ impl AppState {
     /// Runs an admitted call on a detached task, so a caller disconnect,
     /// the deadline or shutdown never aborts a request already sent to
     /// Alpaca. `work` gets the state and the deadline. It runs under a send
-    /// gate that closes at the deadline, at shutdown, and before the caller
-    /// is answered without the result: no Alpaca request and no credential
-    /// mint starts after that answer, and one the gate holds back fails as
-    /// never sent. The task writes the one record carrying the result and
-    /// its Alpaca traffic: `answered` when the handler took the result,
-    /// `settled` when the handler had stopped waiting. The handler answers
-    /// by the deadline, or at once on shutdown; without the result it
-    /// answers `outcome_unknown` for a mutation and `upstream_transient`
-    /// for a read, and writes that answer's record.
+    /// gate that closes at the deadline, at shutdown, when the caller goes
+    /// away, and before the caller is answered without the result: no Alpaca
+    /// request and no credential mint starts after that, and one the gate
+    /// holds back fails as never sent. The task writes the one record
+    /// carrying the result and its Alpaca traffic: `answered` when the
+    /// handler took the result, `settled` when the handler had stopped
+    /// waiting. The handler answers by the deadline, or at once on shutdown;
+    /// without the result it answers `outcome_unknown` for a mutation and
+    /// `upstream_transient` for a read, and writes that answer's record.
     pub async fn run<T, Build, Work>(&self, call: Call, intent: Intent, work: Build) -> Response
     where
         T: Serialize + Send + 'static,
@@ -360,6 +360,9 @@ impl AppState {
             state.audit.emit(&event);
         });
 
+        // A caller that goes away drops this future; the guard then closes
+        // the gate, so its recovery read cannot race a write still to come.
+        let _close_on_drop = CloseOnDrop(gate.clone());
         let result = tokio::select! {
             result = &mut receiver => result.ok(),
             () = tokio::time::sleep_until(deadline) => None,
@@ -464,6 +467,17 @@ impl AppState {
             latency_ms: u64::try_from(elapsed).unwrap_or(u64::MAX),
             gateway_version: self.version.clone(),
         }
+    }
+}
+
+/// Closes a call's send gate when the handler is done with it, including
+/// when the caller goes away and the handler future is dropped. Closing after
+/// the work finished changes nothing.
+struct CloseOnDrop(SendGate);
+
+impl Drop for CloseOnDrop {
+    fn drop(&mut self) {
+        self.0.close();
     }
 }
 

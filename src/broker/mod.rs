@@ -527,6 +527,13 @@ fn format_api_error(
 }
 
 impl AlpacaBrokerApiError {
+    /// Whether Alpaca refused a placement because its `client_order_id`
+    /// already names an order: a resend whose first request was applied.
+    #[must_use]
+    pub fn is_duplicate_client_order_id(&self) -> bool {
+        order::is_duplicate_client_order_id(self)
+    }
+
     /// Classifies this error as rate limiting (a broker HTTP 429, a throttled
     /// token mint, or a gateway hop that relayed a wait), returning the
     /// `Retry-After` hint when one was sent. Every other variant returns

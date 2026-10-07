@@ -377,6 +377,50 @@ async fn a_withdrawal_whose_whitelist_read_outlasts_its_deadline_is_never_sent()
     assert_eq!(last.alpaca_object_id, None);
 }
 
+/// A caller that goes away during the whitelist read closes the send gate,
+/// so the withdrawal it asked for is never sent after it left.
+#[tokio::test]
+async fn a_withdrawal_its_caller_abandons_during_the_whitelist_read_is_never_sent() {
+    let harness = Harness::start().await;
+    let read = harness.alpaca.mock(|when, then| {
+        when.method(GET).path(whitelist_path());
+        then.status(200)
+            .delay(Duration::from_millis(500))
+            .json_body(json!([whitelist_entry(
+                "wl-mm",
+                MARKET_MAKER_WALLET,
+                "APPROVED"
+            )]));
+    });
+    let post = harness.alpaca.mock(|when, then| {
+        when.method(POST).path(transfers_path());
+        then.status(200)
+            .json_body(transfer_json(MARKET_MAKER_WALLET));
+    });
+
+    let mut call = Box::pin(withdraw(&harness, Tier::Bot, MARKET_MAKER_WALLET));
+    let read_started = async {
+        while read.calls_async().await == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+    tokio::select! {
+        answer = &mut call => panic!("answered before the read: {answer:?}"),
+        () = read_started => {}
+    }
+    // The server drops the request future, as hyper does on a closed
+    // connection.
+    drop(call);
+
+    tokio::time::timeout(Duration::from_secs(5), harness.settle())
+        .await
+        .unwrap();
+    post.assert_calls(0);
+    let events = harness.audit_events();
+    let settled = settled(&events).unwrap();
+    assert_eq!(settled.outcome, Some(Outcome::NotApplied), "{events:?}");
+}
+
 const SETTLED_TX: &str = "0xabababababababababababababababababababababababababababababababab";
 
 /// An incoming transfer in a status the library does not know, listed

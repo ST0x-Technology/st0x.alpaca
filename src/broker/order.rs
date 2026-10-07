@@ -749,7 +749,7 @@ pub(super) async fn recover_order_by_client_id(
 /// re-uses a `client_order_id` already attached to an active order. This is the
 /// recoverable duplicate-submission case (the original 2xx was lost in flight),
 /// distinct from other 422s such as insufficient buying power or invalid order.
-fn is_duplicate_client_order_id(error: &AlpacaBrokerApiError) -> bool {
+pub(super) fn is_duplicate_client_order_id(error: &AlpacaBrokerApiError) -> bool {
     use AlpacaBrokerApiError::{
         AccountActivitiesPageLimitExceeded, AccountActivitiesPaginationInvariantViolation,
         AccountNotActive, AlpacaAmount, ApiError, AssetNotActive, AssetNotTradable, BelowPrecision,
