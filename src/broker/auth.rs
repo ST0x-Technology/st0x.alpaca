@@ -146,7 +146,8 @@ impl AlpacaBrokerApiMode {
 
     /// The authx token endpoint JWT-variant credentials mint at,
     /// split by mode like every other Alpaca host.
-    pub(super) fn token_url(&self) -> String {
+    #[must_use]
+    pub fn token_url(&self) -> String {
         match self {
             Self::Sandbox => crate::auth::ALPACA_SANDBOX_TOKEN_URL.to_string(),
             Self::Production => crate::auth::ALPACA_TOKEN_URL.to_string(),

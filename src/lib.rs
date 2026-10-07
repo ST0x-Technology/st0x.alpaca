@@ -54,7 +54,7 @@ pub mod wallet;
 pub use auth::{ALPACA_SANDBOX_TOKEN_URL, ALPACA_TOKEN_URL, KmsJwtError};
 pub use core::{AlpacaAuth, Backpressure, GatewayHopError, Permanence};
 #[cfg(feature = "issuer")]
-pub use core::{AlpacaClient, AlpacaError};
+pub use core::{AlpacaClient, AlpacaError, IssuerCallError};
 #[cfg(any(feature = "issuer", feature = "broker", feature = "corporate-actions"))]
 pub use endpoint::{EndpointError, EndpointRole};
 /// The `st0x-finance` release every public amount, quantity, and symbol type

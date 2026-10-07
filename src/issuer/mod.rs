@@ -14,8 +14,9 @@ use uuid::Uuid;
 
 use st0x_finance::{EmptySymbolError, FractionalShares, Symbol, Usd};
 
-use crate::core::{AlpacaClient, AlpacaError, Network, TokenizationRequestId};
+use crate::core::{AlpacaClient, AlpacaError, IssuerCallError, Network, TokenizationRequestId};
 use crate::rate_limit::retry_after_from_response_headers;
+use crate::request_id;
 
 pub mod itn;
 
@@ -103,7 +104,7 @@ pub struct RedeemRequest {
 }
 
 /// Response payload from Alpaca's redeem endpoint.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RedeemResponse {
     pub tokenization_request_id: TokenizationRequestId,
     pub issuer_request_id: IssuerRequestId,
@@ -147,7 +148,7 @@ pub enum RedeemRequestStatus {
 /// `"0.5"`); a JSON number is accepted too. Parsed into a Rain Float so
 /// consumers can use it in exact arithmetic; the lexical scale is not
 /// preserved because the value is never sent back to Alpaca.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Fees(pub Usd);
 
@@ -156,7 +157,7 @@ pub struct Fees(pub Usd);
 /// The endpoint returns a single object. This enum deserializes both Mint
 /// and Redeem variants via `#[serde(tag = "type")]`, with each variant
 /// carrying the appropriate `issuer_request_id` type.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum TokenizationRequest {
     Mint {},
@@ -267,9 +268,17 @@ impl Serialize for RedeemQty {
     }
 }
 
-#[async_trait]
-impl IssuerApi for AlpacaClient {
-    async fn send_mint_callback(&self, request: MintCallbackRequest) -> Result<(), AlpacaError> {
+impl AlpacaClient {
+    /// [`IssuerApi::send_mint_callback`], reporting whether the callback may
+    /// have reached Alpaca.
+    ///
+    /// # Errors
+    ///
+    /// The [`IssuerApi::send_mint_callback`] error in an [`IssuerCallError`].
+    pub async fn send_mint_callback_reporting(
+        &self,
+        request: MintCallbackRequest,
+    ) -> Result<(), IssuerCallError> {
         let path = [
             "v1",
             "accounts",
@@ -279,10 +288,11 @@ impl IssuerApi for AlpacaClient {
             "mint",
         ];
 
-        self.with_retry(|| async {
-            let response = self.post(&path).await?.json(&request).send().await?;
+        self.with_retry_reporting(|| async {
+            let response = request_id::send(self.post(&path).await?.json(&request)).await?;
 
             let status = response.status();
+            request_id::record(status, response.headers());
             let retry_after = retry_after_from_response_headers(response.headers());
 
             match status {
@@ -307,14 +317,24 @@ impl IssuerApi for AlpacaClient {
         .await
     }
 
-    async fn call_redeem_endpoint(
+    /// [`IssuerApi::call_redeem_endpoint`], reporting whether the redeem call
+    /// may have reached Alpaca.
+    ///
+    /// # Errors
+    ///
+    /// The [`IssuerApi::call_redeem_endpoint`] error in an
+    /// [`IssuerCallError`].
+    pub async fn call_redeem_endpoint_reporting(
         &self,
         request: RedeemRequest,
-    ) -> Result<RedeemResponse, AlpacaError> {
+    ) -> Result<RedeemResponse, IssuerCallError> {
         if !itn::accepts_network_wire_string(request.network.as_str()) {
-            return Err(AlpacaError::UnsupportedTokenizationNetwork {
-                network: request.network,
-                reference: itn::REDEEM_CALLBACK_OPENAPI_REFERENCE,
+            return Err(IssuerCallError {
+                written: false,
+                error: AlpacaError::UnsupportedTokenizationNetwork {
+                    network: request.network,
+                    reference: itn::REDEEM_CALLBACK_OPENAPI_REFERENCE,
+                },
             });
         }
 
@@ -327,10 +347,11 @@ impl IssuerApi for AlpacaClient {
             "redeem",
         ];
 
-        self.with_retry(|| async {
-            let response = self.post(&path).await?.json(&request).send().await?;
+        self.with_retry_reporting(|| async {
+            let response = request_id::send(self.post(&path).await?.json(&request)).await?;
 
             let status = response.status();
+            request_id::record(status, response.headers());
             let retry_after = retry_after_from_response_headers(response.headers());
 
             match status {
@@ -358,6 +379,24 @@ impl IssuerApi for AlpacaClient {
         })
         .await
     }
+}
+
+#[async_trait]
+impl IssuerApi for AlpacaClient {
+    async fn send_mint_callback(&self, request: MintCallbackRequest) -> Result<(), AlpacaError> {
+        self.send_mint_callback_reporting(request)
+            .await
+            .map_err(|failure| failure.error)
+    }
+
+    async fn call_redeem_endpoint(
+        &self,
+        request: RedeemRequest,
+    ) -> Result<RedeemResponse, AlpacaError> {
+        self.call_redeem_endpoint_reporting(request)
+            .await
+            .map_err(|failure| failure.error)
+    }
 
     async fn poll_request_status(
         &self,
@@ -373,9 +412,10 @@ impl IssuerApi for AlpacaClient {
         ];
 
         self.with_retry(|| async {
-            let response = self.get(&path).await?.send().await?;
+            let response = request_id::send(self.get(&path).await?).await?;
 
             let status = response.status();
+            request_id::record(status, response.headers());
             let retry_after = retry_after_from_response_headers(response.headers());
 
             match status {
@@ -856,11 +896,14 @@ mod tests {
 
     use super::itn::{REDEEM_CALLBACK_OPENAPI_REFERENCE, accepts_network_wire_string};
     use super::{
-        ClientId, Fees, IssuerApi, IssuerRequestId, MintCallbackRequest, RedeemQty, RedeemRequest,
-        RedeemRequestStatus, RedeemResponse, TokenSymbol, TokenizationRequest,
+        ClientId, Fees, IssuerApi, IssuerRequestId, MintCallbackRequest, Qty, RedeemQty,
+        RedeemRequest, RedeemRequestStatus, RedeemResponse, TokenSymbol, TokenizationRequest,
         TokenizationRequestType, UnderlyingSymbol,
     };
     use crate::core::{AlpacaClient, AlpacaError, Network, TokenizationRequestId};
+    use crate::request_id::{
+        ALPACA_REQUEST_ID_HEADER, GateClosed, SendGate, Traffic, collect, gated,
+    };
 
     fn underlying_symbol(value: &str) -> UnderlyingSymbol {
         UnderlyingSymbol::new(value)
@@ -2222,6 +2265,134 @@ mod tests {
             })
         ));
         mock.assert_calls(3);
+    }
+
+    /// The 500 may have applied the redeem, so the later definite 422 does
+    /// not make the call unwritten. Both answers reach the audit.
+    #[tokio::test]
+    async fn a_redeem_answered_500_then_422_is_written() {
+        let server = MockServer::start_async().await;
+        let mut failed = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/accounts/test-account/tokenization/callback/redeem");
+            then.status(500).header(ALPACA_REQUEST_ID_HEADER, "first");
+        });
+        let client = make_client(&server, "test-account", "test-key", "test-secret");
+        let call = tokio::spawn(collect(async move {
+            client
+                .call_redeem_endpoint_reporting(create_redeem_request())
+                .await
+        }));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while failed.calls() == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        failed.delete();
+        let rejected = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/accounts/test-account/tokenization/callback/redeem");
+            then.status(422).header(ALPACA_REQUEST_ID_HEADER, "second");
+        });
+
+        let (result, traffic) = tokio::time::timeout(Duration::from_secs(5), call)
+            .await
+            .unwrap()
+            .unwrap();
+        let failure = result.unwrap_err();
+
+        assert!(failure.written);
+        assert!(
+            matches!(
+                failure.error,
+                AlpacaError::Api {
+                    status_code: 422,
+                    ..
+                }
+            ),
+            "{:?}",
+            failure.error
+        );
+        assert_eq!(
+            traffic,
+            Traffic {
+                request_ids: vec!["first".to_string(), "second".to_string()],
+                last_status: Some(422),
+            }
+        );
+        rejected.assert_calls(1);
+    }
+
+    #[tokio::test]
+    async fn a_redeem_answered_422_alone_is_not_written() {
+        let server = MockServer::start_async().await;
+        let rejected = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/accounts/test-account/tokenization/callback/redeem");
+            then.status(422);
+        });
+        let client = make_client(&server, "test-account", "test-key", "test-secret");
+
+        let failure = client
+            .call_redeem_endpoint_reporting(create_redeem_request())
+            .await
+            .unwrap_err();
+
+        assert!(!failure.written);
+        rejected.assert_calls(1);
+    }
+
+    #[tokio::test]
+    async fn a_mint_callback_the_send_gate_held_back_is_not_written() {
+        let server = MockServer::start_async().await;
+        let callback = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/accounts/test-account/tokenization/callback/mint");
+            then.status(200);
+        });
+        let client = make_client(&server, "test-account", "test-key", "test-secret");
+
+        let failure = gated(
+            SendGate::new(|| false),
+            client.send_mint_callback_reporting(create_test_request()),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(!failure.written);
+        assert!(
+            matches!(failure.error, AlpacaError::NotSent(GateClosed)),
+            "{:?}",
+            failure.error
+        );
+        callback.assert_calls(0);
+    }
+
+    /// The gateway answers with these types and its client reads them back
+    /// through the same `Deserialize`.
+    #[test]
+    fn issuer_answers_read_back_what_they_write() {
+        let request: TokenizationRequest =
+            serde_json::from_value(redeem_tokenization_request_json(Some(json!("")))).unwrap();
+        let wire = serde_json::to_value(&request).unwrap();
+        let read_back: TokenizationRequest = serde_json::from_value(wire.clone()).unwrap();
+        let TokenizationRequest::Redeem {
+            quantity, tx_hash, ..
+        } = &read_back
+        else {
+            panic!("expected a redeem, got {read_back:?}");
+        };
+        assert_eq!(*tx_hash, None);
+        assert_eq!(*quantity, Qty("50.00".parse().unwrap()));
+        assert_eq!(serde_json::to_value(&read_back).unwrap(), wire);
+
+        let response = redeem_response_with_fees(Some(json!("0.50")));
+        let wire = serde_json::to_value(&response).unwrap();
+        let read_back: RedeemResponse = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(read_back.fees, response.fees);
+        assert_eq!(serde_json::to_value(&read_back).unwrap(), wire);
     }
 
     #[tokio::test]

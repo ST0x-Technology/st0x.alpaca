@@ -10,8 +10,9 @@ use alloy_primitives::Address;
 use serde::{Deserialize, Serialize};
 use st0x_alpaca::broker::{AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode};
 use st0x_alpaca::core::{AlpacaAuth, Network};
+use st0x_alpaca::corporate_actions::DEFAULT_CORPORATE_ACTIONS_STREAM_URL;
 use st0x_alpaca::endpoint::validate_credential_origin;
-use st0x_alpaca_gateway_api::Operation;
+use st0x_alpaca_gateway_api::{Operation, Profile};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -35,6 +36,8 @@ pub enum ConfigError {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GatewayConfig {
+    /// The deployment this is: its name and its capability matrix.
+    pub profile: Profile,
     /// Written into every audit record. A production deployment must sign
     /// with its Cloud KMS key.
     pub environment: Environment,
@@ -60,6 +63,9 @@ pub struct GatewayConfig {
     pub wallet: WalletConfig,
     #[serde(default)]
     pub tokenization: TokenizationConfig,
+    /// Read by the `s01` profile only.
+    #[serde(default)]
+    pub corporate_actions: CorporateActionsConfig,
 }
 
 const fn default_human_budget() -> u32 {
@@ -164,6 +170,35 @@ pub struct TokenizationConfig {
     /// The only recipients `tokenization.mint` accepts, on every tier.
     #[serde(default)]
     pub mint_recipients: Vec<Address>,
+}
+
+/// The corporate action stream the `s01` profile relays.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CorporateActionsConfig {
+    /// The stream URL, carrying its type and region filter.
+    #[serde(default = "default_stream_url")]
+    pub stream_url: String,
+    /// Longest wait for the next stream chunk before the relay ends.
+    #[serde(default = "default_idle_timeout_secs")]
+    pub idle_timeout_secs: u64,
+}
+
+impl Default for CorporateActionsConfig {
+    fn default() -> Self {
+        Self {
+            stream_url: default_stream_url(),
+            idle_timeout_secs: default_idle_timeout_secs(),
+        }
+    }
+}
+
+fn default_stream_url() -> String {
+    DEFAULT_CORPORATE_ACTIONS_STREAM_URL.to_string()
+}
+
+const fn default_idle_timeout_secs() -> u64 {
+    90
 }
 
 impl GatewayConfig {
@@ -282,6 +317,7 @@ mod tests {
     fn sample(extra: &str) -> String {
         format!(
             r#"
+profile = "t0"
 environment = "staging"
 listen = "127.0.0.1:0"
 expected_account_number = "T0-0001"

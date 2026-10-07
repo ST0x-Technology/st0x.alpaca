@@ -5,6 +5,7 @@
 //! additive: clients ignore fields they do not know.
 
 pub mod account;
+pub mod issuer;
 pub mod market;
 pub mod orders;
 pub mod tokenization;

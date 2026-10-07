@@ -34,5 +34,24 @@ impl Tier {
     }
 }
 
-/// Deployment name used in audit records.
-pub const DEPLOYMENT: &str = "t0-alpaca";
+/// Which deployment the gateway runs as. It names the deployment in audit
+/// records and picks the capability matrix, see [`crate::Operation::tiers`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Profile {
+    /// The T0 trading account (`t0-alpaca`).
+    T0,
+    /// The S01 issuer account (`s01-alpaca`).
+    S01,
+}
+
+impl Profile {
+    /// Deployment name used in audit records.
+    #[must_use]
+    pub const fn deployment(self) -> &'static str {
+        match self {
+            Self::T0 => "t0-alpaca",
+            Self::S01 => "s01-alpaca",
+        }
+    }
+}

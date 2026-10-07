@@ -12,7 +12,6 @@ use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use reqwest::header::HeaderMap;
-#[cfg(feature = "broker")]
 use reqwest::{RequestBuilder, Response, StatusCode};
 
 /// Header Alpaca puts its request id in.
@@ -88,7 +87,6 @@ impl fmt::Debug for SendGate {
 pub struct GateClosed;
 
 /// The failure of [`send`]: the HTTP client's own, or a closed gate.
-#[cfg(feature = "broker")]
 #[derive(Debug)]
 pub(crate) enum SendError {
     Http(reqwest::Error),
@@ -118,14 +116,12 @@ pub async fn gated<Output>(gate: SendGate, future: impl Future<Output = Output>)
 
 /// Sends one Alpaca API request unless the active [`SendGate`] holds it
 /// back. Callers send only once everything the request needs is in hand.
-#[cfg(feature = "broker")]
 pub(crate) async fn send(request: RequestBuilder) -> Result<Response, SendError> {
     start(request)?.await.map_err(SendError::Http)
 }
 
 /// Asks the active gate and, under its lock, hands the request to the HTTP
 /// client, which builds the request's future without awaiting.
-#[cfg(feature = "broker")]
 fn start(
     request: RequestBuilder,
 ) -> Result<impl Future<Output = reqwest::Result<Response>>, SendError> {
@@ -147,7 +143,6 @@ pub(crate) fn ensure_open() -> Result<(), GateClosed> {
 
 /// Records one Alpaca API answer: its status and its request id. Every
 /// client calls it right after its send returns, before reading the body.
-#[cfg(feature = "broker")]
 pub(crate) fn record(status: StatusCode, headers: &HeaderMap) {
     update(|traffic| traffic.last_status = Some(status.as_u16()));
     record_id(headers);
@@ -168,7 +163,7 @@ fn update(change: impl FnOnce(&mut Traffic)) {
     let _ = TRAFFIC.try_with(|traffic| change(&mut traffic.borrow_mut()));
 }
 
-#[cfg(all(test, feature = "broker"))]
+#[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;

@@ -17,6 +17,7 @@ use super::replay::CorporateActionReplay;
 use super::sse::{CorporateActionDecodeBatch, CorporateActionSseDecoder};
 use crate::auth::{AuthRuntime, KmsJwtError};
 use crate::core::AlpacaAuth;
+use crate::request_id::{self, GateClosed, SendError};
 
 /// HTTP client for one validated corporate-action stream endpoint.
 #[derive(Clone)]
@@ -56,6 +57,17 @@ pub enum CorporateActionStreamError {
     InvalidContentType(String),
     #[error(transparent)]
     Auth(#[from] KmsJwtError),
+    #[error(transparent)]
+    NotSent(#[from] GateClosed),
+}
+
+impl From<SendError> for CorporateActionStreamError {
+    fn from(error: SendError) -> Self {
+        match error {
+            SendError::Http(source) => Self::Http(source),
+            SendError::NotSent(closed) => Self::NotSent(closed),
+        }
+    }
 }
 
 impl CorporateActionStreamClient {
@@ -109,7 +121,7 @@ impl CorporateActionStreamClient {
     }
 
     /// Opens the stream at `replay` and checks the response is a successful
-    /// `text/event-stream`.
+    /// `text/event-stream`, leaving its body unread.
     ///
     /// # Errors
     ///
@@ -117,12 +129,13 @@ impl CorporateActionStreamClient {
     /// [`CorporateActionStreamError::HttpStatus`] for any non-2xx status
     /// (including a refused redirect),
     /// [`CorporateActionStreamError::InvalidContentType`] for any other
-    /// content type, or [`CorporateActionStreamError::Auth`] when a bearer
-    /// token cannot be minted.
-    pub async fn connect(
+    /// content type, [`CorporateActionStreamError::Auth`] when a bearer
+    /// token cannot be minted, or [`CorporateActionStreamError::NotSent`]
+    /// when the active send gate holds the request back.
+    pub async fn connect_raw(
         &self,
         replay: &CorporateActionReplay,
-    ) -> Result<CorporateActionStream, CorporateActionStreamError> {
+    ) -> Result<reqwest::Response, CorporateActionStreamError> {
         let request = self.http.get(self.endpoint.url().clone());
         let request = match &self.auth {
             Some(auth) => auth.apply_apca(request).await?,
@@ -135,9 +148,11 @@ impl CorporateActionStreamClient {
             request.query(&query)
         };
 
-        let response = request.send().await?;
-        if !response.status().is_success() {
-            return Err(CorporateActionStreamError::HttpStatus(response.status()));
+        let response = request_id::send(request).await?;
+        let status = response.status();
+        request_id::record(status, response.headers());
+        if !status.is_success() {
+            return Err(CorporateActionStreamError::HttpStatus(status));
         }
         let content_type = response
             .headers()
@@ -150,8 +165,20 @@ impl CorporateActionStreamClient {
             ));
         }
 
+        Ok(response)
+    }
+
+    /// [`Self::connect_raw`], decoding the stream it opens.
+    ///
+    /// # Errors
+    ///
+    /// The [`Self::connect_raw`] errors.
+    pub async fn connect(
+        &self,
+        replay: &CorporateActionReplay,
+    ) -> Result<CorporateActionStream, CorporateActionStreamError> {
         Ok(CorporateActionStream {
-            response,
+            response: self.connect_raw(replay).await?,
             decoder: CorporateActionSseDecoder::default(),
         })
     }

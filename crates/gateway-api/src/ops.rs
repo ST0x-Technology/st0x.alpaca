@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::access::Tier;
+use crate::access::{Profile, Tier};
 
 /// HTTP method of an operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,6 +55,10 @@ pub enum Operation {
     TokenizationRequest,
     TokenizationFindMint,
     TokenizationFindRedemption,
+    IssuerMintCallback,
+    IssuerRedeem,
+    IssuerRequest,
+    CorporateActionsStream,
 }
 
 const BOT_READ_WRITE: &[Tier] = &[Tier::Bot, Tier::Read, Tier::Write];
@@ -62,15 +66,17 @@ const READ_WRITE: &[Tier] = &[Tier::Read, Tier::Write];
 const BOT_WRITE: &[Tier] = &[Tier::Bot, Tier::Write];
 const BOT: &[Tier] = &[Tier::Bot];
 const WRITE: &[Tier] = &[Tier::Write];
+const NONE: &[Tier] = &[];
 
 const SINGLE_CALL: Duration = Duration::from_secs(45);
 const ORDER_PLACEMENT: Duration = Duration::from_secs(125);
 const MULTI_CALL: Duration = Duration::from_secs(90);
 const ACTIVITY_PAGES: Duration = Duration::from_secs(120);
 const WITHDRAWAL_ANSWER: Duration = Duration::from_secs(60);
+const ISSUER_CALL: Duration = Duration::from_secs(270);
 
 impl Operation {
-    pub const ALL: [Self; 38] = [
+    pub const ALL: [Self; 42] = [
         Self::AccountFunds,
         Self::AccountWithdrawableCash,
         Self::AccountInventory,
@@ -109,6 +115,10 @@ impl Operation {
         Self::TokenizationRequest,
         Self::TokenizationFindMint,
         Self::TokenizationFindRedemption,
+        Self::IssuerMintCallback,
+        Self::IssuerRedeem,
+        Self::IssuerRequest,
+        Self::CorporateActionsStream,
     ];
 
     /// Catalog name, as written in audit records and config.
@@ -153,6 +163,10 @@ impl Operation {
             Self::TokenizationRequest => "tokenization.request",
             Self::TokenizationFindMint => "tokenization.find_mint",
             Self::TokenizationFindRedemption => "tokenization.find_redemption",
+            Self::IssuerMintCallback => "issuer.mint_callback",
+            Self::IssuerRedeem => "issuer.redeem",
+            Self::IssuerRequest => "issuer.request",
+            Self::CorporateActionsStream => "corporate_actions.stream",
         }
     }
 
@@ -200,6 +214,10 @@ impl Operation {
                 "/tokenization/mints/by-issuer-request-id/{issuer_request_id}"
             }
             Self::TokenizationFindRedemption => "/tokenization/redemptions/by-tx/{tx_hash}",
+            Self::IssuerMintCallback => "/issuer/mint-callbacks",
+            Self::IssuerRedeem => "/issuer/redemptions",
+            Self::IssuerRequest => "/issuer/requests/{tokenization_request_id}",
+            Self::CorporateActionsStream => "/corporate-actions/stream",
         }
     }
 
@@ -233,6 +251,8 @@ impl Operation {
                 | Self::WalletWhitelistRemove
                 | Self::WalletWhitelistPatchTravelRule
                 | Self::TokenizationMint
+                | Self::IssuerMintCallback
+                | Self::IssuerRedeem
         )
     }
 
@@ -255,7 +275,7 @@ impl Operation {
 
     /// How long the gateway may take before it answers. A mutation already
     /// sent to Alpaca keeps running past this; the answer is then
-    /// `outcome_unknown`.
+    /// `outcome_unknown`. The stream has no deadline; its value is unused.
     #[must_use]
     pub const fn deadline(self) -> Duration {
         match self {
@@ -267,13 +287,32 @@ impl Operation {
             | Self::WalletWhitelistPatchTravelRule => MULTI_CALL,
             Self::ActivitiesList => ACTIVITY_PAGES,
             Self::WalletWithdraw => WITHDRAWAL_ANSWER,
+            Self::IssuerMintCallback | Self::IssuerRedeem | Self::IssuerRequest => ISSUER_CALL,
             _ => SINGLE_CALL,
         }
     }
 
-    /// Tiers allowed to call this operation in the T0 deployment.
+    /// Tiers allowed to call this operation in `profile`'s deployment. S01
+    /// serves the human tiers T0 serves, and its bot tier (the issuance
+    /// runtime) only the issuer calls and the corporate action stream, which
+    /// T0 serves on no tier.
     #[must_use]
-    pub const fn tiers(self) -> &'static [Tier] {
+    pub const fn tiers(self, profile: Profile) -> &'static [Tier] {
+        match (profile, self) {
+            (Profile::T0, _) => self.t0_tiers(),
+            (
+                Profile::S01,
+                Self::IssuerMintCallback | Self::IssuerRedeem | Self::CorporateActionsStream,
+            ) => BOT,
+            (Profile::S01, Self::IssuerRequest) => BOT_READ_WRITE,
+            // `Tier::Bot` comes first in every tier list.
+            (Profile::S01, _) => match self.t0_tiers() {
+                [Tier::Bot, humans @ ..] | humans => humans,
+            },
+        }
+    }
+
+    const fn t0_tiers(self) -> &'static [Tier] {
         match self {
             Self::AccountFunds
             | Self::AccountWithdrawableCash
@@ -310,13 +349,17 @@ impl Operation {
             | Self::WalletWhitelistCreate
             | Self::WalletWhitelistRemove
             | Self::WalletWhitelistPatchTravelRule => WRITE,
+            Self::IssuerMintCallback
+            | Self::IssuerRedeem
+            | Self::IssuerRequest
+            | Self::CorporateActionsStream => NONE,
         }
     }
 
-    /// Whether `tier` may call this operation.
+    /// Whether `tier` may call this operation in `profile`'s deployment.
     #[must_use]
-    pub fn allows(self, tier: Tier) -> bool {
-        self.tiers().contains(&tier)
+    pub fn allows(self, profile: Profile, tier: Tier) -> bool {
+        self.tiers(profile).contains(&tier)
     }
 
     /// Looks an operation up by its catalog name.
@@ -391,6 +434,7 @@ mod tests {
     /// journal and whitelist create have no Alpaca key, and Alpaca refuses a
     /// reused conversion key without the crate adopting the order, so a
     /// resend there could move value twice or fail a placed conversion.
+    /// Alpaca's dedupe of the issuer callbacks is not established.
     #[test]
     fn only_deduplicated_or_idempotent_mutations_are_resendable() {
         let resendable: HashSet<_> = Operation::ALL
@@ -415,6 +459,8 @@ mod tests {
             Operation::JournalsCreate,
             Operation::WalletWhitelistCreate,
             Operation::ConversionsSubmit,
+            Operation::IssuerMintCallback,
+            Operation::IssuerRedeem,
         ] {
             assert!(keyless.mutates(), "{keyless}");
             assert!(!keyless.resendable_with_same_key(), "{keyless}");
@@ -434,18 +480,62 @@ mod tests {
         }
     }
 
+    const PROFILES: [Profile; 2] = [Profile::T0, Profile::S01];
+
+    const NEW_IN_S01: [Operation; 4] = [
+        Operation::IssuerMintCallback,
+        Operation::IssuerRedeem,
+        Operation::IssuerRequest,
+        Operation::CorporateActionsStream,
+    ];
+
     #[test]
     fn mutations_are_posts_and_never_offered_to_readers() {
         for operation in Operation::ALL.into_iter().filter(|op| op.mutates()) {
             assert_eq!(operation.method(), Method::Post, "{operation}");
-            assert!(!operation.allows(Tier::Read), "{operation}");
+            for profile in PROFILES {
+                assert!(!operation.allows(profile, Tier::Read), "{operation}");
+            }
         }
     }
 
     #[test]
-    fn every_t0_operation_is_served_on_some_tier() {
+    fn every_operation_is_served_on_some_tier_of_some_profile() {
         for operation in Operation::ALL {
-            assert_ne!(operation.tiers(), &[] as &[Tier], "{operation}");
+            assert!(
+                PROFILES
+                    .into_iter()
+                    .any(|profile| !operation.tiers(profile).is_empty()),
+                "{operation}"
+            );
+        }
+    }
+
+    #[test]
+    fn s01_bot_tier_serves_exactly_the_new_operations_and_humans_keep_t0_tiers() {
+        let bot: HashSet<_> = Operation::ALL
+            .into_iter()
+            .filter(|op| op.allows(Profile::S01, Tier::Bot))
+            .collect();
+        assert_eq!(bot, HashSet::from(NEW_IN_S01));
+
+        for operation in Operation::ALL {
+            if operation != Operation::IssuerRequest {
+                for tier in [Tier::Read, Tier::Write] {
+                    assert_eq!(
+                        operation.allows(Profile::S01, tier),
+                        operation.allows(Profile::T0, tier),
+                        "{operation} {tier:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn t0_serves_none_of_the_new_operations() {
+        for operation in NEW_IN_S01 {
+            assert_eq!(operation.tiers(Profile::T0), NONE, "{operation}");
         }
     }
 
@@ -458,7 +548,9 @@ mod tests {
             Operation::WalletWhitelistRemove,
             Operation::WalletWhitelistPatchTravelRule,
         ] {
-            assert!(!operation.allows(Tier::Bot), "{operation}");
+            for profile in PROFILES {
+                assert!(!operation.allows(profile, Tier::Bot), "{operation}");
+            }
         }
     }
 }

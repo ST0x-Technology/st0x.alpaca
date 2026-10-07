@@ -52,6 +52,9 @@ pub const ACTIVITY_PAGE_SIZE: usize = 100;
 /// The `X-Request-ID` Alpaca answers the trading account read with.
 pub const ACCOUNT_REQUEST_ID: &str = "req-account";
 
+/// Where the mock serves the corporate action stream.
+pub const STREAM_PATH: &str = "/v1beta1/events/corporate-actions";
+
 pub struct Harness {
     /// Alpaca, and the signing keys under `/google` and `/iap`.
     pub alpaca: MockServer,
@@ -98,12 +101,14 @@ pub fn account_body(account_number: &str) -> Value {
     })
 }
 
-/// Config text for a gateway pointed at the mock server, which serves
-/// Alpaca and, through [`serve_keys`], the signing keys. `extra` is spliced
-/// in as top level keys; `tables` is appended as extra tables.
-pub fn config_text(alpaca: &MockServer, extra: &str, tables: &str) -> String {
+/// Config text for a `profile` gateway pointed at the mock server, which
+/// serves Alpaca, the corporate action stream and, through [`serve_keys`],
+/// the signing keys. `extra` is spliced in as top level keys; `tables` is
+/// appended as extra tables.
+pub fn config_text(alpaca: &MockServer, profile: &str, extra: &str, tables: &str) -> String {
     format!(
         r#"
+profile = "{profile}"
 environment = "staging"
 listen = "127.0.0.1:0"
 expected_account_number = "{ACCOUNT_NUMBER}"
@@ -133,6 +138,9 @@ mint_recipients = ["{BOT_WALLET}"]
 
 [journal.counterparties]
 issuer = "{JOURNAL_COUNTERPARTY}"
+
+[corporate_actions]
+stream_url = "{alpaca}{STREAM_PATH}?type=cash_dividend_corporateaction_event&region=us"
 {tables}
 "#,
         alpaca = alpaca.base_url(),
@@ -167,22 +175,32 @@ pub fn serve_keys(server: &MockServer) {
 }
 
 impl Harness {
-    /// A gateway whose startup account check passed, with the default
+    /// A `t0` gateway whose startup account check passed, with the default
     /// config.
     pub async fn start() -> Self {
-        Self::start_full("", "", None).await
+        Self::start_full("t0", "", "", None).await
+    }
+
+    /// An `s01` gateway, otherwise as [`Self::start`].
+    pub async fn start_s01() -> Self {
+        Self::start_full("s01", "", "", None).await
     }
 
     pub async fn start_with(extra: &str, tables: &str) -> Self {
-        Self::start_full(extra, tables, None).await
+        Self::start_full("t0", extra, tables, None).await
     }
 
     /// A gateway whose every operation deadline is `deadline`.
     pub async fn start_with_deadline(deadline: Duration) -> Self {
-        Self::start_full("", "", Some(deadline)).await
+        Self::start_full("t0", "", "", Some(deadline)).await
     }
 
-    async fn start_full(extra: &str, tables: &str, deadline: Option<Duration>) -> Self {
+    async fn start_full(
+        profile: &str,
+        extra: &str,
+        tables: &str,
+        deadline: Option<Duration>,
+    ) -> Self {
         let alpaca = MockServer::start_async().await;
         serve_keys(&alpaca);
         alpaca.mock(|when, then| {
@@ -193,7 +211,7 @@ impl Harness {
                 .json_body(account_body(ACCOUNT_NUMBER));
         });
 
-        let config = GatewayConfig::parse(&config_text(&alpaca, extra, tables)).unwrap();
+        let config = GatewayConfig::parse(&config_text(&alpaca, profile, extra, tables)).unwrap();
         let audit = MemorySink::default();
         let state = AppState::connect_with_deadline(
             config,
@@ -274,7 +292,7 @@ impl Harness {
 }
 
 /// The status and JSON body `app` answers `request` with.
-async fn answer(app: Router, request: Request<Body>) -> (StatusCode, Value) {
+pub async fn answer(app: Router, request: Request<Body>) -> (StatusCode, Value) {
     let response = app.oneshot(request).await.unwrap();
     let status = response.status();
     let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)

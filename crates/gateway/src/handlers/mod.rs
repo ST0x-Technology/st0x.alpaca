@@ -1,6 +1,8 @@
 //! One handler per catalog operation, grouped by surface.
 
 mod account;
+mod corporate_actions;
+mod issuer;
 mod market;
 mod orders;
 mod tokenization;
@@ -18,6 +20,8 @@ pub(crate) fn route(operation: Operation) -> Option<MethodRouter<AppState>> {
         .or_else(|| orders::route(operation))
         .or_else(|| wallet::route(operation))
         .or_else(|| tokenization::route(operation))
+        .or_else(|| issuer::route(operation))
+        .or_else(|| corporate_actions::route(operation))
 }
 
 #[cfg(test)]

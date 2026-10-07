@@ -22,6 +22,8 @@ use crate::auth::KmsJwtError;
 use crate::endpoint::{EndpointError, EndpointRole, resolve_segments, validate_origin};
 #[cfg(feature = "issuer")]
 use crate::rate_limit::MAX_RETRY_AFTER_HOLD;
+#[cfg(feature = "issuer")]
+use crate::request_id::{GateClosed, SendError};
 
 /// Alpaca API credentials applied to every request.
 #[derive(Clone, Deserialize)]
@@ -248,8 +250,23 @@ impl AlpacaClient {
     /// `Retry-After` deadline exceeds the wait budget.
     pub async fn with_retry<Value, Fut, Operation>(
         &self,
-        mut operation: Operation,
+        operation: Operation,
     ) -> Result<Value, AlpacaError>
+    where
+        Operation: FnMut() -> Fut,
+        Fut: Future<Output = Result<Value, AlpacaError>>,
+    {
+        self.with_retry_reporting(operation)
+            .await
+            .map_err(|failure| failure.error)
+    }
+
+    /// [`Self::with_retry`], also reporting whether any attempt may have
+    /// reached Alpaca.
+    pub(crate) async fn with_retry_reporting<Value, Fut, Operation>(
+        &self,
+        mut operation: Operation,
+    ) -> Result<Value, IssuerCallError>
     where
         Operation: FnMut() -> Fut,
         Fut: Future<Output = Result<Value, AlpacaError>>,
@@ -259,15 +276,16 @@ impl AlpacaClient {
             .with_jitter()
             .build();
         let mut budget = RETRY_AFTER_BUDGET;
+        let mut written = false;
 
-        loop {
+        let error = 'attempts: loop {
             // A different caller may extend the deadline while we sleep.
             while let Some(wait) = self.backpressure_wait() {
                 if wait > budget {
-                    return Err(AlpacaError::RateLimited {
+                    break 'attempts AlpacaError::RateLimited {
                         body: "client is inside an earlier Retry-After deadline".to_string(),
                         retry_after: Some(wait),
-                    });
+                    };
                 }
                 let wait = (wait + retry_after_jitter()).min(budget);
                 budget -= wait;
@@ -277,24 +295,26 @@ impl AlpacaClient {
                 Ok(value) => return Ok(value),
                 Err(error) => error,
             };
+            written |= may_have_reached_alpaca(&error);
 
             if let Some(retry_after) = error.backpressure().and_then(|hint| hint.retry_after) {
                 self.hold_for(retry_after);
             }
 
             if !error.is_retryable() {
-                return Err(error);
+                break error;
             }
             let Some(delay) = delays.next() else {
-                return Err(error);
+                break error;
             };
 
             let wait = self.backpressure_wait().unwrap_or_default();
             if wait > budget {
-                return Err(error);
+                break error;
             }
             tokio::time::sleep(delay).await;
-        }
+        };
+        Err(IssuerCallError { written, error })
     }
 
     /// Time left until the shared `Retry-After` deadline, if one is ahead.
@@ -389,6 +409,18 @@ pub enum AlpacaError {
         network: Network,
         reference: &'static str,
     },
+    #[error(transparent)]
+    NotSent(#[from] GateClosed),
+}
+
+#[cfg(feature = "issuer")]
+impl From<SendError> for AlpacaError {
+    fn from(error: SendError) -> Self {
+        match error {
+            SendError::Http(source) => Self::Reqwest(source),
+            SendError::NotSent(closed) => Self::NotSent(closed),
+        }
+    }
 }
 
 #[cfg(feature = "issuer")]
@@ -407,7 +439,8 @@ impl AlpacaError {
             | Self::Parse { .. }
             | Self::Auth(_)
             | Self::RequestNotFound { .. }
-            | Self::ResponseIdMismatch { .. } => false,
+            | Self::ResponseIdMismatch { .. }
+            | Self::NotSent(_) => false,
         }
     }
 
@@ -438,8 +471,44 @@ impl AlpacaError {
             | Self::Parse { .. }
             | Self::Auth(_)
             | Self::RequestNotFound { .. }
-            | Self::ResponseIdMismatch { .. } => Permanence::Permanent,
+            | Self::ResponseIdMismatch { .. }
+            // A closed send gate stays closed for the rest of its scope.
+            | Self::NotSent(_) => Permanence::Permanent,
         }
+    }
+}
+
+/// A failed issuer POST, with whether it may have reached Alpaca.
+#[cfg(feature = "issuer")]
+#[derive(Debug, thiserror::Error)]
+#[error("Alpaca issuer call failed")]
+pub struct IssuerCallError {
+    /// `false` when no attempt left this process or Alpaca answered each
+    /// one with a definite rejection (a 4xx other than 408). `true` once an
+    /// attempt may have been written: any other answer, an answer lost after
+    /// the request could have left, or a 2xx that did not read back.
+    pub written: bool,
+    #[source]
+    pub error: AlpacaError,
+}
+
+/// Whether a failed attempt may have reached Alpaca, by the rule of
+/// [`IssuerCallError::written`].
+#[cfg(feature = "issuer")]
+fn may_have_reached_alpaca(error: &AlpacaError) -> bool {
+    match error {
+        AlpacaError::Api { status_code, .. } => {
+            !(400..500).contains(status_code) || *status_code == 408
+        }
+        AlpacaError::Reqwest(source) => !(source.is_builder() || source.is_connect()),
+        AlpacaError::Parse { .. } | AlpacaError::ResponseIdMismatch { .. } => true,
+        AlpacaError::InvalidUrl(_)
+        | AlpacaError::Jwt(_)
+        | AlpacaError::NotSent(_)
+        | AlpacaError::UnsupportedTokenizationNetwork { .. }
+        | AlpacaError::Auth(_)
+        | AlpacaError::RateLimited { .. }
+        | AlpacaError::RequestNotFound { .. } => false,
     }
 }
 
