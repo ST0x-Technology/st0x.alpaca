@@ -211,6 +211,25 @@ impl GatewayConfig {
                  Cloud KMS key: [broker] takes client_id and kms_key_version",
             );
         }
+        // The wallet and tokenization clients mint JWT credentials at the
+        // production token endpoint only, and refuse the local key: either
+        // shape elsewhere starts clean and fails every wallet and
+        // tokenization call, or fails startup.
+        match self.broker.auth {
+            AlpacaAuth::PrivateKeyJwt { .. } => {
+                return invalid(
+                    "the wallet and tokenization clients cannot sign with a local private key: \
+                     [broker] takes api_key and api_secret, or client_id and kms_key_version",
+                );
+            }
+            AlpacaAuth::KmsJwt { .. } if self.broker.mode() != AlpacaBrokerApiMode::Production => {
+                return invalid(
+                    "the wallet and tokenization clients mint Cloud KMS tokens at the production \
+                     token endpoint only: a KMS credential needs [broker] mode = \"production\"",
+                );
+            }
+            AlpacaAuth::Basic { .. } | AlpacaAuth::KmsJwt { .. } => {}
+        }
 
         let identity = &self.identity;
         let audiences = [
@@ -355,9 +374,29 @@ mint_recipients = ["0x2222222222222222222222222222222222222222"]
                     "{environment} against {mode}: {error}"
                 );
             }
-
-            GatewayConfig::parse(&deployment(environment, mode, &kms())).unwrap();
         }
+        GatewayConfig::parse(&deployment("production", "production", &kms())).unwrap();
+        GatewayConfig::parse(&deployment("staging", "production", &kms())).unwrap();
+    }
+
+    /// The wallet and tokenization clients mint at the production token
+    /// endpoint and refuse the local key, so a config either would break
+    /// never validates; the sandbox runs on Basic keys.
+    #[test]
+    fn credentials_the_wallet_and_tokenization_clients_cannot_use_are_refused() {
+        let without_mode = sample("")
+            .replace("mode = \"sandbox\"\n", "")
+            .replace(BASIC, &kms());
+        for text in [
+            deployment("staging", "sandbox", &local_pem()),
+            deployment("staging", "sandbox", &kms()),
+            deployment("production", "sandbox", &kms()),
+            without_mode,
+        ] {
+            let error = GatewayConfig::parse(&text).unwrap_err();
+            assert!(matches!(error, ConfigError::Invalid(_)), "{text}: {error}");
+        }
+        GatewayConfig::parse(&deployment("staging", "sandbox", BASIC)).unwrap();
     }
 
     #[test]

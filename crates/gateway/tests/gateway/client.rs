@@ -8,8 +8,8 @@ use httpmock::prelude::*;
 use serde_json::json;
 use st0x_alpaca::Permanence;
 use st0x_alpaca::broker::{
-    AlpacaLimitOrder, AlpacaLimitPrice, ClientOrderId, ConversionOrder, CryptoOrderOutcome,
-    Direction, MarketOrder, OrderState,
+    AlpacaBrokerApiError, AlpacaLimitOrder, AlpacaLimitPrice, ClientOrderId, ConversionOrder,
+    ConversionOrders, CryptoOrderOutcome, Direction, MarketOrder, OrderState,
 };
 use st0x_alpaca::core::Network;
 use st0x_alpaca::st0x_finance::Symbol;
@@ -21,7 +21,9 @@ use st0x_alpaca::wallet::{
 use st0x_alpaca_gateway_api::{AuditPhase, Operation, Outcome, Tier};
 use uuid::Uuid;
 
-use crate::common::{ACCOUNT_ID, BOT_WALLET, Harness, JOURNAL_COUNTERPARTY, until_called};
+use crate::common::{
+    ACCOUNT_ID, BOT_WALLET, Harness, JOURNAL_COUNTERPARTY, MARKET_MAKER_WALLET, until_called,
+};
 
 const ORDER_ID: &str = "7b3f5c1e-2d4a-4b6c-8e9f-0a1b2c3d4e5f";
 const CLIENT_UUID: &str = "66666666-6666-4666-8666-666666666666";
@@ -306,6 +308,60 @@ async fn a_withdrawal_the_gateway_refuses_is_permanent_and_known_not_applied() {
     };
     assert_eq!(hop.permanence(), Permanence::Permanent);
     assert!(!hop.outcome_unknown, "{hop:?}");
+}
+
+/// A withdrawal Alpaca's whitelist has not approved comes back as the
+/// direct path's `AddressNotWhitelisted`.
+#[tokio::test]
+async fn an_unapproved_withdrawal_address_comes_back_as_address_not_whitelisted() {
+    let harness = Harness::start().await;
+    harness.alpaca.mock(|when, then| {
+        when.method(GET)
+            .path(format!("/v1/accounts/{ACCOUNT_ID}/wallets/whitelists"));
+        then.status(200).json_body(json!([]));
+    });
+    let wallet = harness.bot_client().await.wallet();
+    let address = MARKET_MAKER_WALLET.parse().unwrap();
+
+    let error = wallet
+        .initiate_withdrawal(
+            serde_json::from_value(json!("10")).unwrap(),
+            &TokenSymbol::new("USDC"),
+            &address,
+            Uuid::new_v4(),
+            None,
+        )
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(&error, AlpacaWalletError::AddressNotWhitelisted { address: named, .. } if *named == address),
+        "{error:?}"
+    );
+}
+
+/// Alpaca's 422 on a cancel comes back as its `ApiError`, which the
+/// conversion poll reads as a declined deadline cancel, as on the direct
+/// path.
+#[tokio::test]
+async fn a_cancel_alpaca_answers_422_comes_back_with_its_status() {
+    let harness = Harness::start().await;
+    harness.alpaca.mock(|when, then| {
+        when.method(DELETE)
+            .path(format!("{}/{ORDER_ID}", orders_path()));
+        then.status(422)
+            .json_body(json!({ "message": "order is not cancelable" }));
+    });
+    let broker = harness.bot_client().await.broker();
+
+    let error = ConversionOrders::cancel_order(&broker, ORDER_ID)
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(&error, AlpacaBrokerApiError::ApiError { status, .. } if status.as_u16() == 422),
+        "{error:?}"
+    );
 }
 
 /// Accepts exactly a 5 share journal to the issuer counterparty.

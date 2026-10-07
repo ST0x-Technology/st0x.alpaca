@@ -190,13 +190,14 @@ fn answered<E>(
         // Rate limited, by Alpaca or by the human budget: the hold reads as
         // Alpaca's own.
         ErrorCode::Backpressure => Some(alpaca.unwrap_or(StatusCode::TOO_MANY_REQUESTS)),
-        ErrorCode::UpstreamTransient => alpaca,
+        // Alpaca's own answer, a rejection included: the library reads its
+        // status (a 422 on a cancel is a decline) as the direct path does.
+        ErrorCode::UpstreamTransient | ErrorCode::Rejected => alpaca,
         ErrorCode::InvalidRequest
         | ErrorCode::Unauthenticated
         | ErrorCode::Forbidden
         | ErrorCode::CapabilityDisabled
         | ErrorCode::UnknownOperation
-        | ErrorCode::Rejected
         | ErrorCode::Unavailable
         | ErrorCode::NotReady
         | ErrorCode::OutcomeUnknown => None,
@@ -283,8 +284,12 @@ fn market_data_error(
     }
 }
 
-fn wallet_error(operation: Operation, error: ClientError) -> AlpacaWalletError {
-    match answer(operation, error, untyped) {
+fn wallet_error(
+    operation: Operation,
+    error: ClientError,
+    typed: impl FnOnce(RejectionReason, &ErrorBody) -> Option<AlpacaWalletError>,
+) -> AlpacaWalletError {
+    match answer(operation, error, typed) {
         Answer::Typed(error) => error,
         Answer::Alpaca {
             status,
@@ -946,7 +951,7 @@ impl<Token: TokenSource> GatewayWallet<Token> {
         self.client
             .send(operation, params, query, body)
             .await
-            .map_err(|error| wallet_error(operation, error))
+            .map_err(|error| wallet_error(operation, error, untyped))
     }
 
     /// `wallet.withdraw`, as `AlpacaWalletService::initiate_withdrawal`: the
@@ -973,8 +978,21 @@ impl<Token: TokenSource> GatewayWallet<Token> {
             operation_id,
             reason: reason.map(str::to_string),
         };
-        self.call(Operation::WalletWithdraw, &[], NONE, Some(&request))
+        let operation = Operation::WalletWithdraw;
+        // The direct path's typed refusal, on the network it checks.
+        let not_whitelisted = |reason, _: &ErrorBody| {
+            (reason == RejectionReason::AddressNotWhitelisted).then(|| {
+                AlpacaWalletError::AddressNotWhitelisted {
+                    address: *to_address,
+                    asset: asset.clone(),
+                    network: Network::new("ethereum"),
+                }
+            })
+        };
+        self.client
+            .send(operation, &[], NONE, Some(&request))
             .await
+            .map_err(|error| wallet_error(operation, error, not_whitelisted))
     }
 
     /// `wallet.transfer`, as `AlpacaWalletService::get_transfer` followed by
@@ -1401,7 +1419,7 @@ mod tests {
                 gateway(body.clone()),
                 AlpacaBrokerApiError::LatestTrade,
             );
-            let wallet = wallet_error(operation, gateway(body.clone()));
+            let wallet = wallet_error(operation, gateway(body.clone()), untyped);
             let tokenization = tokenization_error(operation, gateway(body.clone()), untyped);
             let unknown = |hop: &GatewayHopError| hop.outcome_unknown;
 
@@ -1693,7 +1711,10 @@ mod tests {
     }
 
     /// The rejections a caller branches on come back as their library
-    /// variant; any other rejection is a permanent hop with a known outcome.
+    /// variant; a rejection Alpaca answered comes back as the family's
+    /// `ApiError` with that status, so a 422 on a cancel reads as the
+    /// decline it is on the direct path; any other rejection is a permanent
+    /// hop with a known outcome.
     #[test]
     fn only_the_rejections_a_caller_branches_on_are_rebuilt() {
         let symbol = Symbol::new("AAPL").unwrap();
@@ -1746,26 +1767,50 @@ mod tests {
             matches!(&error, AlpacaTokenizationError::RequestNotFound { id: named } if *named == id),
             "{error:?}"
         );
+        let relayed = broker_error(
+            Operation::OrdersCancel,
+            gateway(ErrorBody {
+                outcome: Some(Outcome::NotApplied),
+                alpaca_status: Some(422),
+                ..rejected(RejectionReason::AlpacaApi)
+            }),
+        );
+        assert!(
+            matches!(relayed, AlpacaBrokerApiError::ApiError { status, .. } if status == 422),
+            "{relayed:?}"
+        );
 
+        // The gateway's own rejections carry no Alpaca status.
+        let ours = |reason| {
+            gateway(ErrorBody {
+                outcome: Some(Outcome::NotApplied),
+                ..rejected(reason)
+            })
+        };
         let hops = [
-            broker_error(KEYED, refused(RejectionReason::AssetNotActive)).permanence(),
-            wallet_error(KEYLESS, refused(RejectionReason::AddressNotWhitelisted)).permanence(),
+            broker_error(KEYED, ours(RejectionReason::AssetNotActive)).permanence(),
+            wallet_error(
+                KEYLESS,
+                ours(RejectionReason::AddressNotWhitelisted),
+                untyped,
+            )
+            .permanence(),
             tokenization_error(
                 Operation::TokenizationRequest,
-                refused(RejectionReason::WrongNetwork),
+                ours(RejectionReason::WrongNetwork),
                 request_not_found(&id),
             )
             .permanence(),
             tokenization_error(
                 Operation::TokenizationMint,
-                refused(RejectionReason::RequestNotFound),
+                ours(RejectionReason::RequestNotFound),
                 mint_rejection(&symbol),
             )
             .permanence(),
         ];
         assert_eq!(hops, [Permanence::Permanent; 4]);
         assert!(matches!(
-            broker_error(KEYED, refused(RejectionReason::AssetNotActive)),
+            broker_error(KEYED, ours(RejectionReason::AssetNotActive)),
             AlpacaBrokerApiError::Gateway(GatewayHopError {
                 retryable: false,
                 outcome_unknown: false,

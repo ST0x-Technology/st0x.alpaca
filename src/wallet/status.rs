@@ -40,8 +40,8 @@ impl Default for PollingConfig {
 /// Polls a transfer until it reaches a terminal state (Complete or Failed).
 ///
 /// A failed read the poll retries (`is_retried`) is read again with
-/// exponential backoff; any other read error ends the poll. No read starts
-/// at or after the timeout, and a read still running there is dropped.
+/// exponential backoff; any other read error ends the poll. No read or
+/// backoff wait runs past the timeout.
 ///
 /// # Errors
 ///
@@ -69,11 +69,17 @@ pub async fn poll_transfer_until_complete_with(
         .with_max_delay(config.max_retry_delay);
 
     loop {
-        let transfer =
-            (|| read_before(deadline, || transfers.get_transfer(transfer_id), timed_out))
-                .retry(retry_strategy)
-                .when(is_retried)
-                .await?;
+        // The deadline bounds the whole retry, its backoff sleeps included.
+        let transfer = read_before(
+            deadline,
+            || {
+                (|| transfers.get_transfer(transfer_id))
+                    .retry(retry_strategy)
+                    .when(is_retried)
+            },
+            timed_out,
+        )
+        .await?;
 
         validate_and_log_status_change(*transfer_id, last_status, &transfer)?;
 
@@ -237,9 +243,8 @@ fn log_transfer_final_status(transfer_id: AlpacaTransferId, status: TransferStat
 /// Polls for an incoming deposit transfer matching the given tx hash, through
 /// [`WalletTransfers::find_deposit_by_tx_hash`], until it is detected and
 /// reaches a terminal state. A failed lookup the poll retries
-/// (`is_retried`) is looked up again with exponential backoff. No lookup
-/// starts at or after the timeout, and a lookup still running there is
-/// dropped.
+/// (`is_retried`) is looked up again with exponential backoff. No lookup or
+/// backoff wait runs past the timeout.
 ///
 /// # Errors
 ///
@@ -267,15 +272,16 @@ pub async fn poll_deposit_by_tx_hash_with(
         .with_max_delay(config.max_retry_delay);
 
     loop {
-        let maybe_transfer = (|| {
-            read_before(
-                deadline,
-                || transfers.find_deposit_by_tx_hash(tx_hash),
-                timed_out,
-            )
-        })
-        .retry(retry_strategy)
-        .when(is_retried)
+        // The deadline bounds the whole retry, its backoff sleeps included.
+        let maybe_transfer = read_before(
+            deadline,
+            || {
+                (|| transfers.find_deposit_by_tx_hash(tx_hash))
+                    .retry(retry_strategy)
+                    .when(is_retried)
+            },
+            timed_out,
+        )
         .await?;
 
         let Some(transfer) = maybe_transfer else {
@@ -1521,5 +1527,47 @@ mod tests {
         );
         assert_eq!(started.elapsed(), deadline);
         assert_eq!(transfers.started.get(), 1);
+    }
+
+    /// A backoff wait longer than the time left ends at the deadline: both
+    /// backoff polls time out there instead of sleeping the whole wait.
+    #[tokio::test(start_paused = true)]
+    async fn a_backoff_wait_past_the_deadline_ends_the_poll_at_the_deadline() {
+        let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
+        let tx_hash =
+            fixed_bytes!("abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890");
+        let deadline = Duration::from_secs(1);
+        let config = PollingConfig {
+            min_retry_delay: Duration::from_secs(60),
+            max_retry_delay: Duration::from_secs(60),
+            ..fast_polling(deadline)
+        };
+        let unavailable = || AlpacaWalletError::ApiError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: String::new(),
+            retry_after: None,
+        };
+
+        let transfers = ScriptedTransfers::new(vec![Err(unavailable())], vec![]);
+        let started = Instant::now();
+        let error = poll_transfer_until_complete_with(&transfers, &transfer_id, &config)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, AlpacaWalletError::TransferTimeout { .. }),
+            "{error:?}"
+        );
+        assert_eq!(started.elapsed(), deadline);
+
+        let deposits = ScriptedTransfers::new(vec![], vec![Err(unavailable())]);
+        let started = Instant::now();
+        let error = poll_deposit_by_tx_hash_with(&deposits, &tx_hash, &config)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, AlpacaWalletError::DepositTimeout { .. }),
+            "{error:?}"
+        );
+        assert_eq!(started.elapsed(), deadline);
     }
 }
