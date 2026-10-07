@@ -19,7 +19,6 @@ use st0x_alpaca::broker::{AlpacaBrokerApi, AlpacaBrokerApiError};
 use st0x_alpaca::core::{AlpacaClient, AlpacaError, Network};
 use st0x_alpaca::corporate_actions::{
     CorporateActionEndpointError, CorporateActionStreamBuildError, CorporateActionStreamClient,
-    CorporateActionStreamEndpoint,
 };
 use st0x_alpaca::request_id::{self, SendGate, Traffic};
 use st0x_alpaca::tokenization::{AlpacaTokenizationError, AlpacaTokenizationService};
@@ -107,13 +106,14 @@ pub enum StartupError {
     StreamClient(#[from] CorporateActionStreamBuildError),
 }
 
-/// The `s01` profile's clients. Mint callbacks and redemptions each have
-/// their own issuer client, so a `Retry-After` hold on one does not stall
-/// the other.
+/// The `s01` profile's clients. Mint callbacks, redemptions and request
+/// status reads each have their own issuer client, so a `Retry-After` hold
+/// on one (a human polling `issuer.request` included) does not stall the
+/// others.
 pub struct IssuerClients {
     pub mint_callbacks: AlpacaClient,
-    /// Redemptions and request status reads.
     pub redemptions: AlpacaClient,
+    pub requests: AlpacaClient,
     pub corporate_actions: CorporateActionStreamClient,
 }
 
@@ -132,22 +132,12 @@ impl IssuerClients {
                 ISSUER_REQUEST_TIMEOUT,
             )
         };
-        // Tests serve the stream from a loopback mock that still gets the
-        // credentials; a deployed gateway sends them to Alpaca's host only.
-        #[cfg(any(test, feature = "test-support"))]
-        let endpoint = CorporateActionStreamEndpoint::authenticated_loopback(
-            &config.corporate_actions.stream_url,
-        )?;
-        #[cfg(not(any(test, feature = "test-support")))]
-        let endpoint = CorporateActionStreamEndpoint::parse(
-            &config.corporate_actions.stream_url,
-            st0x_alpaca::corporate_actions::DevelopmentLoopback::Deny,
-        )?;
         Ok(Self {
             mint_callbacks: client()?,
             redemptions: client()?,
+            requests: client()?,
             corporate_actions: CorporateActionStreamClient::new(
-                endpoint,
+                config.corporate_actions.endpoint()?,
                 broker.auth.clone(),
                 &token_url,
                 ISSUER_CONNECT_TIMEOUT,

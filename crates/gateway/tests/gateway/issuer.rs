@@ -105,7 +105,7 @@ async fn the_bot_mint_callback_is_applied_and_audited_as_s01() {
 /// Alpaca gave, a refused credential's too.
 #[tokio::test]
 async fn a_redeem_rejected_after_a_server_error_is_outcome_unknown_and_alone_not_applied() {
-    for refusal in [422, 403] {
+    for refusal in [400, 403] {
         let harness = Harness::start_s01().await;
         let failed = harness.alpaca.mock(|when, then| {
             when.method(POST).path(callback_path("redeem"));

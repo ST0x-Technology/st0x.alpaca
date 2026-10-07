@@ -503,7 +503,9 @@ impl AlpacaError {
 pub struct IssuerCallError {
     /// `false` for a read, and for a POST when no attempt left this process
     /// or Alpaca answered each one with a definite rejection (a 4xx other
-    /// than 408). `true` once a POST attempt may have been written: any
+    /// than 408, and other than the status the endpoint also gives after
+    /// it may have applied the request: 400 for a mint callback, 422 for a
+    /// redeem). `true` once a POST attempt may have been written: any
     /// other answer, an answer lost after the request could have left, or a
     /// 2xx that did not read back.
     pub written: bool,
@@ -513,6 +515,18 @@ pub struct IssuerCallError {
     pub alpaca_status: Option<u16>,
     #[source]
     pub error: AlpacaError,
+}
+
+#[cfg(feature = "issuer")]
+impl IssuerCallError {
+    /// Marks the call written when Alpaca's final answer is `status`, which
+    /// the endpoint also gives once the request may have been applied. A
+    /// 4xx ends the retry loop, so the final answer is the last attempt's.
+    pub(crate) fn written_on(self, status: u16) -> Self {
+        let written = self.written
+            || matches!(self.error, AlpacaError::Api { status_code, .. } if status_code == status);
+        Self { written, ..self }
+    }
 }
 
 /// Whether a failed attempt may have reached Alpaca, by the rule of

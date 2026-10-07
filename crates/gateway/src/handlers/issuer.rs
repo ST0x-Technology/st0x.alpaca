@@ -82,7 +82,7 @@ async fn request(
         .read(call, intent, |state| async move {
             state
                 .issuer()?
-                .redemptions
+                .requests
                 .poll_request_status_reporting(&request_id)
                 .await
                 .map_err(|failure| issuer_call(&failure))

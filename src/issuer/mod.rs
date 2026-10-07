@@ -315,6 +315,9 @@ impl AlpacaClient {
             }
         })
         .await
+        // Alpaca documents a 400 here as an internal failure while it
+        // processes the confirmation, not as a rejection.
+        .map_err(|failure| failure.written_on(400))
     }
 
     /// [`IssuerApi::call_redeem_endpoint`], reporting whether the redeem call
@@ -379,6 +382,9 @@ impl AlpacaClient {
             }
         })
         .await
+        // Alpaca answers 422 to an `issuer_request_id` it has already seen,
+        // so a resend after a lost answer gets 422 for an applied redeem.
+        .map_err(|failure| failure.written_on(422))
     }
 
     /// [`IssuerApi::poll_request_status`], reporting the status of the last
@@ -2289,10 +2295,10 @@ mod tests {
         mock.assert_calls(3);
     }
 
-    /// The 500 may have applied the redeem, so the later definite 422 does
+    /// The 500 may have applied the redeem, so the later definite 400 does
     /// not make the call unwritten. Both answers reach the audit.
     #[tokio::test]
-    async fn a_redeem_answered_500_then_422_is_written() {
+    async fn a_redeem_answered_500_then_400_is_written() {
         let server = MockServer::start_async().await;
         let mut failed = server.mock(|when, then| {
             when.method(POST)
@@ -2316,7 +2322,7 @@ mod tests {
         let rejected = server.mock(|when, then| {
             when.method(POST)
                 .path("/v1/accounts/test-account/tokenization/callback/redeem");
-            then.status(422).header(ALPACA_REQUEST_ID_HEADER, "second");
+            then.status(400).header(ALPACA_REQUEST_ID_HEADER, "second");
         });
 
         let (result, traffic) = tokio::time::timeout(Duration::from_secs(5), call)
@@ -2326,12 +2332,12 @@ mod tests {
         let failure = result.unwrap_err();
 
         assert!(failure.written);
-        assert_eq!(failure.alpaca_status, Some(422));
+        assert_eq!(failure.alpaca_status, Some(400));
         assert!(
             matches!(
                 failure.error,
                 AlpacaError::Api {
-                    status_code: 422,
+                    status_code: 400,
                     ..
                 }
             ),
@@ -2342,35 +2348,55 @@ mod tests {
             traffic,
             Traffic {
                 request_ids: vec!["first".to_string(), "second".to_string()],
-                last_status: Some(422),
+                last_status: Some(400),
             }
         );
         rejected.assert_calls(1);
     }
 
+    /// A lone 4xx is a rejection, except the status each endpoint also gives
+    /// once the request may have been applied: a mint callback 400 (an
+    /// internal failure at Alpaca) and a redeem 422 (a reused
+    /// `issuer_request_id`).
     #[tokio::test]
-    async fn a_redeem_answered_422_alone_is_not_written() {
-        let server = MockServer::start_async().await;
-        let rejected = server.mock(|when, then| {
-            when.method(POST)
-                .path("/v1/accounts/test-account/tokenization/callback/redeem");
-            then.status(422);
-        });
-        let client = make_client(&server, "test-account", "test-key", "test-secret");
+    async fn a_lone_4xx_is_not_written_unless_it_may_follow_an_applied_request() {
+        for (endpoint, status, written) in [
+            ("mint", 400, true),
+            ("mint", 422, false),
+            ("redeem", 400, false),
+            ("redeem", 422, true),
+        ] {
+            let server = MockServer::start_async().await;
+            let answered = server.mock(|when, then| {
+                when.method(POST).path(format!(
+                    "/v1/accounts/test-account/tokenization/callback/{endpoint}"
+                ));
+                then.status(status);
+            });
+            let client = make_client(&server, "test-account", "test-key", "test-secret");
 
-        let failure = client
-            .call_redeem_endpoint_reporting(create_redeem_request())
-            .await
-            .unwrap_err();
+            let failure = if endpoint == "mint" {
+                client
+                    .send_mint_callback_reporting(create_test_request())
+                    .await
+                    .unwrap_err()
+            } else {
+                client
+                    .call_redeem_endpoint_reporting(create_redeem_request())
+                    .await
+                    .unwrap_err()
+            };
 
-        assert!(!failure.written);
-        rejected.assert_calls(1);
+            assert_eq!(failure.written, written, "{endpoint} {status}");
+            assert_eq!(failure.alpaca_status, Some(status));
+            answered.assert_calls(1);
+        }
     }
 
     /// A definite rejection whose body is cut short is still that rejection,
     /// as the credential mint reads its error bodies.
     #[tokio::test]
-    async fn a_redeem_422_whose_body_is_cut_short_is_not_written() {
+    async fn a_redeem_400_whose_body_is_cut_short_is_not_written() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2385,7 +2411,7 @@ mod tests {
                 request.extend_from_slice(&chunk[..read]);
             }
             socket
-                .write_all(b"HTTP/1.1 422 Unprocessable Entity\r\ncontent-length: 100\r\n\r\n{\"")
+                .write_all(b"HTTP/1.1 400 Bad Request\r\ncontent-length: 100\r\n\r\n{\"")
                 .await
                 .unwrap();
         });
@@ -2408,7 +2434,7 @@ mod tests {
             matches!(
                 failure.error,
                 AlpacaError::Api {
-                    status_code: 422,
+                    status_code: 400,
                     ..
                 }
             ),
@@ -2416,7 +2442,7 @@ mod tests {
             failure.error
         );
         assert!(!failure.written);
-        assert_eq!(failure.alpaca_status, Some(422));
+        assert_eq!(failure.alpaca_status, Some(400));
     }
 
     /// `Auth` covers 401 and 403 alike; the status is the one Alpaca sent.
