@@ -471,16 +471,22 @@ fn network_refusal(
     }
 }
 
-/// Maps an issuer error.
+/// Maps an issuer error. It sets no Alpaca status the error does not name:
+/// [`issuer_call`] takes it from the answers the call got.
 #[must_use]
 pub fn issuer(error: &AlpacaError, sent: Sent) -> Failure {
     use AlpacaError as E;
 
     let message = error.to_string();
     if let Some(pressure) = error.backpressure() {
-        let status = matches!(error, E::RateLimited { .. })
-            .then_some(reqwest::StatusCode::TOO_MANY_REQUESTS);
-        return throttled(pressure.retry_after, status, message);
+        // An Alpaca 429, or the client's hold from an earlier one.
+        if matches!(error, E::RateLimited { .. }) {
+            return Failure {
+                retry_after: pressure.retry_after,
+                ..Failure::new(ErrorCode::Backpressure, message)
+            };
+        }
+        return throttled(pressure.retry_after, None, message);
     }
 
     match error {
@@ -509,26 +515,26 @@ pub fn issuer(error: &AlpacaError, sent: Sent) -> Failure {
     }
 }
 
-/// Maps a failed issuer POST as [`placement`] maps an order: once it may
-/// have been written, `outcome_unknown` keeping the Alpaca status and any
-/// hold; before that, as a read.
+/// Maps a failed issuer call as [`placement`] maps an order: once a POST
+/// may have been written, `outcome_unknown` keeping any hold; before that,
+/// and for a read, as [`issuer`] maps a read. Either carries the status of
+/// the last answer Alpaca gave the call.
 #[must_use]
 pub fn issuer_call(failure: &IssuerCallError) -> Failure {
-    if !failure.written {
-        return issuer(&failure.error, Sent::Read);
-    }
-    let alpaca_status = match &failure.error {
-        AlpacaError::Api { status_code, .. } => Some(*status_code),
-        AlpacaError::RateLimited { .. } => Some(429),
-        _ => None,
+    let mapped = if failure.written {
+        Failure {
+            retry_after: failure
+                .error
+                .backpressure()
+                .and_then(|pressure| pressure.retry_after),
+            ..Failure::new(ErrorCode::OutcomeUnknown, failure.error.to_string())
+        }
+    } else {
+        issuer(&failure.error, Sent::Read)
     };
     Failure {
-        alpaca_status,
-        retry_after: failure
-            .error
-            .backpressure()
-            .and_then(|pressure| pressure.retry_after),
-        ..Failure::new(ErrorCode::OutcomeUnknown, failure.error.to_string())
+        alpaca_status: failure.alpaca_status,
+        ..mapped
     }
 }
 
@@ -557,9 +563,11 @@ pub fn corporate_actions(error: &CorporateActionStreamError) -> Failure {
         }
         E::Http(source) if never_left(source) => unsent(source, message),
         E::Http(_) => untyped(Sent::Read, Permanence::Transient, message),
-        E::HttpStatus(status) if *status == reqwest::StatusCode::TOO_MANY_REQUESTS => {
-            throttled(None, Some(*status), message)
-        }
+        E::RateLimited { retry_after } => throttled(
+            *retry_after,
+            Some(reqwest::StatusCode::TOO_MANY_REQUESTS),
+            message,
+        ),
         // A refused redirect repeats; a 408 or 5xx can clear.
         E::HttpStatus(status) => {
             let permanence = if status.is_redirection() {
@@ -569,7 +577,9 @@ pub fn corporate_actions(error: &CorporateActionStreamError) -> Failure {
             };
             api_failure(*status, Sent::Read, permanence, message)
         }
-        E::InvalidContentType(_) => untyped(Sent::Read, Permanence::Permanent, message),
+        E::InvalidContentType { status, .. } => {
+            api_failure(*status, Sent::Read, Permanence::Permanent, message)
+        }
     }
 }
 
@@ -741,11 +751,13 @@ mod tests {
                 .for_mutation(Operation::TokenizationMint),
             issuer_call(&IssuerCallError {
                 written: false,
+                alpaca_status: None,
                 error: AlpacaError::NotSent(GateClosed),
             })
             .for_mutation(Operation::IssuerRedeem),
             issuer_call(&IssuerCallError {
                 written: false,
+                alpaca_status: None,
                 error: AlpacaError::Jwt(mint()),
             })
             .for_mutation(Operation::IssuerRedeem),

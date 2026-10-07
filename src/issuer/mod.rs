@@ -270,7 +270,7 @@ impl Serialize for RedeemQty {
 
 impl AlpacaClient {
     /// [`IssuerApi::send_mint_callback`], reporting whether the callback may
-    /// have reached Alpaca.
+    /// have reached Alpaca and the status of the last answer Alpaca gave.
     ///
     /// # Errors
     ///
@@ -298,15 +298,15 @@ impl AlpacaClient {
             match status {
                 StatusCode::OK => Ok(()),
                 StatusCode::TOO_MANY_REQUESTS => {
-                    let body = response.text().await?;
+                    let body = response.text().await.unwrap_or_default();
                     Err(AlpacaError::RateLimited { body, retry_after })
                 }
                 StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
-                    let body = response.text().await?;
+                    let body = response.text().await.unwrap_or_default();
                     Err(AlpacaError::Auth(body))
                 }
                 status => {
-                    let body = response.text().await?;
+                    let body = response.text().await.unwrap_or_default();
                     Err(AlpacaError::Api {
                         status_code: status.as_u16(),
                         body,
@@ -318,7 +318,7 @@ impl AlpacaClient {
     }
 
     /// [`IssuerApi::call_redeem_endpoint`], reporting whether the redeem call
-    /// may have reached Alpaca.
+    /// may have reached Alpaca and the status of the last answer Alpaca gave.
     ///
     /// # Errors
     ///
@@ -331,6 +331,7 @@ impl AlpacaClient {
         if !itn::accepts_network_wire_string(request.network.as_str()) {
             return Err(IssuerCallError {
                 written: false,
+                alpaca_status: None,
                 error: AlpacaError::UnsupportedTokenizationNetwork {
                     network: request.network,
                     reference: itn::REDEEM_CALLBACK_OPENAPI_REFERENCE,
@@ -361,15 +362,15 @@ impl AlpacaClient {
                         .map_err(|source| AlpacaError::Parse { body, source })
                 }
                 StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
-                    let body = response.text().await?;
+                    let body = response.text().await.unwrap_or_default();
                     Err(AlpacaError::Auth(body))
                 }
                 StatusCode::TOO_MANY_REQUESTS => {
-                    let body = response.text().await?;
+                    let body = response.text().await.unwrap_or_default();
                     Err(AlpacaError::RateLimited { body, retry_after })
                 }
                 status => {
-                    let body = response.text().await?;
+                    let body = response.text().await.unwrap_or_default();
                     Err(AlpacaError::Api {
                         status_code: status.as_u16(),
                         body,
@@ -379,29 +380,19 @@ impl AlpacaClient {
         })
         .await
     }
-}
 
-#[async_trait]
-impl IssuerApi for AlpacaClient {
-    async fn send_mint_callback(&self, request: MintCallbackRequest) -> Result<(), AlpacaError> {
-        self.send_mint_callback_reporting(request)
-            .await
-            .map_err(|failure| failure.error)
-    }
-
-    async fn call_redeem_endpoint(
-        &self,
-        request: RedeemRequest,
-    ) -> Result<RedeemResponse, AlpacaError> {
-        self.call_redeem_endpoint_reporting(request)
-            .await
-            .map_err(|failure| failure.error)
-    }
-
-    async fn poll_request_status(
+    /// [`IssuerApi::poll_request_status`], reporting the status of the last
+    /// answer Alpaca gave. A read writes nothing, so its
+    /// [`IssuerCallError::written`] is always `false`.
+    ///
+    /// # Errors
+    ///
+    /// The [`IssuerApi::poll_request_status`] error in an
+    /// [`IssuerCallError`].
+    pub async fn poll_request_status_reporting(
         &self,
         tokenization_request_id: &TokenizationRequestId,
-    ) -> Result<TokenizationRequest, AlpacaError> {
+    ) -> Result<TokenizationRequest, IssuerCallError> {
         let path = [
             "v1",
             "accounts",
@@ -411,7 +402,7 @@ impl IssuerApi for AlpacaClient {
             tokenization_request_id.0.as_str(),
         ];
 
-        self.with_retry(|| async {
+        self.with_retry_reporting(|| async {
             let response = request_id::send(self.get(&path).await?).await?;
 
             let status = response.status();
@@ -438,22 +429,22 @@ impl IssuerApi for AlpacaClient {
                     Ok(request)
                 }
                 StatusCode::NOT_FOUND => {
-                    let body = response.text().await?;
+                    let body = response.text().await.unwrap_or_default();
                     Err(AlpacaError::RequestNotFound {
                         id: tokenization_request_id.clone(),
                         body,
                     })
                 }
                 StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
-                    let body = response.text().await?;
+                    let body = response.text().await.unwrap_or_default();
                     Err(AlpacaError::Auth(body))
                 }
                 StatusCode::TOO_MANY_REQUESTS => {
-                    let body = response.text().await?;
+                    let body = response.text().await.unwrap_or_default();
                     Err(AlpacaError::RateLimited { body, retry_after })
                 }
                 status => {
-                    let body = response.text().await?;
+                    let body = response.text().await.unwrap_or_default();
                     Err(AlpacaError::Api {
                         status_code: status.as_u16(),
                         body,
@@ -462,6 +453,37 @@ impl IssuerApi for AlpacaClient {
             }
         })
         .await
+        .map_err(|failure| IssuerCallError {
+            written: false,
+            ..failure
+        })
+    }
+}
+
+#[async_trait]
+impl IssuerApi for AlpacaClient {
+    async fn send_mint_callback(&self, request: MintCallbackRequest) -> Result<(), AlpacaError> {
+        self.send_mint_callback_reporting(request)
+            .await
+            .map_err(|failure| failure.error)
+    }
+
+    async fn call_redeem_endpoint(
+        &self,
+        request: RedeemRequest,
+    ) -> Result<RedeemResponse, AlpacaError> {
+        self.call_redeem_endpoint_reporting(request)
+            .await
+            .map_err(|failure| failure.error)
+    }
+
+    async fn poll_request_status(
+        &self,
+        tokenization_request_id: &TokenizationRequestId,
+    ) -> Result<TokenizationRequest, AlpacaError> {
+        self.poll_request_status_reporting(tokenization_request_id)
+            .await
+            .map_err(|failure| failure.error)
     }
 }
 
@@ -2304,6 +2326,7 @@ mod tests {
         let failure = result.unwrap_err();
 
         assert!(failure.written);
+        assert_eq!(failure.alpaca_status, Some(422));
         assert!(
             matches!(
                 failure.error,
@@ -2342,6 +2365,106 @@ mod tests {
 
         assert!(!failure.written);
         rejected.assert_calls(1);
+    }
+
+    /// A definite rejection whose body is cut short is still that rejection,
+    /// as the credential mint reads its error bodies.
+    #[tokio::test]
+    async fn a_redeem_422_whose_body_is_cut_short_is_not_written() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = socket.read(&mut chunk).await.unwrap();
+                assert_ne!(read, 0, "the client closed before sending its request");
+                request.extend_from_slice(&chunk[..read]);
+            }
+            socket
+                .write_all(b"HTTP/1.1 422 Unprocessable Entity\r\ncontent-length: 100\r\n\r\n{\"")
+                .await
+                .unwrap();
+        });
+        let client = AlpacaClient::new(
+            &url,
+            "test-account".to_string(),
+            "test-key".to_string(),
+            "test-secret".to_string(),
+            Duration::from_secs(10),
+            Duration::from_secs(30),
+        )
+        .unwrap();
+
+        let failure = client
+            .call_redeem_endpoint_reporting(create_redeem_request())
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                failure.error,
+                AlpacaError::Api {
+                    status_code: 422,
+                    ..
+                }
+            ),
+            "{:?}",
+            failure.error
+        );
+        assert!(!failure.written);
+        assert_eq!(failure.alpaca_status, Some(422));
+    }
+
+    /// `Auth` covers 401 and 403 alike; the status is the one Alpaca sent.
+    #[tokio::test]
+    async fn a_request_read_answered_401_reports_401_and_is_not_written() {
+        let server = MockServer::start_async().await;
+        let refused = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/accounts/test-account/tokenization/requests/request-1");
+            then.status(401);
+        });
+        let client = make_client(&server, "test-account", "test-key", "test-secret");
+
+        let failure = client
+            .poll_request_status_reporting(&TokenizationRequestId("request-1".to_string()))
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(failure.error, AlpacaError::Auth(_)),
+            "{:?}",
+            failure.error
+        );
+        assert!(!failure.written);
+        assert_eq!(failure.alpaca_status, Some(401));
+        refused.assert_calls(1);
+    }
+
+    /// A read Alpaca answered 500 on every attempt wrote nothing.
+    #[tokio::test]
+    async fn a_request_read_answered_500_is_not_written() {
+        let server = MockServer::start_async().await;
+        let failed = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/accounts/test-account/tokenization/requests/request-1");
+            then.status(500);
+        });
+        let client =
+            make_client(&server, "test-account", "test-key", "test-secret").with_max_retries(1);
+
+        let failure = client
+            .poll_request_status_reporting(&TokenizationRequestId("request-1".to_string()))
+            .await
+            .unwrap_err();
+
+        assert!(!failure.written);
+        assert_eq!(failure.alpaca_status, Some(500));
+        failed.assert_calls(2);
     }
 
     #[tokio::test]

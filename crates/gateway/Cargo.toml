@@ -12,8 +12,8 @@ path = "src/main.rs"
 
 [features]
 # Test only hooks for this crate's own integration tests: per test
-# deadlines and the in memory audit sink.
-test-support = []
+# deadlines, the in memory audit sink, and a credentialed loopback stream.
+test-support = ["st0x-alpaca/test-support"]
 
 [dependencies]
 alloy-primitives = { version = "1", features = ["serde"] }

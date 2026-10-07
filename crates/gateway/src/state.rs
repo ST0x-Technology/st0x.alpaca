@@ -19,7 +19,7 @@ use st0x_alpaca::broker::{AlpacaBrokerApi, AlpacaBrokerApiError};
 use st0x_alpaca::core::{AlpacaClient, AlpacaError, Network};
 use st0x_alpaca::corporate_actions::{
     CorporateActionEndpointError, CorporateActionStreamBuildError, CorporateActionStreamClient,
-    CorporateActionStreamEndpoint, DevelopmentLoopback,
+    CorporateActionStreamEndpoint,
 };
 use st0x_alpaca::request_id::{self, SendGate, Traffic};
 use st0x_alpaca::tokenization::{AlpacaTokenizationError, AlpacaTokenizationService};
@@ -132,15 +132,17 @@ impl IssuerClients {
                 ISSUER_REQUEST_TIMEOUT,
             )
         };
-        // Tests serve the stream from a loopback mock, which gets no
+        // Tests serve the stream from a loopback mock that still gets the
         // credentials; a deployed gateway sends them to Alpaca's host only.
-        let loopback = if cfg!(any(test, feature = "test-support")) {
-            DevelopmentLoopback::Allow
-        } else {
-            DevelopmentLoopback::Deny
-        };
-        let endpoint =
-            CorporateActionStreamEndpoint::parse(&config.corporate_actions.stream_url, loopback)?;
+        #[cfg(any(test, feature = "test-support"))]
+        let endpoint = CorporateActionStreamEndpoint::authenticated_loopback(
+            &config.corporate_actions.stream_url,
+        )?;
+        #[cfg(not(any(test, feature = "test-support")))]
+        let endpoint = CorporateActionStreamEndpoint::parse(
+            &config.corporate_actions.stream_url,
+            st0x_alpaca::corporate_actions::DevelopmentLoopback::Deny,
+        )?;
         Ok(Self {
             mint_callbacks: client()?,
             redemptions: client()?,

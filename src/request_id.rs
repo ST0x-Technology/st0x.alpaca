@@ -7,7 +7,7 @@
 //! request and no credential mint of that future starts. Outside a scope
 //! nothing is recorded and every request may leave.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
@@ -96,6 +96,7 @@ pub(crate) enum SendError {
 tokio::task_local! {
     static TRAFFIC: RefCell<Traffic>;
     static GATE: SendGate;
+    static LAST_ANSWER: Cell<Option<u16>>;
 }
 
 /// Runs `future` and returns its output with the Alpaca traffic it made.
@@ -106,6 +107,21 @@ pub async fn collect<Output>(future: impl Future<Output = Output>) -> (Output, T
             (output, TRAFFIC.with(RefCell::take))
         })
         .await
+}
+
+/// Runs `future` keeping the status of the last Alpaca API answer it gets,
+/// which [`last_answer`] reads from inside it. Its traffic still counts in
+/// the enclosing [`collect`] scope.
+#[cfg(feature = "issuer")]
+pub(crate) fn tracking_last_answer<Fut: Future>(future: Fut) -> impl Future<Output = Fut::Output> {
+    LAST_ANSWER.scope(Cell::new(None), future)
+}
+
+/// The status of the last Alpaca API answer the enclosing
+/// [`tracking_last_answer`] scope got; `None` when it got none.
+#[cfg(feature = "issuer")]
+pub(crate) fn last_answer() -> Option<u16> {
+    LAST_ANSWER.try_with(Cell::get).ok().flatten()
 }
 
 /// Runs `future` with every Alpaca request and credential mint it starts
@@ -145,6 +161,7 @@ pub(crate) fn ensure_open() -> Result<(), GateClosed> {
 /// client calls it right after its send returns, before reading the body.
 pub(crate) fn record(status: StatusCode, headers: &HeaderMap) {
     update(|traffic| traffic.last_status = Some(status.as_u16()));
+    let _ = LAST_ANSWER.try_with(|last| last.set(Some(status.as_u16())));
     record_id(headers);
 }
 

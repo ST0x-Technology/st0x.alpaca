@@ -11,11 +11,13 @@ use st0x_alpaca::corporate_actions::{
 use st0x_alpaca::issuer::{
     self, ClientId, IssuerRequestId, RedeemQty, TokenSymbol, UnderlyingSymbol,
 };
+use st0x_alpaca::st0x_finance::Positive;
 
 /// `issuer.mint_callback` request: Alpaca is told the mint went out onchain.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct MintCallbackRequest {
+    #[serde(deserialize_with = "tokenization_request_id")]
     pub tokenization_request_id: TokenizationRequestId,
     pub client_id: ClientId,
     pub wallet_address: Address,
@@ -39,11 +41,14 @@ impl From<MintCallbackRequest> for issuer::MintCallbackRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RedeemRequest {
+    #[serde(deserialize_with = "issuer_request_id")]
     pub issuer_request_id: IssuerRequestId,
+    #[serde(deserialize_with = "underlying_symbol")]
     pub underlying_symbol: UnderlyingSymbol,
+    #[serde(deserialize_with = "token_symbol")]
     pub token_symbol: TokenSymbol,
     pub client_id: ClientId,
-    /// Sent to Alpaca exactly as spelled here.
+    /// Strictly positive, sent to Alpaca exactly as spelled here.
     #[serde(deserialize_with = "redeem_qty")]
     pub quantity: RedeemQty,
     pub network: Network,
@@ -66,8 +71,54 @@ impl From<RedeemRequest> for issuer::RedeemRequest {
     }
 }
 
+/// `issuer.request` path: the tokenization request to read, under the same
+/// rule as the body field.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RequestPath {
+    #[serde(deserialize_with = "tokenization_request_id")]
+    pub tokenization_request_id: TokenizationRequestId,
+}
+
+/// Reads a request id: not blank, at most [`super::REQUEST_ID_MAX`]
+/// characters.
+fn request_id<'de, D: Deserializer<'de>>(field: &str, deserializer: D) -> Result<String, D::Error> {
+    let raw = super::bounded(field, super::REQUEST_ID_MAX, deserializer)?;
+    if raw.trim().is_empty() {
+        return Err(serde::de::Error::custom(format_args!(
+            "{field} must not be blank"
+        )));
+    }
+    Ok(raw)
+}
+
+fn tokenization_request_id<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<TokenizationRequestId, D::Error> {
+    request_id("tokenizationRequestId", deserializer).map(TokenizationRequestId)
+}
+
+fn issuer_request_id<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<IssuerRequestId, D::Error> {
+    request_id("issuerRequestId", deserializer).map(IssuerRequestId)
+}
+
+fn underlying_symbol<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<UnderlyingSymbol, D::Error> {
+    super::symbol(deserializer).map(UnderlyingSymbol)
+}
+
+fn token_symbol<'de, D: Deserializer<'de>>(deserializer: D) -> Result<TokenSymbol, D::Error> {
+    super::safe_symbol(deserializer).map(TokenSymbol)
+}
+
 fn redeem_qty<'de, D: Deserializer<'de>>(deserializer: D) -> Result<RedeemQty, D::Error> {
-    RedeemQty::new(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    let quantity =
+        RedeemQty::new(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)?;
+    Positive::new(quantity.shares().0).map_err(serde::de::Error::custom)?;
+    Ok(quantity)
 }
 
 /// `corporate_actions.stream` query: where the relayed stream starts.

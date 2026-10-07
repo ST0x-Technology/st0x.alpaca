@@ -3,12 +3,10 @@
 use axum::extract::State;
 use axum::response::Response;
 use axum::routing::{MethodRouter, get, post};
-use st0x_alpaca::core::TokenizationRequestId;
-use st0x_alpaca::issuer::IssuerApi as _;
 use st0x_alpaca_gateway_api::Operation;
-use st0x_alpaca_gateway_api::dto::issuer::{MintCallbackRequest, RedeemRequest};
+use st0x_alpaca_gateway_api::dto::issuer::{MintCallbackRequest, RedeemRequest, RequestPath};
 
-use crate::answer::{Sent, issuer, issuer_call};
+use crate::answer::issuer_call;
 use crate::extract::{Body, Params};
 use crate::state::{AppState, Call, Done, Intent};
 
@@ -75,7 +73,9 @@ async fn redeem(
 async fn request(
     State(state): State<AppState>,
     call: Call,
-    Params(request_id): Params<TokenizationRequestId>,
+    Params(RequestPath {
+        tokenization_request_id: request_id,
+    }): Params<RequestPath>,
 ) -> Response {
     let intent = Intent::default().key(&request_id);
     state
@@ -83,9 +83,9 @@ async fn request(
             state
                 .issuer()?
                 .redemptions
-                .poll_request_status(&request_id)
+                .poll_request_status_reporting(&request_id)
                 .await
-                .map_err(|error| issuer(&error, Sent::Read))
+                .map_err(|failure| issuer_call(&failure))
         })
         .await
 }

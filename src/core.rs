@@ -23,7 +23,7 @@ use crate::endpoint::{EndpointError, EndpointRole, resolve_segments, validate_or
 #[cfg(feature = "issuer")]
 use crate::rate_limit::MAX_RETRY_AFTER_HOLD;
 #[cfg(feature = "issuer")]
-use crate::request_id::{GateClosed, SendError};
+use crate::request_id::{self, GateClosed, SendError};
 
 /// Alpaca API credentials applied to every request.
 #[derive(Clone, Deserialize)]
@@ -262,8 +262,21 @@ impl AlpacaClient {
     }
 
     /// [`Self::with_retry`], also reporting whether any attempt may have
-    /// reached Alpaca.
-    pub(crate) async fn with_retry_reporting<Value, Fut, Operation>(
+    /// reached Alpaca and the status of the last answer Alpaca gave.
+    pub(crate) fn with_retry_reporting<Value, Fut, Operation>(
+        &self,
+        operation: Operation,
+    ) -> impl Future<Output = Result<Value, IssuerCallError>>
+    where
+        Operation: FnMut() -> Fut,
+        Fut: Future<Output = Result<Value, AlpacaError>>,
+    {
+        request_id::tracking_last_answer(self.retry_attempts(operation))
+    }
+
+    /// The retry loop of [`Self::with_retry_reporting`], run inside its
+    /// [`request_id::tracking_last_answer`] scope.
+    async fn retry_attempts<Value, Fut, Operation>(
         &self,
         mut operation: Operation,
     ) -> Result<Value, IssuerCallError>
@@ -314,7 +327,11 @@ impl AlpacaClient {
             }
             tokio::time::sleep(delay).await;
         };
-        Err(IssuerCallError { written, error })
+        Err(IssuerCallError {
+            written,
+            alpaca_status: request_id::last_answer(),
+            error,
+        })
     }
 
     /// Time left until the shared `Retry-After` deadline, if one is ahead.
@@ -478,16 +495,22 @@ impl AlpacaError {
     }
 }
 
-/// A failed issuer POST, with whether it may have reached Alpaca.
+/// A failed issuer call, with whether it may have written at Alpaca and
+/// what Alpaca last answered.
 #[cfg(feature = "issuer")]
 #[derive(Debug, thiserror::Error)]
 #[error("Alpaca issuer call failed")]
 pub struct IssuerCallError {
-    /// `false` when no attempt left this process or Alpaca answered each
-    /// one with a definite rejection (a 4xx other than 408). `true` once an
-    /// attempt may have been written: any other answer, an answer lost after
-    /// the request could have left, or a 2xx that did not read back.
+    /// `false` for a read, and for a POST when no attempt left this process
+    /// or Alpaca answered each one with a definite rejection (a 4xx other
+    /// than 408). `true` once a POST attempt may have been written: any
+    /// other answer, an answer lost after the request could have left, or a
+    /// 2xx that did not read back.
     pub written: bool,
+    /// The status of the last answer Alpaca gave any attempt of the call;
+    /// `None` when no attempt got one (a local `Retry-After` hold, a
+    /// connect failure, a credential mint that failed).
+    pub alpaca_status: Option<u16>,
     #[source]
     pub error: AlpacaError,
 }
@@ -895,6 +918,67 @@ mod tests {
             .unwrap();
         assert!(started.elapsed() >= Duration::from_millis(300));
         extend.await.unwrap();
+    }
+
+    /// A hold another caller takes while this call backs off refuses the
+    /// next attempt locally; the status stays the one Alpaca last answered.
+    #[cfg(feature = "issuer")]
+    #[tokio::test(start_paused = true)]
+    async fn a_call_answered_500_then_held_locally_reports_500() {
+        let client = retry_client();
+        let mut attempts = 0;
+        let failure = client
+            .with_retry_reporting(|| {
+                attempts += 1;
+                let other = client.clone();
+                async move {
+                    request_id::record(
+                        reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+                        &reqwest::header::HeaderMap::new(),
+                    );
+                    tokio::spawn(async move { other.hold_for(Duration::from_secs(300)) });
+                    Err::<(), _>(AlpacaError::Api {
+                        status_code: 500,
+                        body: String::new(),
+                    })
+                }
+            })
+            .await
+            .unwrap_err();
+
+        assert_eq!(attempts, 1);
+        assert!(
+            matches!(failure.error, AlpacaError::RateLimited { .. }),
+            "{:?}",
+            failure.error
+        );
+        assert!(failure.written);
+        assert_eq!(failure.alpaca_status, Some(500));
+    }
+
+    #[cfg(feature = "issuer")]
+    #[tokio::test]
+    async fn a_call_held_locally_before_any_attempt_reports_no_status() {
+        let client = retry_client();
+        client.hold_for(Duration::from_secs(300));
+        let mut attempts = 0;
+
+        let failure = client
+            .with_retry_reporting(|| {
+                attempts += 1;
+                std::future::ready(Ok(()))
+            })
+            .await
+            .unwrap_err();
+
+        assert_eq!(attempts, 0);
+        assert!(
+            matches!(failure.error, AlpacaError::RateLimited { .. }),
+            "{:?}",
+            failure.error
+        );
+        assert!(!failure.written);
+        assert_eq!(failure.alpaca_status, None);
     }
 
     #[cfg(feature = "issuer")]

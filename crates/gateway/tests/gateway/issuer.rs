@@ -3,6 +3,7 @@
 
 use axum::http::StatusCode;
 use axum::http::header::CONTENT_TYPE;
+use httpmock::When;
 use httpmock::prelude::*;
 use serde_json::{Value, json};
 use st0x_alpaca_gateway_api::{AuditPhase, Operation, Outcome, Tier};
@@ -22,6 +23,13 @@ const FRAMES: &str =
 
 fn callback_path(kind: &str) -> String {
     format!("/v1/accounts/{ACCOUNT_ID}/tokenization/callback/{kind}")
+}
+
+/// Matches only a request carrying the harness's Basic broker credential as
+/// the stream client sends it.
+fn credentialed(when: When) -> When {
+    when.header("APCA-API-KEY-ID", "key")
+        .header("APCA-API-SECRET-KEY", "secret")
 }
 
 fn mint_callback_body() -> Value {
@@ -93,49 +101,116 @@ async fn the_bot_mint_callback_is_applied_and_audited_as_s01() {
 
 /// The library resends a redeem after a server error, which may have been
 /// applied, so a rejection of the resend proves nothing; a rejection of the
-/// only attempt does.
+/// only attempt does. Either answer carries the status of the last answer
+/// Alpaca gave, a refused credential's too.
 #[tokio::test]
 async fn a_redeem_rejected_after_a_server_error_is_outcome_unknown_and_alone_not_applied() {
-    let harness = Harness::start_s01().await;
-    let failed = harness.alpaca.mock(|when, then| {
-        when.method(POST).path(callback_path("redeem"));
-        then.status(500).body("internal error");
-    });
-    let request = authorized(
-        Tier::Bot,
-        "POST",
-        "/bot/v1/issuer/redemptions",
-        Some(redeem_body("base")),
-    );
-    let mut call = tokio::spawn(answer(harness.app.clone(), request));
-    until_called(&failed, &mut call).await;
-    failed.delete_async().await;
-    let rejected = harness.alpaca.mock(|when, then| {
-        when.method(POST).path(callback_path("redeem"));
-        then.status(422).body("redemption refused");
-    });
-
-    let (status, body) = call.await.unwrap();
-    assert_eq!(status, StatusCode::GATEWAY_TIMEOUT, "{body}");
-    assert_eq!(body["code"], "outcome_unknown");
-    assert_eq!(body["outcome"], "unknown");
-    assert_eq!(body["alpacaStatus"], 422);
-    assert_eq!(body["retryableWithSameKey"], false);
-    rejected.assert_calls(1);
-
-    let (status, body) = harness
-        .call(
+    for refusal in [422, 403] {
+        let harness = Harness::start_s01().await;
+        let failed = harness.alpaca.mock(|when, then| {
+            when.method(POST).path(callback_path("redeem"));
+            then.status(500).body("internal error");
+        });
+        let request = authorized(
             Tier::Bot,
             "POST",
-            "/issuer/redemptions",
+            "/bot/v1/issuer/redemptions",
             Some(redeem_body("base")),
-        )
-        .await;
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
-    assert_eq!(body["code"], "rejected");
-    assert_eq!(body["reason"], "alpaca_api");
-    assert_eq!(body["outcome"], "not_applied");
-    rejected.assert_calls(2);
+        );
+        let mut call = tokio::spawn(answer(harness.app.clone(), request));
+        until_called(&failed, &mut call).await;
+        failed.delete_async().await;
+        let rejected = harness.alpaca.mock(|when, then| {
+            when.method(POST).path(callback_path("redeem"));
+            then.status(refusal).body("redemption refused");
+        });
+
+        let (status, body) = call.await.unwrap();
+        assert_eq!(status, StatusCode::GATEWAY_TIMEOUT, "{refusal}: {body}");
+        assert_eq!(body["code"], "outcome_unknown", "{refusal}");
+        assert_eq!(body["outcome"], "unknown", "{refusal}");
+        assert_eq!(body["alpacaStatus"], refusal);
+        assert_eq!(body["retryableWithSameKey"], false, "{refusal}");
+        rejected.assert_calls(1);
+
+        let (status, body) = harness
+            .call(
+                Tier::Bot,
+                "POST",
+                "/issuer/redemptions",
+                Some(redeem_body("base")),
+            )
+            .await;
+        assert_eq!(
+            status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "{refusal}: {body}"
+        );
+        assert_eq!(body["code"], "rejected", "{refusal}");
+        assert_eq!(body["reason"], "alpaca_api", "{refusal}");
+        assert_eq!(body["outcome"], "not_applied", "{refusal}");
+        assert_eq!(body["alpacaStatus"], refusal);
+        rejected.assert_calls(2);
+    }
+}
+
+/// Each refused issuer body answers `400 invalid_request` and reaches no
+/// Alpaca endpoint.
+#[tokio::test]
+async fn a_bad_issuer_key_symbol_or_quantity_is_refused_before_alpaca() {
+    let harness = Harness::start_s01().await;
+    let callbacks = harness.alpaca.mock(|when, then| {
+        when.method(POST).path_includes("/tokenization/callback/");
+        then.status(200);
+    });
+    let reads = harness.alpaca.mock(|when, then| {
+        when.method(GET).path_includes("/tokenization/requests/");
+        then.status(200);
+    });
+    let overlong_id = "x".repeat(129);
+    let overlong_symbol = "A".repeat(33);
+    let mint = |value: &str| {
+        let mut body = mint_callback_body();
+        body["tokenizationRequestId"] = json!(value);
+        ("/issuer/mint-callbacks", body)
+    };
+    let redeem = |field: &str, value: &str| {
+        let mut body = redeem_body("base");
+        body[field] = json!(value);
+        ("/issuer/redemptions", body)
+    };
+
+    for (path, body) in [
+        mint(""),
+        mint("  "),
+        mint(&overlong_id),
+        redeem("issuerRequestId", ""),
+        redeem("issuerRequestId", " "),
+        redeem("issuerRequestId", &overlong_id),
+        redeem("underlyingSymbol", "../AAPL"),
+        redeem("underlyingSymbol", &overlong_symbol),
+        redeem("tokenSymbol", ""),
+        redeem("tokenSymbol", "tAAPL?x"),
+        redeem("tokenSymbol", &overlong_symbol),
+        redeem("quantity", "0"),
+        redeem("quantity", "-2.5"),
+    ] {
+        let (status, reply) = harness
+            .call(Tier::Bot, "POST", path, Some(body.clone()))
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}: {reply}");
+        assert_eq!(reply["code"], "invalid_request", "{body}");
+    }
+    for path in [
+        "/issuer/requests/%20".to_string(),
+        format!("/issuer/requests/{overlong_id}"),
+    ] {
+        let (status, reply) = harness.call(Tier::Bot, "GET", &path, None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{path}: {reply}");
+        assert_eq!(reply["code"], "invalid_request", "{path}");
+    }
+    callbacks.assert_calls(0);
+    reads.assert_calls(0);
 }
 
 /// The request type names only networks the ITN preflight accepts, so any
@@ -183,6 +258,29 @@ async fn a_request_alpaca_does_not_hold_is_request_not_found() {
 }
 
 #[tokio::test]
+async fn a_refused_credential_on_a_request_read_keeps_its_alpaca_status() {
+    let harness = Harness::start_s01().await;
+    harness.alpaca.mock(|when, then| {
+        when.method(GET).path(format!(
+            "/v1/accounts/{ACCOUNT_ID}/tokenization/requests/tok_req_9"
+        ));
+        then.status(401).body("unauthorized");
+    });
+
+    let (status, body) = harness
+        .call(Tier::Bot, "GET", "/issuer/requests/tok_req_9", None)
+        .await;
+
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["code"], "rejected");
+    assert_eq!(body["reason"], "alpaca_api");
+    assert_eq!(body["alpacaStatus"], 401);
+    let events = harness.audit_events();
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0].alpaca_status, Some(401));
+}
+
+#[tokio::test]
 async fn an_issuer_429_relays_its_retry_after_as_backpressure() {
     let harness = Harness::start_s01().await;
     let callback = harness.alpaca.mock(|when, then| {
@@ -207,13 +305,37 @@ async fn an_issuer_429_relays_its_retry_after_as_backpressure() {
     assert_eq!(body["alpacaStatus"], 429);
     assert_eq!(body["retryAfterSecs"], 60);
     callback.assert_calls(1);
+
+    // The client holds the next callback back for the rest of Alpaca's
+    // hold, so Alpaca answers nothing and no status is named.
+    let (status, body) = harness
+        .call(
+            Tier::Bot,
+            "POST",
+            "/issuer/mint-callbacks",
+            Some(mint_callback_body()),
+        )
+        .await;
+
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+    assert_eq!(body["code"], "backpressure");
+    assert_eq!(body["outcome"], "not_applied");
+    assert_eq!(body["alpacaStatus"], Value::Null);
+    let hold = body["retryAfterSecs"].as_u64().unwrap();
+    assert!((31..=60).contains(&hold), "{body}");
+    callback.assert_calls(1);
+    let events = harness.audit_events();
+    assert_eq!(events.len(), 2, "{events:?}");
+    assert_eq!(events[1].alpaca_status, None);
+    assert!(events[1].alpaca_request_ids.is_empty(), "{events:?}");
 }
 
 #[tokio::test]
 async fn the_stream_relays_alpaca_bytes_unchanged_from_the_replay_position() {
     let harness = Harness::start_s01().await;
     let resumed = harness.alpaca.mock(|when, then| {
-        when.method(GET)
+        credentialed(when)
+            .method(GET)
             .path(STREAM_PATH)
             .query_param("type", "cash_dividend_corporateaction_event")
             .query_param("region", "us")
@@ -223,7 +345,8 @@ async fn the_stream_relays_alpaca_bytes_unchanged_from_the_replay_position() {
             .body(FRAMES);
     });
     let window = harness.alpaca.mock(|when, then| {
-        when.method(GET)
+        credentialed(when)
+            .method(GET)
             .path(STREAM_PATH)
             .query_param("since", "2026-10-01T00:00:00Z")
             .query_param("until", "2026-10-02T00:00:00Z")
@@ -265,13 +388,56 @@ async fn the_stream_relays_alpaca_bytes_unchanged_from_the_replay_position() {
     }
 }
 
+#[tokio::test]
+async fn a_stream_429_relays_its_retry_after_as_backpressure() {
+    let harness = Harness::start_s01().await;
+    let stream = harness.alpaca.mock(|when, then| {
+        credentialed(when).method(GET).path(STREAM_PATH);
+        then.status(429)
+            .header("retry-after", "30")
+            .body("rate limit exceeded");
+    });
+
+    let (status, body) = harness
+        .call(Tier::Bot, "GET", "/corporate-actions/stream", None)
+        .await;
+
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+    assert_eq!(body["code"], "backpressure");
+    assert_eq!(body["alpacaStatus"], 429);
+    assert_eq!(body["retryAfterSecs"], 30);
+    stream.assert_calls(1);
+}
+
+#[tokio::test]
+async fn a_stream_answer_that_is_not_an_event_stream_keeps_its_alpaca_status() {
+    let harness = Harness::start_s01().await;
+    harness.alpaca.mock(|when, then| {
+        credentialed(when).method(GET).path(STREAM_PATH);
+        then.status(200)
+            .header("content-type", "application/json")
+            .body("{}");
+    });
+
+    let (_, body) = harness
+        .call(Tier::Bot, "GET", "/corporate-actions/stream", None)
+        .await;
+
+    assert_eq!(body["code"], "upstream_transient", "{body}");
+    assert_eq!(body["retryable"], false);
+    assert_eq!(body["alpacaStatus"], 200);
+    let events = harness.audit_events();
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0].alpaca_status, Some(200));
+}
+
 /// A caller that goes away while the stream connect is pending still leaves
 /// the connect's record, written `settled` with its Alpaca traffic.
 #[tokio::test]
 async fn a_stream_connect_its_caller_abandons_is_still_audited() {
     let harness = Harness::start_s01().await;
     let stream = harness.alpaca.mock(|when, then| {
-        when.method(GET).path(STREAM_PATH);
+        credentialed(when).method(GET).path(STREAM_PATH);
         then.status(200)
             .header("content-type", "text/event-stream")
             .header("x-request-id", "req-stream")

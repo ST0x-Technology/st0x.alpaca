@@ -17,6 +17,7 @@ use super::replay::CorporateActionReplay;
 use super::sse::{CorporateActionDecodeBatch, CorporateActionSseDecoder};
 use crate::auth::{AuthRuntime, KmsJwtError};
 use crate::core::AlpacaAuth;
+use crate::rate_limit::retry_after_from_response_headers;
 use crate::request_id::{self, GateClosed, SendError};
 
 /// HTTP client for one validated corporate-action stream endpoint.
@@ -53,8 +54,18 @@ pub enum CorporateActionStreamError {
     Http(#[from] reqwest::Error),
     #[error("corporate-action stream returned HTTP {0}")]
     HttpStatus(StatusCode),
-    #[error("corporate-action stream returned content type {0}")]
-    InvalidContentType(String),
+    /// Alpaca answered 429, with its `Retry-After` hint when it sent one.
+    #[error(
+        "corporate-action stream returned HTTP {}",
+        StatusCode::TOO_MANY_REQUESTS
+    )]
+    RateLimited { retry_after: Option<Duration> },
+    /// Alpaca answered `status` with a body that is not an event stream.
+    #[error("corporate-action stream returned content type {content_type}")]
+    InvalidContentType {
+        status: StatusCode,
+        content_type: String,
+    },
     #[error(transparent)]
     Auth(#[from] KmsJwtError),
     #[error(transparent)]
@@ -126,8 +137,9 @@ impl CorporateActionStreamClient {
     /// # Errors
     ///
     /// Returns [`CorporateActionStreamError::Http`] on transport failure,
-    /// [`CorporateActionStreamError::HttpStatus`] for any non-2xx status
-    /// (including a refused redirect),
+    /// [`CorporateActionStreamError::RateLimited`] for a 429,
+    /// [`CorporateActionStreamError::HttpStatus`] for any other non-2xx
+    /// status (including a refused redirect),
     /// [`CorporateActionStreamError::InvalidContentType`] for any other
     /// content type, [`CorporateActionStreamError::Auth`] when a bearer
     /// token cannot be minted, or [`CorporateActionStreamError::NotSent`]
@@ -151,6 +163,11 @@ impl CorporateActionStreamClient {
         let response = request_id::send(request).await?;
         let status = response.status();
         request_id::record(status, response.headers());
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            return Err(CorporateActionStreamError::RateLimited {
+                retry_after: retry_after_from_response_headers(response.headers()),
+            });
+        }
         if !status.is_success() {
             return Err(CorporateActionStreamError::HttpStatus(status));
         }
@@ -160,9 +177,10 @@ impl CorporateActionStreamClient {
             .and_then(|value| value.to_str().ok())
             .unwrap_or_default();
         if !content_type.starts_with("text/event-stream") {
-            return Err(CorporateActionStreamError::InvalidContentType(
-                content_type.to_string(),
-            ));
+            return Err(CorporateActionStreamError::InvalidContentType {
+                status,
+                content_type: content_type.to_string(),
+            });
         }
 
         Ok(response)
@@ -522,17 +540,17 @@ mod tests {
 
         assert!(matches!(
             error,
-            CorporateActionStreamError::InvalidContentType(content_type)
-                if content_type == "application/json"
+            CorporateActionStreamError::InvalidContentType { status, content_type }
+                if status == StatusCode::OK && content_type == "application/json"
         ));
     }
 
     #[tokio::test]
-    async fn non_success_status_and_redirects_are_reported_as_http_status() {
+    async fn a_429_is_rate_limited_and_redirects_are_reported_as_http_status() {
         let server = MockServer::start();
         server.mock(|when, then| {
             when.method(GET).path("/corporate-actions");
-            then.status(429);
+            then.status(429).header("Retry-After", "30");
         });
         server.mock(|when, then| {
             when.method(GET).path("/redirect");
@@ -545,10 +563,15 @@ mod tests {
             .connect(&CorporateActionReplay::Live)
             .await
             .unwrap_err();
-        assert!(matches!(
-            error,
-            CorporateActionStreamError::HttpStatus(StatusCode::TOO_MANY_REQUESTS)
-        ));
+        assert!(
+            matches!(
+                error,
+                CorporateActionStreamError::RateLimited {
+                    retry_after: Some(wait)
+                } if wait == Duration::from_secs(30)
+            ),
+            "{error:?}"
+        );
 
         let redirecting = CorporateActionStreamEndpoint::authenticated_loopback(&format!(
             "{}/redirect",
