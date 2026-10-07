@@ -352,7 +352,15 @@ impl AlpacaClient {
         ];
 
         self.with_retry_reporting(|| async {
-            let response = request_id::send(self.post(&path).await?.json(&request)).await?;
+            // Every attempt carries the same key and body, so Alpaca replays
+            // the first answer to a resend instead of refusing the reused
+            // `issuer_request_id` with 422.
+            let post = self
+                .post(&path)
+                .await?
+                .header("Idempotency-Key", request.issuer_request_id.0.as_str())
+                .json(&request);
+            let response = request_id::send(post).await?;
 
             let status = response.status();
             request_id::record(status, response.headers());
@@ -2270,13 +2278,19 @@ mod tests {
         success.assert_calls(1);
     }
 
+    /// Every attempt carries the same `Idempotency-Key`, so Alpaca replays
+    /// the first answer to a resend.
     #[tokio::test]
     async fn test_call_redeem_endpoint_retries_transient_server_errors() {
         let server = MockServer::start();
 
         let mock = server.mock(|when, then| {
             when.method(POST)
-                .path("/v1/accounts/test-account/tokenization/callback/redeem");
+                .path("/v1/accounts/test-account/tokenization/callback/redeem")
+                .header(
+                    "Idempotency-Key",
+                    "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd",
+                );
             then.status(500).body("Internal Server Error");
         });
 
