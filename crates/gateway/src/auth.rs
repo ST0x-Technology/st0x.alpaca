@@ -83,7 +83,7 @@ enum KeyKind {
 
 struct CachedKeys {
     keys: Vec<(String, DecodingKey)>,
-    fetched_at: Instant,
+    expires_at: Instant,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -272,7 +272,7 @@ impl TokenVerifier {
     async fn cached_key(&self, kid: &str, allow_stale: bool) -> Option<DecodingKey> {
         let guard = self.keys.read().await;
         let key = guard.as_ref().and_then(|cached| {
-            if !allow_stale && cached.fetched_at.elapsed() > JWKS_TTL {
+            if !allow_stale && Instant::now() >= cached.expires_at {
                 return None;
             }
             cached
@@ -289,7 +289,7 @@ impl TokenVerifier {
         let cache_is_cold = {
             let guard = self.keys.read().await;
             if let Some(cached) = guard.as_ref()
-                && cached.fetched_at.elapsed() <= JWKS_TTL
+                && Instant::now() < cached.expires_at
                 && cached.keys.iter().any(|(id, _)| id == kid)
             {
                 return Ok(());
@@ -316,7 +316,7 @@ impl TokenVerifier {
             Ok(keys) => {
                 *self.keys.write().await = Some(CachedKeys {
                     keys,
-                    fetched_at: Instant::now(),
+                    expires_at: Instant::now() + JWKS_TTL,
                 });
                 Ok(())
             }
@@ -623,15 +623,13 @@ mod tests {
         }
     }
 
-    /// Seeds the cache as if the keys were fetched two TTLs ago, with the
-    /// refresh floor long expired so a refresh attempt is permitted.
+    /// Seeds an expired cache and permits its next refresh attempt.
     async fn seed_stale_cache(verifier: &TokenVerifier, kind: KeyKind) {
-        let long_ago = Instant::now().checked_sub(JWKS_TTL * 2).unwrap();
         *verifier.keys.write().await = Some(CachedKeys {
             keys: vec![(KID.to_string(), decoding_key(kind))],
-            fetched_at: long_ago,
+            expires_at: Instant::now(),
         });
-        *verifier.last_refresh_attempt.lock().unwrap() = Some(long_ago);
+        *verifier.last_refresh_attempt.lock().unwrap() = None;
     }
 
     #[tokio::test]
