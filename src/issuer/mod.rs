@@ -18,6 +18,24 @@ use crate::core::{AlpacaClient, AlpacaError, IssuerCallError, Network, Tokenizat
 use crate::rate_limit::retry_after_from_response_headers;
 use crate::request_id;
 
+const REDEEM_IDEMPOTENCY_NAMESPACE: Uuid = uuid::uuid!("91943ff3-f69c-5dbe-a3e3-7ce22083bac6");
+const REDEEM_IDEMPOTENCY_KEY_LEN: usize = uuid::fmt::Hyphenated::LENGTH;
+
+/// A stable UUID key scoped to Alpaca issuer redeems. The body keeps the
+/// original issuer request id; only the retry key is bounded to 36 ASCII
+/// characters.
+fn redeem_idempotency_key<'a>(
+    issuer_request_id: &IssuerRequestId,
+    encoded: &'a mut [u8; REDEEM_IDEMPOTENCY_KEY_LEN],
+) -> &'a str {
+    Uuid::new_v5(
+        &REDEEM_IDEMPOTENCY_NAMESPACE,
+        issuer_request_id.0.as_bytes(),
+    )
+    .as_hyphenated()
+    .encode_lower(encoded)
+}
+
 pub mod itn;
 
 /// Issuer-side operations against Alpaca's tokenization endpoints.
@@ -342,15 +360,8 @@ impl AlpacaClient {
             });
         }
 
-        let idempotency_key = request
-            .issuer_request_id
-            .0
-            .parse::<reqwest::header::HeaderValue>()
-            .map_err(|source| IssuerCallError {
-                written: false,
-                alpaca_status: None,
-                error: AlpacaError::InvalidIdempotencyKey(source),
-            })?;
+        let mut encoded_key = [0; REDEEM_IDEMPOTENCY_KEY_LEN];
+        let idempotency_key = redeem_idempotency_key(&request.issuer_request_id, &mut encoded_key);
 
         let path = [
             "v1",
@@ -362,13 +373,12 @@ impl AlpacaClient {
         ];
 
         self.with_retry_reporting(|| async {
-            // Every attempt carries the same key and body, so Alpaca replays
-            // the first answer to a resend instead of refusing the reused
-            // `issuer_request_id` with 422.
+            // Every attempt carries the same bounded key derived from the
+            // issuer request id, so Alpaca replays the first answer.
             let post = self
                 .post(&path)
                 .await?
-                .header("Idempotency-Key", idempotency_key.clone())
+                .header("Idempotency-Key", idempotency_key)
                 .json(&request);
             let response = request_id::send(post).await?;
 
@@ -2288,8 +2298,8 @@ mod tests {
         success.assert_calls(1);
     }
 
-    /// Every attempt carries the same `Idempotency-Key`, so Alpaca replays
-    /// the first answer to a resend.
+    /// Every attempt derives the same bounded `Idempotency-Key`, so Alpaca
+    /// replays the first answer to a resend.
     #[tokio::test]
     async fn test_call_redeem_endpoint_retries_transient_server_errors() {
         let server = MockServer::start();
@@ -2297,10 +2307,7 @@ mod tests {
         let mock = server.mock(|when, then| {
             when.method(POST)
                 .path("/v1/accounts/test-account/tokenization/callback/redeem")
-                .header(
-                    "Idempotency-Key",
-                    "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd",
-                );
+                .header("Idempotency-Key", "8e38d4e9-5eb6-5559-886c-4598f6f4544e");
             then.status(500).body("Internal Server Error");
         });
 
@@ -2320,35 +2327,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_invalid_redeem_idempotency_key_is_not_retried_or_sent() {
+    async fn redeem_idempotency_keys_are_bounded_ascii_for_any_request_id() {
         let server = MockServer::start();
-        let sent = server.mock(|when, then| {
-            when.method(POST)
-                .path("/v1/accounts/test-account/tokenization/callback/redeem");
-            then.status(200);
-        });
         let client =
             make_client(&server, "test-account", "test-key", "test-secret").with_max_retries(5);
-        let mut request = create_redeem_request();
-        request.issuer_request_id = IssuerRequestId("0xabc\n".to_string());
 
-        let failure = client
-            .call_redeem_endpoint_reporting(request)
-            .await
-            .unwrap_err();
+        for (issuer_request_id, expected_key) in [
+            ("redemption 42", "a48752c4-66f4-58c5-ae15-4cc4d282b320"),
+            ("redemption-é", "08abad25-f017-51ab-8e37-b541979ece87"),
+            (
+                "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd",
+                "8e38d4e9-5eb6-5559-886c-4598f6f4544e",
+            ),
+        ] {
+            assert_eq!(expected_key.len(), 36);
+            assert!(expected_key.bytes().all(|byte| byte.is_ascii_graphic()));
+            let mut sent = server.mock(|when, then| {
+                when.method(POST)
+                    .path("/v1/accounts/test-account/tokenization/callback/redeem")
+                    .header("Idempotency-Key", expected_key);
+                then.status(400).body("malformed request");
+            });
+            let mut request = create_redeem_request();
+            request.issuer_request_id = IssuerRequestId(issuer_request_id.to_string());
 
-        assert!(!failure.written);
-        assert_eq!(failure.alpaca_status, None);
-        assert!(matches!(
-            &failure.error,
-            AlpacaError::InvalidIdempotencyKey(_)
-        ));
-        assert!(!failure.error.is_retryable());
-        assert_eq!(
-            failure.error.permanence(),
-            crate::core::Permanence::Permanent
-        );
-        sent.assert_calls(0);
+            let failure = client
+                .call_redeem_endpoint_reporting(request)
+                .await
+                .unwrap_err();
+
+            assert!(!failure.written);
+            assert_eq!(failure.alpaca_status, Some(400));
+            assert!(matches!(
+                failure.error,
+                AlpacaError::Api {
+                    status_code: 400,
+                    ..
+                }
+            ));
+            sent.assert_calls(1);
+            sent.delete();
+        }
     }
 
     /// The 500 may have applied the redeem, so the later definite 400 does

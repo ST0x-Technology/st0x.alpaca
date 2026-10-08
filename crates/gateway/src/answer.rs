@@ -498,10 +498,8 @@ pub fn issuer(error: &AlpacaError, sent: Sent) -> Failure {
         E::NotSent(_) | E::Jwt(KmsJwtError::NotSent(_)) => {
             Failure::new(ErrorCode::UpstreamTransient, message)
         }
-        // The request never left: no credential, endpoint, header, or connection.
-        E::Jwt(_) | E::InvalidUrl(_) | E::InvalidIdempotencyKey(_) => {
-            unsendable(error.permanence(), message)
-        }
+        // The request never left: no credential, endpoint, or connection.
+        E::Jwt(_) | E::InvalidUrl(_) => unsendable(error.permanence(), message),
         E::Reqwest(source) if never_left(source) => unsent(source, message),
         E::RequestNotFound { .. } => Failure {
             alpaca_status: Some(404),
