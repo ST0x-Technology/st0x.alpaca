@@ -154,14 +154,14 @@ Use the same controls in the production project, with a separate production Brok
 
 ## Deploying `s01-alpaca`
 
-s01.devops deploys `s01-alpaca-staging`, then `s01-alpaca`, in the s01issuer.com org, with the `t0-alpaca` steps above and these differences:
+`s01.devops` deploys each environment into its own `<project>` in `<s01 org>`, with the `t0-alpaca` steps above and these differences:
 
-1. The runtime service account is `s01-alpaca` in each project (`s01-alpaca@s01-alpaca` in production), with its own KMS key `alpaca-api-key` and a BrokerDash credential scoped to the S01 account and the `s01` matrix. No T0 principal holds a role in either project.
+1. The runtime service account is `<runtime service account>`, with its own KMS key `<KMS key>` and a BrokerDash credential scoped to the S01 account and the `s01` matrix. No T0 principal holds a role in either project.
 2. Cloud Run service `s01-alpaca` with an `s01` config.
-3. `run.invoker` for that environment's issuance runtime service account in `s01-issuance` and the project's IAP service agent only. Production `bot_principals` lists only the production issuance runtime service account.
-4. IAP on the read backend admits `alpaca-readers@s01issuer.com` and `alpaca-admins@s01issuer.com`; on the write backend only `alpaca-admins@s01issuer.com`.
-5. The S01 org's CI builds and attests the image from the same st0x.alpaca tag into `s01-artifacts`, and the project sink and audit bucket are the S01 org's.
-6. To check a deployment, call `GET /bot/v1/issuer/requests/{tokenization_request_id}` for a known request from the issuance runtime with its ID token, and `/alpaca-read/v1/account/funds` from a laptop through the load balancer.
+3. `run.invoker` for that environment's issuance runtime service account from its own `<project>` and the gateway project's IAP service agent only. Production `bot_principals` lists only the production issuance runtime service account.
+4. IAP on the read backend admits `<reader group>` and `<admin group>`; on the write backend only `<admin group>`.
+5. The S01 org's CI builds and attests the image from the same st0x.alpaca tag into `<artifact registry>`, and the project sink and audit bucket are the S01 org's.
+6. To check a deployment, call `GET /bot/v1/issuer/requests/{tokenization_request_id}` for a known request from the issuance runtime with its ID token, and `<read-prefix>/v1/account/funds` from a laptop through the load balancer.
 
 ## Rollouts
 
