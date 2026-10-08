@@ -470,6 +470,48 @@ async fn a_stream_connect_its_caller_abandons_is_still_audited() {
     assert_eq!(events[0].alpaca_request_ids, ["req-stream"]);
 }
 
+/// Shutdown answers a stream whose Alpaca connect is still pending, while
+/// the tracked connect finishes and records its result afterward.
+#[tokio::test]
+async fn a_stream_connect_pending_at_shutdown_answers_unavailable_at_once() {
+    let harness = Harness::start_s01().await;
+    let stream = harness.alpaca.mock(|when, then| {
+        credentialed(when).method(GET).path(STREAM_PATH);
+        then.status(200)
+            .header("content-type", "text/event-stream")
+            .header("x-request-id", "req-stream")
+            .delay(std::time::Duration::from_millis(300))
+            .body(FRAMES);
+    });
+    let request = authorized(Tier::Bot, "GET", "/bot/v1/corporate-actions/stream", None);
+    let mut call = tokio::spawn(harness.app.clone().oneshot(request));
+    until_called(&stream, &mut call).await;
+
+    harness.state.shutdown.cancel();
+    let response = tokio::time::timeout(std::time::Duration::from_secs(1), call)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["code"], "unavailable");
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), harness.settle())
+        .await
+        .unwrap();
+    let events = harness.audit_events();
+    assert_eq!(events.len(), 2, "{events:?}");
+    assert_eq!(events[0].operation, Operation::CorporateActionsStream);
+    assert_eq!(events[0].phase, AuditPhase::Answered);
+    assert_eq!(events[1].operation, Operation::CorporateActionsStream);
+    assert_eq!(events[1].phase, AuditPhase::Settled);
+    assert_eq!(events[1].alpaca_request_ids, ["req-stream"]);
+}
+
 #[tokio::test]
 async fn humans_cannot_reach_the_issuer_posts_nor_the_s01_bot_orders() {
     let harness = Harness::start_s01().await;

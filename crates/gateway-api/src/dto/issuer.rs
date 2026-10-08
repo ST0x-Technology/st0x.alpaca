@@ -80,13 +80,18 @@ pub struct RequestPath {
     pub tokenization_request_id: TokenizationRequestId,
 }
 
-/// Reads a request id: not blank, at most [`super::REQUEST_ID_MAX`]
-/// characters.
+/// Reads a request id: not blank, without control characters, and at most
+/// [`super::REQUEST_ID_MAX`] characters.
 fn request_id<'de, D: Deserializer<'de>>(field: &str, deserializer: D) -> Result<String, D::Error> {
     let raw = super::bounded(field, super::REQUEST_ID_MAX, deserializer)?;
     if raw.trim().is_empty() {
         return Err(serde::de::Error::custom(format_args!(
             "{field} must not be blank"
+        )));
+    }
+    if raw.chars().any(char::is_control) {
+        return Err(serde::de::Error::custom(format_args!(
+            "{field} must not contain control characters"
         )));
     }
     Ok(raw)
@@ -114,11 +119,31 @@ fn token_symbol<'de, D: Deserializer<'de>>(deserializer: D) -> Result<TokenSymbo
     super::safe_symbol(deserializer).map(TokenSymbol)
 }
 
+const REDEEM_QTY_MAX_SCALE: usize = 9;
+
 fn redeem_qty<'de, D: Deserializer<'de>>(deserializer: D) -> Result<RedeemQty, D::Error> {
-    let quantity =
-        RedeemQty::new(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)?;
+    let wire = String::deserialize(deserializer)?;
+    if !plain_decimal_with_max_scale(&wire, REDEEM_QTY_MAX_SCALE) {
+        return Err(serde::de::Error::custom(format_args!(
+            "quantity must be a plain decimal with at most {REDEEM_QTY_MAX_SCALE} fractional digits"
+        )));
+    }
+    let quantity = RedeemQty::new(wire).map_err(serde::de::Error::custom)?;
     Positive::new(quantity.shares().0).map_err(serde::de::Error::custom)?;
     Ok(quantity)
+}
+
+fn plain_decimal_with_max_scale(raw: &str, max_scale: usize) -> bool {
+    let (whole, fraction) = raw
+        .split_once('.')
+        .map_or((raw, None), |(whole, fraction)| (whole, Some(fraction)));
+    !whole.is_empty()
+        && whole.bytes().all(|byte| byte.is_ascii_digit())
+        && fraction.is_none_or(|fraction| {
+            !fraction.is_empty()
+                && fraction.len() <= max_scale
+                && fraction.bytes().all(|byte| byte.is_ascii_digit())
+        })
 }
 
 /// `corporate_actions.stream` query: where the relayed stream starts.
@@ -166,19 +191,23 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    fn redeem_reaches_alpaca_with_the_callers_quantity_spelling() {
-        let request: RedeemRequest = serde_json::from_value(json!({
-            "issuerRequestId": "0xabc",
+    fn redeem_request(issuer_request_id: &str, quantity: &str) -> serde_json::Value {
+        json!({
+            "issuerRequestId": issuer_request_id,
             "underlyingSymbol": "AAPL",
             "tokenSymbol": "tAAPL",
             "clientId": "904837e3-3b76-47ec-b432-046db621571b",
-            "quantity": "1.50",
+            "quantity": quantity,
             "network": "base",
             "walletAddress": Address::repeat_byte(1),
             "txHash": B256::repeat_byte(2),
-        }))
-        .unwrap();
+        })
+    }
+
+    #[test]
+    fn redeem_reaches_alpaca_with_the_callers_quantity_spelling() {
+        let request: RedeemRequest =
+            serde_json::from_value(redeem_request("0xabc", "1.50")).unwrap();
 
         let alpaca = serde_json::to_value(issuer::RedeemRequest::from(request)).unwrap();
 
@@ -186,6 +215,43 @@ mod tests {
         assert_eq!(alpaca["underlying_symbol"], "AAPL");
         assert_eq!(alpaca["token_symbol"], "tAAPL");
         assert_eq!(alpaca["wallet_address"], json!(Address::repeat_byte(1)));
+    }
+
+    #[test]
+    fn redeem_quantity_is_a_plain_decimal_with_at_most_nine_fractional_digits() {
+        for accepted in ["1", "1.0", "0.000000001", "0001.500000000"] {
+            serde_json::from_value::<RedeemRequest>(redeem_request("0xabc", accepted)).unwrap();
+        }
+
+        for refused in ["1e2", "1e-37", "0.0000000000001", ".1", "1."] {
+            let error = serde_json::from_value::<RedeemRequest>(redeem_request("0xabc", refused))
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("plain decimal"),
+                "{refused}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn request_ids_refuse_control_characters() {
+        for refused in ["0xabc\n", "0xabc\0", "0xabc\u{7f}"] {
+            let redeem_error =
+                serde_json::from_value::<RedeemRequest>(redeem_request(refused, "1")).unwrap_err();
+            assert!(
+                redeem_error.to_string().contains("control characters"),
+                "{redeem_error}"
+            );
+
+            let path_error = serde_json::from_value::<RequestPath>(json!({
+                "tokenization_request_id": refused,
+            }))
+            .unwrap_err();
+            assert!(
+                path_error.to_string().contains("control characters"),
+                "{path_error}"
+            );
+        }
     }
 
     #[test]

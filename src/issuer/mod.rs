@@ -342,6 +342,16 @@ impl AlpacaClient {
             });
         }
 
+        let idempotency_key = request
+            .issuer_request_id
+            .0
+            .parse::<reqwest::header::HeaderValue>()
+            .map_err(|source| IssuerCallError {
+                written: false,
+                alpaca_status: None,
+                error: AlpacaError::InvalidIdempotencyKey(source),
+            })?;
+
         let path = [
             "v1",
             "accounts",
@@ -358,7 +368,7 @@ impl AlpacaClient {
             let post = self
                 .post(&path)
                 .await?
-                .header("Idempotency-Key", request.issuer_request_id.0.as_str())
+                .header("Idempotency-Key", idempotency_key.clone())
                 .json(&request);
             let response = request_id::send(post).await?;
 
@@ -2307,6 +2317,38 @@ mod tests {
             })
         ));
         mock.assert_calls(3);
+    }
+
+    #[tokio::test]
+    async fn an_invalid_redeem_idempotency_key_is_not_retried_or_sent() {
+        let server = MockServer::start();
+        let sent = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/accounts/test-account/tokenization/callback/redeem");
+            then.status(200);
+        });
+        let client =
+            make_client(&server, "test-account", "test-key", "test-secret").with_max_retries(5);
+        let mut request = create_redeem_request();
+        request.issuer_request_id = IssuerRequestId("0xabc\n".to_string());
+
+        let failure = client
+            .call_redeem_endpoint_reporting(request)
+            .await
+            .unwrap_err();
+
+        assert!(!failure.written);
+        assert_eq!(failure.alpaca_status, None);
+        assert!(matches!(
+            &failure.error,
+            AlpacaError::InvalidIdempotencyKey(_)
+        ));
+        assert!(!failure.error.is_retryable());
+        assert_eq!(
+            failure.error.permanence(),
+            crate::core::Permanence::Permanent
+        );
+        sent.assert_calls(0);
     }
 
     /// The 500 may have applied the redeem, so the later definite 400 does

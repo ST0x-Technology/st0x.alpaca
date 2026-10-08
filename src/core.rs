@@ -379,6 +379,8 @@ fn retry_after_jitter() -> Duration {
 pub enum AlpacaError {
     #[error(transparent)]
     InvalidUrl(#[from] EndpointError),
+    #[error("issuer request id is not a valid Idempotency-Key header value")]
+    InvalidIdempotencyKey(#[source] reqwest::header::InvalidHeaderValue),
     #[error("Reqwest error: {0}")]
     Reqwest(#[from] reqwest::Error),
     #[error(transparent)]
@@ -452,6 +454,7 @@ impl AlpacaError {
             Self::RateLimited { .. } => true,
             Self::Jwt(error) => !error.is_deterministic(),
             Self::InvalidUrl(_)
+            | Self::InvalidIdempotencyKey(_)
             | Self::UnsupportedTokenizationNetwork { .. }
             | Self::Parse { .. }
             | Self::Auth(_)
@@ -484,6 +487,7 @@ impl AlpacaError {
             Self::Reqwest(_) | Self::Jwt(_) | Self::RateLimited { .. } => Permanence::Transient,
             Self::Api { status_code, .. } => status_permanence(*status_code),
             Self::InvalidUrl(_)
+            | Self::InvalidIdempotencyKey(_)
             | Self::UnsupportedTokenizationNetwork { .. }
             | Self::Parse { .. }
             | Self::Auth(_)
@@ -540,6 +544,7 @@ fn may_have_reached_alpaca(error: &AlpacaError) -> bool {
         AlpacaError::Reqwest(source) => !(source.is_builder() || source.is_connect()),
         AlpacaError::Parse { .. } | AlpacaError::ResponseIdMismatch { .. } => true,
         AlpacaError::InvalidUrl(_)
+        | AlpacaError::InvalidIdempotencyKey(_)
         | AlpacaError::Jwt(_)
         | AlpacaError::NotSent(_)
         | AlpacaError::UnsupportedTokenizationNetwork { .. }

@@ -478,8 +478,8 @@ impl AppState {
     /// such as a stream whose body outlives the call: no deadline and no
     /// send gate. `open` runs on a tracked task that writes the record with
     /// its Alpaca traffic once it resolves, `answered` when the caller took
-    /// the response and `settled` when the caller had gone away, as
-    /// [`Self::run`] does.
+    /// the response and `settled` when the caller had gone away or shutdown
+    /// answered first, as [`Self::run`] does.
     pub async fn relay<Open>(&self, call: Call, intent: Intent, open: Open) -> Response
     where
         Open: Future<Output = Result<Response, Failure>> + Send + 'static,
@@ -487,8 +487,8 @@ impl AppState {
         if let Err(failure) = self.admit(&call, &intent) {
             return self.refuse(&call, &intent, failure).into_response();
         }
-        let (sender, receiver) = oneshot::channel::<Result<Response, Failure>>();
-        let (state, task_call) = (self.clone(), call.clone());
+        let (sender, mut receiver) = oneshot::channel::<Result<Response, Failure>>();
+        let (state, task_call, task_intent) = (self.clone(), call.clone(), intent.clone());
         self.tasks.spawn(async move {
             let (result, traffic) = request_id::collect(open).await;
             let result = result.map_err(|failure| Failure {
@@ -497,7 +497,7 @@ impl AppState {
             });
             let mut event = state.event(
                 &task_call,
-                &intent,
+                &task_intent,
                 AuditPhase::Answered,
                 &traffic,
                 result.as_ref().map(|_| [].as_slice()),
@@ -507,19 +507,20 @@ impl AppState {
             }
             state.audit.emit(&event);
         });
-        match receiver.await {
-            Ok(Ok(response)) => tagged(call.request_id, response),
-            Ok(Err(failure)) => failure.into_response(),
-            // The task always sends unless it was dropped, which only the
-            // runtime shutting down does.
-            Err(_) => Failure {
-                request_id: call.request_id,
-                ..Failure::new(
-                    ErrorCode::Unavailable,
-                    "the gateway is shutting down".to_string(),
+        let result = tokio::select! {
+            result = &mut receiver => result.ok(),
+            () = self.shutdown.cancelled() => None,
+        };
+        match result {
+            Some(Ok(response)) => tagged(call.request_id, response),
+            Some(Err(failure)) => failure.into_response(),
+            None => self
+                .refuse(
+                    &call,
+                    &intent,
+                    Failure::new(ErrorCode::Unavailable, "the gateway is shutting down"),
                 )
-            }
-            .into_response(),
+                .into_response(),
         }
     }
 
