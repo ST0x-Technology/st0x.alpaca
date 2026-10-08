@@ -48,6 +48,10 @@ const AUDIT_ID_MAX: usize = 128;
 /// Most Alpaca supplied ids one audit list keeps: the first this many.
 const AUDIT_IDS_MAX: usize = 100;
 
+/// Bounds detached wallet work so shutdown never depends on an unbounded
+/// keyless write. Expiry is an ambiguous result, not proof Alpaca rejected it.
+const WALLET_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// `text` cut to its first `max` characters.
 fn cut(mut text: String, max: usize) -> String {
     if let Some((at, _)) = text.char_indices().nth(max) {
@@ -142,10 +146,11 @@ impl AppState {
         }
 
         let base_url = config.broker.base_url().to_string();
-        let wallet = AlpacaWalletService::new(
+        let wallet = AlpacaWalletService::new_with_request_timeout(
             base_url.clone(),
             config.broker.account_id,
             config.broker.auth.clone(),
+            WALLET_REQUEST_TIMEOUT,
         )?;
 
         let mut tokenizers = HashMap::new();

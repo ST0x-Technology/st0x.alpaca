@@ -30,6 +30,7 @@ mod whitelist;
 
 use alloy_primitives::{Address, TxHash};
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::error;
 
 use st0x_finance::Usdc;
@@ -72,6 +73,30 @@ impl AlpacaWalletService {
         auth: crate::core::AlpacaAuth,
     ) -> Result<Self, AlpacaWalletError> {
         let client = AlpacaWalletClient::new(base_url, account_id, auth)?;
+
+        Ok(Self {
+            client: Arc::new(client),
+            polling_config: PollingConfig::default(),
+        })
+    }
+
+    /// Builds the wallet service with a total timeout on each HTTP request.
+    ///
+    /// This is for gateways that must bound detached work. A timeout leaves a
+    /// keyless write ambiguous, so callers must reconcile and never retry it
+    /// from the timeout alone.
+    ///
+    /// # Errors
+    ///
+    /// Returns the client construction or authentication error.
+    pub fn new_with_request_timeout(
+        base_url: String,
+        account_id: AlpacaAccountId,
+        auth: crate::core::AlpacaAuth,
+        request_timeout: Duration,
+    ) -> Result<Self, AlpacaWalletError> {
+        let client =
+            AlpacaWalletClient::with_request_timeout(base_url, account_id, auth, request_timeout)?;
 
         Ok(Self {
             client: Arc::new(client),

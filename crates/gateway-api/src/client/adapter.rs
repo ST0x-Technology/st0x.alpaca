@@ -957,9 +957,13 @@ impl<Token: TokenSource> GatewayWallet<Token> {
     /// `wallet.withdraw`, as `AlpacaWalletService::initiate_withdrawal`: the
     /// gateway checks the whitelist, then sends the withdrawal once.
     /// `operation_id` names the call in the audit; `reason` is required on
-    /// the write tier. After an unknown outcome, wait for this request's
-    /// `settled` audit record before reading `list_all_transfers`; an empty
-    /// read before that record can race the withdrawal POST still in flight.
+    /// the write tier. After an unknown outcome, wait for the record carrying
+    /// the work result: `answered` with Alpaca traffic, or `settled`. Then
+    /// reconcile `list_all_transfers` repeatedly over a window longer than
+    /// the local timeout and expected Alpaca processing delay. Match amount,
+    /// destination, and `created_at` no earlier than the gateway answer.
+    /// Neither a local timeout nor one empty read proves rejection; never
+    /// retry the withdrawal from either condition.
     ///
     /// # Errors
     ///

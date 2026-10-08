@@ -207,11 +207,6 @@ impl AlpacaWalletError {
     }
 }
 
-/// Bounds every wallet HTTP request, including a keyless write whose answer
-/// is lost. Once this expires the detached gateway task settles, so recovery
-/// can wait for that record before reading the resulting state.
-const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
-
 /// How long the wallet client waits for a connection.
 const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -223,7 +218,9 @@ pub struct AlpacaWalletClient {
 }
 
 impl AlpacaWalletClient {
-    /// Builds the wallet HTTP client.
+    /// Builds the wallet HTTP client with a connection timeout and no total
+    /// request timeout. A timed out withdrawal POST is ambiguous and must
+    /// never invite an automatic retry.
     ///
     /// # Errors
     ///
@@ -236,14 +233,23 @@ impl AlpacaWalletClient {
         account_id: AlpacaAccountId,
         auth: AlpacaAuth,
     ) -> Result<Self, AlpacaWalletError> {
-        Self::with_request_timeout(base_url, account_id, auth, HTTP_REQUEST_TIMEOUT)
+        Self::build(base_url, account_id, auth, None)
     }
 
-    fn with_request_timeout(
+    pub(super) fn with_request_timeout(
         base_url: String,
         account_id: AlpacaAccountId,
         auth: AlpacaAuth,
         request_timeout: Duration,
+    ) -> Result<Self, AlpacaWalletError> {
+        Self::build(base_url, account_id, auth, Some(request_timeout))
+    }
+
+    fn build(
+        base_url: String,
+        account_id: AlpacaAccountId,
+        auth: AlpacaAuth,
+        request_timeout: Option<Duration>,
     ) -> Result<Self, AlpacaWalletError> {
         // The wallet client carries a raw base_url with no mode, so JWT
         // credentials mint at the live authx endpoint. Basic and KmsJwt
@@ -262,14 +268,15 @@ impl AlpacaWalletClient {
 
         // Credentials ride on every request, so never follow a redirect to
         // a host the caller did not configure.
-        let client = Client::builder()
+        let mut client = Client::builder()
             .redirect(Policy::none())
-            .connect_timeout(HTTP_CONNECT_TIMEOUT)
-            .timeout(request_timeout)
-            .build()?;
+            .connect_timeout(HTTP_CONNECT_TIMEOUT);
+        if let Some(request_timeout) = request_timeout {
+            client = client.timeout(request_timeout);
+        }
 
         Ok(Self {
-            client,
+            client: client.build()?,
             account_id,
             base_url,
             auth: AuthRuntime::build(auth, crate::auth::ALPACA_TOKEN_URL)?,
