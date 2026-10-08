@@ -511,6 +511,12 @@ impl AppState {
             result = &mut receiver => result.ok(),
             () = self.shutdown.cancelled() => None,
         };
+        // Close before answering shutdown. A result already queued remains
+        // the answer, and its task keeps the one audit record as `answered`.
+        let result = result.or_else(|| {
+            receiver.close();
+            receiver.try_recv().ok()
+        });
         match result {
             Some(Ok(response)) => tagged(call.request_id, response),
             Some(Err(failure)) => failure.into_response(),

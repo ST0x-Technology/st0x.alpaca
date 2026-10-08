@@ -6,7 +6,7 @@ use axum::http::HeaderValue;
 use axum::http::header::CONTENT_TYPE;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{MethodRouter, get};
-use futures_util::StreamExt as _;
+use futures_util::{StreamExt as _, stream};
 use st0x_alpaca::corporate_actions::CorporateActionReplay;
 use st0x_alpaca_gateway_api::Operation;
 use st0x_alpaca_gateway_api::dto::issuer::ReplayQuery;
@@ -23,13 +23,31 @@ pub(super) fn route(operation: Operation) -> Option<MethodRouter<AppState>> {
     })
 }
 
-/// The Alpaca body, ending as soon as shutdown starts so the connection
-/// drain leaves the grace period for detached work.
+/// The Alpaca body. Shutdown interrupts it with a transport error so a
+/// bounded replay cannot mistake a cut response for a complete window.
 fn until_shutdown(body: Body, shutdown: CancellationToken) -> Body {
-    Body::from_stream(
-        body.into_data_stream()
-            .take_until(shutdown.cancelled_owned()),
-    )
+    let body = stream::unfold(
+        (body.into_data_stream(), shutdown, false),
+        |(mut body, shutdown, finished)| async move {
+            if finished {
+                return None;
+            }
+            tokio::select! {
+                biased;
+                () = shutdown.cancelled() => Some((
+                    Err(axum::Error::new(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "gateway shutdown interrupted corporate action stream",
+                    ))),
+                    (body, shutdown, true),
+                )),
+                item = body.next() => {
+                    item.map(|item| (item, (body, shutdown, false)))
+                }
+            }
+        },
+    );
+    Body::from_stream(body)
 }
 
 /// Relays Alpaca's event stream from the replay position, byte for byte.
@@ -66,12 +84,11 @@ mod tests {
     use std::time::Duration;
 
     use axum::body::{Bytes, to_bytes};
-    use futures_util::stream;
 
     use super::*;
 
     #[tokio::test]
-    async fn the_relay_body_ends_when_shutdown_starts() {
+    async fn the_relay_body_fails_when_shutdown_starts() {
         let shutdown = CancellationToken::new();
         let upstream = Body::from_stream(stream::pending::<Result<Bytes, Infallible>>());
         let body = until_shutdown(upstream, shutdown.clone());
@@ -81,11 +98,14 @@ mod tests {
         assert!(!read.is_finished());
         shutdown.cancel();
 
-        let bytes = tokio::time::timeout(Duration::from_secs(1), &mut read)
+        let error = tokio::time::timeout(Duration::from_secs(1), &mut read)
             .await
             .unwrap()
             .unwrap()
-            .unwrap();
-        assert!(bytes.is_empty());
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "gateway shutdown interrupted corporate action stream"
+        );
     }
 }
