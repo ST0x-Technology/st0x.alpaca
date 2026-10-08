@@ -321,7 +321,9 @@ pub async fn poll_request_until_complete_with(
         let request = match read_before(deadline, || lookups.get_request(id), timed_out).await {
             Ok(request) => request,
             Err(error) => {
-                retry_transient(error)?;
+                if let Some(wait) = retry_transient(error)? {
+                    sleep_before(deadline, wait, timed_out).await?;
+                }
                 continue;
             }
         };
@@ -381,7 +383,11 @@ pub async fn poll_for_redemption_with(
         {
             Ok(Some(request)) => return Ok(request),
             Ok(None) => {}
-            Err(error) => retry_transient(error)?,
+            Err(error) => {
+                if let Some(wait) = retry_transient(error)? {
+                    sleep_before(deadline, wait, timed_out).await?;
+                }
+            }
         }
     }
 }
@@ -400,17 +406,31 @@ async fn tick_before(
         .map_err(|_| timed_out())
 }
 
+/// Waits out a relayed `Retry-After` unless the poll deadline comes first.
+async fn sleep_before(
+    deadline: Instant,
+    wait: Duration,
+    timed_out: impl FnOnce() -> AlpacaTokenizationError,
+) -> Result<(), AlpacaTokenizationError> {
+    tokio::time::timeout_at(deadline, tokio::time::sleep(wait))
+        .await
+        .map_err(|_| timed_out())
+}
+
 /// The retry rule of the tokenization polls, the one the wallet polls
 /// follow: a lookup error [`AlpacaTokenizationError::permanence`] calls
-/// transient is looked up again at the next interval; every other lookup
-/// error, the poll's own timeout included, ends the poll.
-fn retry_transient(error: AlpacaTokenizationError) -> Result<(), AlpacaTokenizationError> {
+/// transient is looked up again, after its `Retry-After` hint when it carries
+/// one; every other lookup error, the poll's own timeout included, ends the
+/// poll.
+fn retry_transient(
+    error: AlpacaTokenizationError,
+) -> Result<Option<Duration>, AlpacaTokenizationError> {
     if error.permanence() != Permanence::Transient {
         return Err(error);
     }
 
     warn!(target: "tokenization", %error, "Tokenization lookup failed, polling again");
-    Ok(())
+    Ok(error.backpressure().and_then(|hint| hint.retry_after))
 }
 
 /// Type of tokenization request.
@@ -3365,6 +3385,77 @@ mod tests {
                 assert_eq!(calls, 1 + usize::from(retried), "{expected}");
             }
         }
+    }
+    /// Both polls honor a relayed wait longer than their interval, without
+    /// sleeping beyond their own deadline.
+    #[tokio::test(start_paused = true)]
+    async fn tokenization_polls_honor_retry_after_without_exceeding_the_deadline() {
+        let retry_after = Duration::from_mins(10);
+        let config = PollingConfig {
+            interval: Duration::from_mins(1),
+            ..fast_polling(Duration::from_mins(30))
+        };
+
+        let requests = ScriptedLookups::requests(move |call| match call {
+            0 => Err(gateway_hop(true, Some(retry_after))),
+            _ => Ok(TokenizationRequest::mock_completed()),
+        });
+        let started = Instant::now();
+        poll_request_until_complete_with(
+            &requests,
+            &tokenization_request_id("MOCK_REQ_ID"),
+            &config,
+        )
+        .await
+        .unwrap();
+        assert_eq!(started.elapsed(), retry_after);
+        assert_eq!(requests.calls(), 2);
+
+        let redemptions = ScriptedLookups::redemptions(move |call| match call {
+            0 => Err(gateway_hop(true, Some(retry_after))),
+            _ => Ok(Some(TokenizationRequest::mock_completed())),
+        });
+        let started = Instant::now();
+        poll_for_redemption_with(&redemptions, &TxHash::ZERO, &config)
+            .await
+            .unwrap();
+        assert_eq!(started.elapsed(), retry_after);
+        assert_eq!(redemptions.calls(), 2);
+
+        let timeout = Duration::from_mins(5);
+        let config = PollingConfig {
+            interval: Duration::from_mins(1),
+            ..fast_polling(timeout)
+        };
+        let requests =
+            ScriptedLookups::requests(move |_| Err(gateway_hop(true, Some(retry_after))));
+        let started = Instant::now();
+        let error = poll_request_until_complete_with(
+            &requests,
+            &tokenization_request_id("MOCK_REQ_ID"),
+            &config,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(error, AlpacaTokenizationError::PollTimeout { .. }),
+            "{error:?}"
+        );
+        assert_eq!(started.elapsed(), timeout);
+        assert_eq!(requests.calls(), 1);
+
+        let redemptions =
+            ScriptedLookups::redemptions(move |_| Err(gateway_hop(true, Some(retry_after))));
+        let started = Instant::now();
+        let error = poll_for_redemption_with(&redemptions, &TxHash::ZERO, &config)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, AlpacaTokenizationError::PollTimeout { .. }),
+            "{error:?}"
+        );
+        assert_eq!(started.elapsed(), timeout);
+        assert_eq!(redemptions.calls(), 1);
     }
 
     /// A poll whose interval is longer than its timeout ends at the timeout,
