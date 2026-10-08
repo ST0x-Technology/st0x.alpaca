@@ -207,13 +207,12 @@ impl AlpacaWalletError {
     }
 }
 
-/// How long the wallet client waits for a connection, the connect bound the
-/// tokenization and broker API clients use. A connection that never opens
-/// means the request never left, so the bound cannot turn a withdrawal POST
-/// into an ambiguous failure. There is deliberately no total request
-/// timeout, unlike those clients: one firing on the keyless withdrawal POST
-/// after it left would turn a hang into an ambiguous failure a caller could
-/// retry into a second withdrawal.
+/// Bounds every wallet HTTP request, including a keyless write whose answer
+/// is lost. Once this expires the detached gateway task settles, so recovery
+/// can wait for that record before reading the resulting state.
+const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long the wallet client waits for a connection.
 const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct AlpacaWalletClient {
@@ -237,12 +236,21 @@ impl AlpacaWalletClient {
         account_id: AlpacaAccountId,
         auth: AlpacaAuth,
     ) -> Result<Self, AlpacaWalletError> {
+        Self::with_request_timeout(base_url, account_id, auth, HTTP_REQUEST_TIMEOUT)
+    }
+
+    fn with_request_timeout(
+        base_url: String,
+        account_id: AlpacaAccountId,
+        auth: AlpacaAuth,
+        request_timeout: Duration,
+    ) -> Result<Self, AlpacaWalletError> {
         // The wallet client carries a raw base_url with no mode, so JWT
         // credentials mint at the live authx endpoint. Basic and KmsJwt
-        // are production-only by construction; a private_key_jwt
-        // credential can belong to the sandbox, and minting it at the
-        // production authx answers a misleading 401 -- reject it here
-        // until the token URL is threaded from a mode-aware caller.
+        // are production only by construction. A private_key_jwt credential
+        // can belong to the sandbox, and minting it at the production authx
+        // answers a misleading 401. Reject it here until the token URL is
+        // threaded from a caller that knows the mode.
         match &auth {
             AlpacaAuth::PrivateKeyJwt { .. } => {
                 return Err(AlpacaWalletError::PrivateKeyJwtUnsupported);
@@ -257,6 +265,7 @@ impl AlpacaWalletClient {
         let client = Client::builder()
             .redirect(Policy::none())
             .connect_timeout(HTTP_CONNECT_TIMEOUT)
+            .timeout(request_timeout)
             .build()?;
 
         Ok(Self {
@@ -597,6 +606,33 @@ mod tests {
         .unwrap();
 
         assert_eq!(*client.account_id(), TEST_ACCOUNT_ID);
+    }
+
+    #[tokio::test]
+    async fn a_stalled_wallet_write_ends_at_the_request_timeout() {
+        let server = MockServer::start();
+        let write = server.mock(|when, then| {
+            when.method(POST).path("/stalled");
+            then.status(200).delay(Duration::from_secs(1)).body("{}");
+        });
+        let client = AlpacaWalletClient::with_request_timeout(
+            server.base_url(),
+            TEST_ACCOUNT_ID,
+            AlpacaAuth::Basic {
+                api_key: "test_key_id".to_string(),
+                api_secret: "test_secret_key".to_string(),
+            },
+            Duration::from_millis(100),
+        )
+        .unwrap();
+
+        let error = client.post("/stalled", &json!({})).await.unwrap_err();
+
+        assert!(
+            matches!(&error, AlpacaWalletError::Reqwest(source) if source.is_timeout()),
+            "{error:?}"
+        );
+        write.assert_calls(1);
     }
 
     #[test]

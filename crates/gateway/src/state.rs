@@ -361,7 +361,8 @@ impl AppState {
         });
 
         // A caller that goes away drops this future; the guard then closes
-        // the gate, so its recovery read cannot race a write still to come.
+        // the gate, so no new request can start. A keyless write already in
+        // flight may still finish, so recovery waits for its settled record.
         let _close_on_drop = CloseOnDrop(gate.clone());
         let result = tokio::select! {
             result = &mut receiver => result.ok(),

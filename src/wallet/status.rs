@@ -7,7 +7,7 @@
 //! (Complete/Failed) or times out.
 
 use alloy_primitives::TxHash;
-use backon::{ExponentialBuilder, Retryable};
+use backon::{BackoffBuilder, ExponentialBuilder};
 use std::time::Duration;
 use tokio::time::{Instant, sleep};
 use tracing::{info, warn};
@@ -37,10 +37,39 @@ impl Default for PollingConfig {
     }
 }
 
+async fn retry_read_before<T, Read, ReadFuture>(
+    deadline: Instant,
+    mut read: Read,
+    strategy: ExponentialBuilder,
+    timed_out: &impl Fn() -> AlpacaWalletError,
+) -> Result<T, AlpacaWalletError>
+where
+    Read: FnMut() -> ReadFuture,
+    ReadFuture: Future<Output = Result<T, AlpacaWalletError>>,
+{
+    let mut backoff = strategy.build();
+    loop {
+        match read_before(deadline, &mut read, timed_out).await {
+            Ok(value) => return Ok(value),
+            Err(error) if is_retried(&error) => {
+                let Some(backoff_delay) = backoff.next() else {
+                    return Err(error);
+                };
+                let retry_after = error
+                    .backpressure()
+                    .and_then(|hint| hint.retry_after)
+                    .unwrap_or_default();
+                sleep(next_poll_delay(backoff_delay.max(retry_after), deadline)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 /// Polls a transfer until it reaches a terminal state (Complete or Failed).
 ///
-/// A failed read the poll retries (`is_retried`) is read again with
-/// exponential backoff; any other read error ends the poll. No read or
+/// A failed read the poll retries (`is_retried`) is read again after the
+/// longer of its exponential backoff and its `Retry-After` hint. No read or
 /// backoff wait runs past the timeout.
 ///
 /// # Errors
@@ -69,15 +98,11 @@ pub async fn poll_transfer_until_complete_with(
         .with_max_delay(config.max_retry_delay);
 
     loop {
-        // The deadline bounds the whole retry, its backoff sleeps included.
-        let transfer = read_before(
+        let transfer = retry_read_before(
             deadline,
-            || {
-                (|| transfers.get_transfer(transfer_id))
-                    .retry(retry_strategy)
-                    .when(is_retried)
-            },
-            timed_out,
+            || transfers.get_transfer(transfer_id),
+            retry_strategy,
+            &timed_out,
         )
         .await?;
 
@@ -243,8 +268,9 @@ fn log_transfer_final_status(transfer_id: AlpacaTransferId, status: TransferStat
 /// Polls for an incoming deposit transfer matching the given tx hash, through
 /// [`WalletTransfers::find_deposit_by_tx_hash`], until it is detected and
 /// reaches a terminal state. A failed lookup the poll retries
-/// (`is_retried`) is looked up again with exponential backoff. No lookup or
-/// backoff wait runs past the timeout.
+/// (`is_retried`) is looked up again after the longer of its exponential
+/// backoff and its `Retry-After` hint. No lookup or backoff wait runs past
+/// the timeout.
 ///
 /// # Errors
 ///
@@ -272,15 +298,11 @@ pub async fn poll_deposit_by_tx_hash_with(
         .with_max_delay(config.max_retry_delay);
 
     loop {
-        // The deadline bounds the whole retry, its backoff sleeps included.
-        let maybe_transfer = read_before(
+        let maybe_transfer = retry_read_before(
             deadline,
-            || {
-                (|| transfers.find_deposit_by_tx_hash(tx_hash))
-                    .retry(retry_strategy)
-                    .when(is_retried)
-            },
-            timed_out,
+            || transfers.find_deposit_by_tx_hash(tx_hash),
+            retry_strategy,
+            &timed_out,
         )
         .await?;
 
@@ -1351,6 +1373,45 @@ mod tests {
             min_retry_delay: Duration::from_millis(1),
             max_retry_delay: Duration::from_millis(5),
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn backoff_polls_wait_out_retry_after_before_their_next_read() {
+        let transfer_id = Uuid::new_v4();
+        let tx_hash =
+            fixed_bytes!("abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890");
+        let complete = transfer_for_hash_poll(transfer_id, "COMPLETE", Some(tx_hash));
+        let wait = Duration::from_secs(60);
+        let config = PollingConfig {
+            interval: Duration::from_secs(1),
+            timeout: wait + Duration::from_secs(1),
+            max_retries: 1,
+            min_retry_delay: Duration::from_secs(1),
+            max_retry_delay: Duration::from_secs(1),
+        };
+        let limited = || AlpacaWalletError::ApiError {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            message: String::new(),
+            retry_after: Some(wait),
+        };
+
+        let transfers = ScriptedTransfers::new(vec![Err(limited()), Ok(complete.clone())], vec![]);
+        let started = Instant::now();
+        let transfer = poll_transfer_until_complete_with(&transfers, &transfer_id.into(), &config)
+            .await
+            .unwrap();
+        assert_eq!(transfer.status, TransferStatus::Complete);
+        assert_eq!(started.elapsed(), wait);
+        assert_eq!(transfers.left(), 0);
+
+        let deposits = ScriptedTransfers::new(vec![], vec![Err(limited()), Ok(Some(complete))]);
+        let started = Instant::now();
+        let deposit = poll_deposit_by_tx_hash_with(&deposits, &tx_hash, &config)
+            .await
+            .unwrap();
+        assert_eq!(deposit.status, TransferStatus::Complete);
+        assert_eq!(started.elapsed(), wait);
+        assert_eq!(deposits.left(), 0);
     }
 
     /// The retry rule the three polls share: a read error `permanence` calls

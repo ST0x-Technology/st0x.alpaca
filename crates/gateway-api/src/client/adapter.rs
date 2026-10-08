@@ -957,8 +957,9 @@ impl<Token: TokenSource> GatewayWallet<Token> {
     /// `wallet.withdraw`, as `AlpacaWalletService::initiate_withdrawal`: the
     /// gateway checks the whitelist, then sends the withdrawal once.
     /// `operation_id` names the call in the audit; `reason` is required on
-    /// the write tier. Never send again after an unknown outcome; reconcile
-    /// from `list_all_transfers`.
+    /// the write tier. After an unknown outcome, wait for this request's
+    /// `settled` audit record before reading `list_all_transfers`; an empty
+    /// read before that record can race the withdrawal POST still in flight.
     ///
     /// # Errors
     ///
