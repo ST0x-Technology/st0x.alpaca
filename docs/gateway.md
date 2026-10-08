@@ -32,7 +32,7 @@ Outside the app, Cloud Run `run.invoker` is granted only to the bot service acco
 
 ## Config
 
-The service reads the TOML file named by `ST0X_ALPACA_GATEWAY_CONFIG` (the image sets `/run/t0-alpaca/gateway.toml`). Unknown keys are refused at the top level and in the gateway's own tables; `[broker]` is read with the library's `AlpacaBrokerApiCtx`, which ignores keys it does not know, so a misspelled key there takes the library default and the startup account check is what catches a wrong endpoint. `environment` is exactly `production` or `staging`; any other value, `prod` or `Production` included, fails to parse. With `environment = "production"`, or with `mode = "production"` in `[broker]` (the real money Broker API, whatever the environment), only the Cloud KMS credential (`client_id` and `kms_key_version`) passes validation, so no key material for the real money endpoint lives in the config. A staging deployment against the sandbox signs with `api_key` and `api_secret` only: the wallet and tokenization clients mint Cloud KMS tokens at the production token endpoint, so validation refuses KMS with a sandbox or omitted mode, and it refuses the local private key (`private_key_pem`) everywhere. The bot, read and write audiences must differ. `identity.google_jwks_url` and `identity.iap_jwks_url` default to Google's key URLs; an override must be HTTPS, or HTTP on a loopback host. `st0x-alpaca-gateway --validate-config <path>` checks a file without contacting anything. A file that does not parse is reported with the parser's message, never the offending line itself, so a malformed credential line stays out of the startup log and the validation output.
+The service reads the TOML file named by `ST0X_ALPACA_GATEWAY_CONFIG`. The deployment supplies that path. Unknown keys are refused at the top level and in the gateway's own tables; `[broker]` is read with the library's `AlpacaBrokerApiCtx`, which ignores keys it does not know, so a misspelled key there takes the library default and the startup account check is what catches a wrong endpoint. `environment` is exactly `production` or `staging`; any other value, `prod` or `Production` included, fails to parse. With `environment = "production"`, or with `mode = "production"` in `[broker]` (the real money Broker API, whatever the environment), only the Cloud KMS credential (`client_id` and `kms_key_version`) passes validation, so no key material for the real money endpoint lives in the config. A staging deployment against the sandbox signs with `api_key` and `api_secret` only: the wallet and tokenization clients mint Cloud KMS tokens at the production token endpoint, so validation refuses KMS with a sandbox or omitted mode, and it refuses the local private key (`private_key_pem`) everywhere. The bot, read and write audiences must differ. `identity.google_jwks_url` and `identity.iap_jwks_url` default to Google's key URLs; an override must be HTTPS, or HTTP on a loopback host. `st0x-alpaca-gateway --validate-config <path>` checks a file without contacting anything. A file that does not parse is reported with the parser's message, never the offending line itself, so a malformed credential line stays out of the startup log and the validation output.
 
 ```toml
 environment = "staging"
@@ -47,13 +47,13 @@ human_budget_per_minute = 60
 [broker]
 # Keyless: Cloud KMS signs the private_key_jwt assertion with the runtime service account.
 client_id = "<BrokerDash client id>"
-kms_key_version = "projects/<project>/locations/<region>/keyRings/<ring>/cryptoKeys/alpaca-api-key/cryptoKeyVersions/1"
-account_id = "<T0 account id>"
+kms_key_version = "projects/<project>/locations/<region>/keyRings/<ring>/cryptoKeys/<key>/cryptoKeyVersions/<version>"
+account_id = "<account id>"
 mode = "production"
 
 [identity]
 bot_audience = "<Cloud Run service URL>"
-bot_principals = ["<unique id of t0-liquidity@t0-liquidity>"]
+bot_principals = ["<unique id of bot service account>"]
 read_audience = "/projects/<number>/global/backendServices/<read backend id>"
 write_audience = "/projects/<number>/global/backendServices/<write backend id>"
 
@@ -92,32 +92,32 @@ Query the audit stream in Cloud Logging with `labels.log="st0x_alpaca_gateway_au
 
 ```bash
 nix build .#gateway-oci
-./result | docker load    # t0-alpaca:latest, entrypoint /bin/st0x-alpaca-gateway
+./result | docker load    # <gateway-image>:latest, entrypoint /bin/st0x-alpaca-gateway
 ```
 
 The image has no base layer and a pinned creation time, so a commit always rebuilds to the same digest. `gateway-oci` and `st0x-alpaca-gateway` are flake outputs on Linux only, so on a Mac the image needs a Linux builder (`nix build .#packages.x86_64-linux.gateway-oci`). CI builds the image on every pull request.
 
 ## Deploying to staging
 
-The `t0-alpaca-staging` project in the t0trade.com org needs, in t0.devops:
+Concrete organization, project, identity, key, registry, secret, and log routing names belong in the private infrastructure repository. A staging deployment needs:
 
-1. A runtime service account `t0-alpaca` and a KMS key `alpaca-api-key` (EC P-256) with that account as the only `signerVerifier`, with KMS Data Access audit logging on.
-2. A BrokerDash credential registered against that key's public half, scoped to the staging account, with the narrowest scopes BrokerDash offers for the T0 matrix.
-3. Cloud Run service `t0-alpaca`: the attested image digest, min and max instances 1, CPU always allocated, ingress all, request timeout 300 s, the config mounted from Secret Manager at `/run/t0-alpaca/gateway.toml`.
-4. `run.invoker` for the staging liquidity runtime service account and the project's IAP service agent only.
-5. An external HTTPS load balancer with a serverless NEG and two backends, `/alpaca-read/*` and `/alpaca-write/*`, each with IAP and its own group, backend timeout 300 s, request logging at sample rate 1.0. Their backend ids are the two audiences in config.
-6. The project sink to `aggregated-logs`, and the `audit_trail` module with an extra filter for `labels.log="st0x_alpaca_gateway_audit"` so mutation records reach `t0-audit-trail`.
+1. A dedicated runtime service account and Cloud KMS key, with that account as the only `signerVerifier` and KMS Data Access audit logging enabled.
+2. A BrokerDash credential registered against that key's public half, scoped to the staging account, with the narrowest scopes the operation matrix needs.
+3. A Cloud Run service using the attested image digest, min and max instances 1, CPU always allocated, ingress all, request timeout 300 s, and the config mounted from Secret Manager at `<config-mount-path>`.
+4. `run.invoker` for the staging bot runtime service account and the project's IAP service agent only.
+5. An external HTTPS load balancer with a serverless NEG and separate `<read-prefix>/*` and `<write-prefix>/*` backends, each with IAP and its own group, backend timeout 300 s, and request logging at sample rate 1.0. Their backend ids are the two audiences in config.
+6. A project log sink and audit module routing records with `labels.log="st0x_alpaca_gateway_audit"` to the protected audit destination.
 
 Then:
 
-1. Build and push the image to `europe-west3-docker.pkg.dev/t0-artifacts/t0-alpaca/t0-alpaca` and sign its Binary Authorization attestation.
-2. Validate and publish the staging config: `docker run --rm -v $PWD/staging.toml:/candidate.toml t0-alpaca:latest --validate-config /candidate.toml`, then add it as a new Secret Manager version.
+1. Build and push the image to `<artifact-registry>/<repository>/<image>` and sign its Binary Authorization attestation.
+2. Validate and publish the staging config: `docker run --rm -v $PWD/staging.toml:/candidate.toml <gateway-image>:latest --validate-config /candidate.toml`, then add it as a new Secret Manager version.
 3. Deploy the digest with no traffic, check its startup log line `Gateway bound to its Alpaca account`, then move all traffic to it at once and check `/readyz` (see [Rollouts](#rollouts)).
-4. From the staging liquidity VM, call `GET /bot/v1/account/funds` with the VM's ID token; from a laptop, call `/alpaca-read/v1/account/funds` through the load balancer. Both write audit records.
+4. From the staging bot runtime, call `GET /bot/v1/account/funds` with its ID token; from an operator machine, call the read tier account funds route through the load balancer. Both write audit records.
 
 ## Deploying to production
 
-Same steps in `t0-alpaca`, with the production BrokerDash credential and account, behind the app deploy PAM grant like every other T0 service. The production config sets `environment = "production"` and must use the Cloud KMS credential; validation refuses any other shape. Production `bot_principals` lists only the production liquidity runtime service account.
+Use the same controls in the production project, with a separate production BrokerDash credential, account, service account, KMS key, config, and artifact digest. The production config sets `environment = "production"` and must use the Cloud KMS credential; validation refuses any other shape. Production `bot_principals` lists only the production bot runtime service account.
 
 ## Rollouts
 
@@ -127,9 +127,9 @@ Min and max instances 1 does not make the gateway a single process. Cloud Run ca
 2. Deploy every revision (a new digest, a new config version, a rollback) with no traffic, then move all traffic to it at once. A revision without traffic admits nothing, so the overlap lasts only while the old revision drains. Never split traffic between two revisions: both keep admitting for as long as the split lasts. A config roll runs the same two commands with `--update-secrets` in place of `--image`.
 
 ```bash
-gcloud run services update t0-alpaca --project <project> --region <region> --image <digest> --no-traffic
+gcloud run services update <service> --project <project> --region <region> --image <digest> --no-traffic
 # Check the new revision's startup log line `Gateway bound to its Alpaca account`.
-gcloud run services update-traffic t0-alpaca --project <project> --region <region> --to-latest
+gcloud run services update-traffic <service> --project <project> --region <region> --to-latest
 ```
 
 ## Rollback

@@ -106,7 +106,7 @@ async fn acting_for_a_human_names_them_in_the_audit_record() {
     let broker = harness
         .bot_client()
         .await
-        .acting_for("operator@t0trade.com")
+        .acting_for("operator@example.com")
         .broker();
 
     broker.account_funds().await.unwrap();
@@ -115,7 +115,7 @@ async fn acting_for_a_human_names_them_in_the_audit_record() {
     assert_eq!(events.len(), 1);
     assert_eq!(
         events[0].on_behalf_of.as_deref(),
-        Some("operator@t0trade.com")
+        Some("operator@example.com")
     );
 }
 
@@ -468,7 +468,7 @@ async fn a_write_tier_adapter_places_an_exact_limit_order_and_a_journal_with_its
             )
         })
         .collect();
-    let operator = Some("operator@t0trade.com".to_string());
+    let operator = Some("operator@example.com".to_string());
     assert_eq!(
         answered,
         [

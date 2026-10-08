@@ -372,7 +372,7 @@ pub fn bot_token(subject: &str, audience: &str) -> String {
         &header,
         &Claims {
             sub: subject,
-            email: "t0-liquidity@t0-liquidity.iam.gserviceaccount.com",
+            email: "liquidity-bot@example-project.iam.gserviceaccount.com",
             aud: audience,
             iss: "https://accounts.google.com",
             exp: exp(),
@@ -394,7 +394,7 @@ pub fn iap_token(audience: &str) -> String {
         &header,
         &Claims {
             sub: "accounts.google.com:1234",
-            email: "operator@t0trade.com",
+            email: "operator@example.com",
             aud: audience,
             iss: "https://cloud.google.com/iap",
             exp: exp(),
