@@ -1,4 +1,4 @@
-//! The account bound Alpaca gateway (`t0-alpaca`).
+//! The account bound Alpaca gateway (`t0-alpaca`, `s01-alpaca`).
 //!
 //! Holds the deployment's Alpaca credential and serves the operation catalog
 //! of `st0x-alpaca-gateway-api` to bots (Google ID tokens) and operators

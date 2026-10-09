@@ -9,11 +9,11 @@ use std::time::Duration;
 use axum::Json;
 use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
-use st0x_alpaca::KmsJwtError;
-use st0x_alpaca::Permanence;
 use st0x_alpaca::broker::{AlpacaBrokerApiError, AlpacaMarketDataError, PlacementError};
+use st0x_alpaca::corporate_actions::CorporateActionStreamError;
 use st0x_alpaca::tokenization::AlpacaTokenizationError;
 use st0x_alpaca::wallet::AlpacaWalletError;
+use st0x_alpaca::{AlpacaError, IssuerCallError, KmsJwtError, Permanence};
 use st0x_alpaca_gateway_api::{
     ErrorBody, ErrorCode, Operation, Outcome, REQUEST_ID_HEADER, RejectionReason,
 };
@@ -471,6 +471,118 @@ fn network_refusal(
     }
 }
 
+/// Maps an issuer error. It sets no Alpaca status the error does not name:
+/// [`issuer_call`] takes it from the answers the call got.
+#[must_use]
+pub fn issuer(error: &AlpacaError, sent: Sent) -> Failure {
+    use AlpacaError as E;
+
+    let message = error.to_string();
+    if let Some(pressure) = error.backpressure() {
+        // An Alpaca 429, or the client's hold from an earlier one.
+        if matches!(error, E::RateLimited { .. }) {
+            return Failure {
+                retry_after: pressure.retry_after,
+                ..Failure::new(ErrorCode::Backpressure, message)
+            };
+        }
+        return throttled(pressure.retry_after, None, message);
+    }
+
+    match error {
+        // Refused before anything was sent.
+        E::UnsupportedTokenizationNetwork { .. } => {
+            Failure::rejected(RejectionReason::UnsupportedNetwork, message)
+        }
+        // The send gate held the request or its credential mint back.
+        E::NotSent(_) | E::Jwt(KmsJwtError::NotSent(_)) => {
+            Failure::new(ErrorCode::UpstreamTransient, message)
+        }
+        // The request never left: no credential, endpoint, or connection.
+        E::Jwt(_) | E::InvalidUrl(_) => unsendable(error.permanence(), message),
+        E::Reqwest(source) if never_left(source) => unsent(source, message),
+        E::RequestNotFound { .. } => Failure {
+            alpaca_status: Some(404),
+            ..Failure::rejected(RejectionReason::RequestNotFound, message)
+        },
+        // Alpaca refused the credential with a 401 or 403.
+        E::Auth(_) => Failure::rejected(RejectionReason::AlpacaApi, message),
+        E::Api { status_code, .. } => match reqwest::StatusCode::from_u16(*status_code) {
+            Ok(status) => api_failure(status, sent, error.permanence(), message),
+            Err(_) => untyped(sent, error.permanence(), message),
+        },
+        _ => untyped(sent, error.permanence(), message),
+    }
+}
+
+/// Maps a failed issuer call as [`placement`] maps an order: once a POST
+/// may have been written, `outcome_unknown` keeping any hold; before that,
+/// and for a read, as [`issuer`] maps a read. Either carries the status of
+/// the last answer Alpaca gave the call.
+#[must_use]
+pub fn issuer_call(failure: &IssuerCallError) -> Failure {
+    let mapped = if failure.written {
+        Failure {
+            retry_after: failure
+                .error
+                .backpressure()
+                .and_then(|pressure| pressure.retry_after),
+            ..Failure::new(ErrorCode::OutcomeUnknown, failure.error.to_string())
+        }
+    } else {
+        issuer(&failure.error, Sent::Read)
+    };
+    Failure {
+        alpaca_status: failure.alpaca_status,
+        ..mapped
+    }
+}
+
+/// Maps a failure to open the corporate action stream, a read.
+#[must_use]
+pub fn corporate_actions(error: &CorporateActionStreamError) -> Failure {
+    use CorporateActionStreamError as E;
+
+    let message = error.to_string();
+    match error {
+        E::Auth(source) if source.is_rate_limited() => {
+            throttled(source.retry_after(), None, message)
+        }
+        // The send gate held the request or its credential mint back.
+        E::NotSent(_) | E::Auth(KmsJwtError::NotSent(_)) => {
+            Failure::new(ErrorCode::UpstreamTransient, message)
+        }
+        // The request never left: no credential, no connection.
+        E::Auth(source) => {
+            let permanence = if source.is_deterministic() {
+                Permanence::Permanent
+            } else {
+                Permanence::Transient
+            };
+            unsendable(permanence, message)
+        }
+        E::Http(source) if never_left(source) => unsent(source, message),
+        E::Http(_) => untyped(Sent::Read, Permanence::Transient, message),
+        E::RateLimited { retry_after } => throttled(
+            *retry_after,
+            Some(reqwest::StatusCode::TOO_MANY_REQUESTS),
+            message,
+        ),
+        // A refused redirect repeats; a 408 or 5xx can clear.
+        E::HttpStatus(status) => {
+            let permanence = if status.is_redirection() {
+                Permanence::Permanent
+            } else {
+                Permanence::Transient
+            };
+            api_failure(*status, Sent::Read, permanence, message)
+        }
+        E::InvalidContentType { status, .. } => {
+            api_failure(*status, Sent::Read, Permanence::Permanent, message)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use st0x_alpaca::KmsJwtError;
@@ -519,6 +631,8 @@ mod tests {
                 &AlpacaTokenizationError::Auth(kms_throttled()),
                 Sent::Mutation,
             ),
+            issuer(&AlpacaError::Jwt(kms_throttled()), Sent::Read),
+            corporate_actions(&CorporateActionStreamError::Auth(kms_throttled())),
         ];
 
         for failure in failures {
@@ -556,6 +670,9 @@ mod tests {
                     .for_mutation(Operation::WalletWithdraw),
                 tokenization(&AlpacaTokenizationError::Auth(kms()), Sent::Mutation)
                     .for_mutation(Operation::TokenizationMint),
+                issuer(&AlpacaError::Jwt(kms()), Sent::Mutation)
+                    .for_mutation(Operation::IssuerRedeem),
+                corporate_actions(&CorporateActionStreamError::Auth(kms())),
             ];
 
             for failure in failures {
@@ -632,6 +749,18 @@ mod tests {
             .for_mutation(Operation::TokenizationMint),
             tokenization(&AlpacaTokenizationError::Auth(mint()), Sent::Mutation)
                 .for_mutation(Operation::TokenizationMint),
+            issuer_call(&IssuerCallError {
+                written: false,
+                alpaca_status: None,
+                error: AlpacaError::NotSent(GateClosed),
+            })
+            .for_mutation(Operation::IssuerRedeem),
+            issuer_call(&IssuerCallError {
+                written: false,
+                alpaca_status: None,
+                error: AlpacaError::Jwt(mint()),
+            })
+            .for_mutation(Operation::IssuerRedeem),
         ];
 
         for failure in failures {

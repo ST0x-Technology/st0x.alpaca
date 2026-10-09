@@ -7,12 +7,11 @@
 //! request and no credential mint of that future starts. Outside a scope
 //! nothing is recorded and every request may leave.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use reqwest::header::HeaderMap;
-#[cfg(feature = "broker")]
 use reqwest::{RequestBuilder, Response, StatusCode};
 
 /// Header Alpaca puts its request id in.
@@ -88,7 +87,6 @@ impl fmt::Debug for SendGate {
 pub struct GateClosed;
 
 /// The failure of [`send`]: the HTTP client's own, or a closed gate.
-#[cfg(feature = "broker")]
 #[derive(Debug)]
 pub(crate) enum SendError {
     Http(reqwest::Error),
@@ -98,6 +96,7 @@ pub(crate) enum SendError {
 tokio::task_local! {
     static TRAFFIC: RefCell<Traffic>;
     static GATE: SendGate;
+    static LAST_ANSWER: Cell<Option<u16>>;
 }
 
 /// Runs `future` and returns its output with the Alpaca traffic it made.
@@ -110,6 +109,21 @@ pub async fn collect<Output>(future: impl Future<Output = Output>) -> (Output, T
         .await
 }
 
+/// Runs `future` keeping the status of the last Alpaca API answer it gets,
+/// which [`last_answer`] reads from inside it. Its traffic still counts in
+/// the enclosing [`collect`] scope.
+#[cfg(feature = "issuer")]
+pub(crate) fn tracking_last_answer<Fut: Future>(future: Fut) -> impl Future<Output = Fut::Output> {
+    LAST_ANSWER.scope(Cell::new(None), future)
+}
+
+/// The status of the last Alpaca API answer the enclosing
+/// [`tracking_last_answer`] scope got; `None` when it got none.
+#[cfg(feature = "issuer")]
+pub(crate) fn last_answer() -> Option<u16> {
+    LAST_ANSWER.try_with(Cell::get).ok().flatten()
+}
+
 /// Runs `future` with every Alpaca request and credential mint it starts
 /// asking `gate` first. In nested scopes the innermost gate decides.
 pub async fn gated<Output>(gate: SendGate, future: impl Future<Output = Output>) -> Output {
@@ -118,14 +132,12 @@ pub async fn gated<Output>(gate: SendGate, future: impl Future<Output = Output>)
 
 /// Sends one Alpaca API request unless the active [`SendGate`] holds it
 /// back. Callers send only once everything the request needs is in hand.
-#[cfg(feature = "broker")]
 pub(crate) async fn send(request: RequestBuilder) -> Result<Response, SendError> {
     start(request)?.await.map_err(SendError::Http)
 }
 
 /// Asks the active gate and, under its lock, hands the request to the HTTP
 /// client, which builds the request's future without awaiting.
-#[cfg(feature = "broker")]
 fn start(
     request: RequestBuilder,
 ) -> Result<impl Future<Output = reqwest::Result<Response>>, SendError> {
@@ -147,9 +159,9 @@ pub(crate) fn ensure_open() -> Result<(), GateClosed> {
 
 /// Records one Alpaca API answer: its status and its request id. Every
 /// client calls it right after its send returns, before reading the body.
-#[cfg(feature = "broker")]
 pub(crate) fn record(status: StatusCode, headers: &HeaderMap) {
     update(|traffic| traffic.last_status = Some(status.as_u16()));
+    let _ = LAST_ANSWER.try_with(|last| last.set(Some(status.as_u16())));
     record_id(headers);
 }
 
@@ -168,7 +180,7 @@ fn update(change: impl FnOnce(&mut Traffic)) {
     let _ = TRAFFIC.try_with(|traffic| change(&mut traffic.borrow_mut()));
 }
 
-#[cfg(all(test, feature = "broker"))]
+#[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;

@@ -1,5 +1,5 @@
-//! Shared state, the startup account check, and the runner every handler
-//! goes through: admission (shutdown, capability switch, human budget), the
+//! Shared state, the startup account check, and the runners handlers go
+//! through: admission (shutdown, capability switch, human budget), the
 //! operation deadline, detached work, and audit.
 
 use std::collections::{BTreeMap, HashMap};
@@ -16,12 +16,15 @@ use chrono::Utc;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use st0x_alpaca::broker::{AlpacaBrokerApi, AlpacaBrokerApiError};
-use st0x_alpaca::core::Network;
+use st0x_alpaca::core::{AlpacaClient, AlpacaError, Network};
+use st0x_alpaca::corporate_actions::{
+    CorporateActionEndpointError, CorporateActionStreamBuildError, CorporateActionStreamClient,
+};
 use st0x_alpaca::request_id::{self, SendGate, Traffic};
 use st0x_alpaca::tokenization::{AlpacaTokenizationError, AlpacaTokenizationService};
 use st0x_alpaca::wallet::{AlpacaWalletError, AlpacaWalletService};
 use st0x_alpaca_gateway_api::{
-    AuditEvent, AuditPhase, DEPLOYMENT, ErrorCode, ON_BEHALF_OF_HEADER, Operation, Outcome,
+    AuditEvent, AuditPhase, ErrorCode, ON_BEHALF_OF_HEADER, Operation, Outcome, Profile,
     REQUEST_ID_HEADER, RejectionReason, Tier,
 };
 use tokio::sync::oneshot;
@@ -51,6 +54,11 @@ const AUDIT_IDS_MAX: usize = 100;
 /// Bounds detached wallet work so shutdown never depends on an unbounded
 /// keyless write. Expiry is an ambiguous result, not proof Alpaca rejected it.
 const WALLET_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// Connect timeout of the issuer and stream clients.
+const ISSUER_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Per request timeout of the issuer clients.
+const ISSUER_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// `text` cut to its first `max` characters.
 fn cut(mut text: String, max: usize) -> String {
@@ -90,6 +98,53 @@ pub enum StartupError {
     Wallet(#[from] AlpacaWalletError),
     #[error("tokenization client: {0}")]
     Tokenization(#[from] AlpacaTokenizationError),
+    #[error("issuer client: {0}")]
+    Issuer(#[from] AlpacaError),
+    #[error("corporate action stream: {0}")]
+    StreamEndpoint(#[from] CorporateActionEndpointError),
+    #[error("corporate action stream client: {0}")]
+    StreamClient(#[from] CorporateActionStreamBuildError),
+}
+
+/// The `s01` profile's clients. Mint callbacks, redemptions and request
+/// status reads each have their own issuer client, so a `Retry-After` hold
+/// on one (a human polling `issuer.request` included) does not stall the
+/// others.
+pub struct IssuerClients {
+    pub mint_callbacks: AlpacaClient,
+    pub redemptions: AlpacaClient,
+    pub requests: AlpacaClient,
+    pub corporate_actions: CorporateActionStreamClient,
+}
+
+impl IssuerClients {
+    /// Builds the clients with the broker credential, account and token URL.
+    fn new(config: &GatewayConfig) -> Result<Self, StartupError> {
+        let broker = &config.broker;
+        let token_url = broker.mode().token_url();
+        let client = || {
+            AlpacaClient::with_auth(
+                broker.base_url(),
+                broker.account_id.to_string(),
+                broker.auth.clone(),
+                &token_url,
+                ISSUER_CONNECT_TIMEOUT,
+                ISSUER_REQUEST_TIMEOUT,
+            )
+        };
+        Ok(Self {
+            mint_callbacks: client()?,
+            redemptions: client()?,
+            requests: client()?,
+            corporate_actions: CorporateActionStreamClient::new(
+                config.corporate_actions.endpoint()?,
+                broker.auth.clone(),
+                &token_url,
+                ISSUER_CONNECT_TIMEOUT,
+                Duration::from_secs(config.corporate_actions.idle_timeout_secs),
+            )?,
+        })
+    }
 }
 
 pub struct Inner {
@@ -97,6 +152,8 @@ pub struct Inner {
     pub broker: AlpacaBrokerApi,
     pub wallet: AlpacaWalletService,
     pub tokenizers: HashMap<Network, AlpacaTokenizationService>,
+    /// Built for the `s01` profile only.
+    pub issuer_clients: Option<IssuerClients>,
     pub audit: Arc<dyn AuditSink>,
     pub budget: HumanBudget,
     /// Detached work; shutdown waits for it.
@@ -163,8 +220,13 @@ impl AppState {
             )?;
             tokenizers.insert(*network, service);
         }
+        let issuer_clients = match config.profile {
+            Profile::T0 => None,
+            Profile::S01 => Some(IssuerClients::new(&config)?),
+        };
 
         info!(
+            deployment = config.profile.deployment(),
             environment = %config.environment,
             account_id = %config.broker.account_id,
             "Gateway bound to its Alpaca account"
@@ -176,6 +238,7 @@ impl AppState {
             broker,
             wallet,
             tokenizers,
+            issuer_clients,
             audit,
             budget,
             tasks: TaskTracker::new(),
@@ -221,6 +284,21 @@ impl AppState {
                     "network {} is not configured on this deployment",
                     network.as_str()
                 ),
+            )
+        })
+    }
+
+    /// The `s01` clients, or a refusal on a profile without them.
+    ///
+    /// # Errors
+    ///
+    /// Returns `403 capability_disabled` when the profile builds no issuer
+    /// clients.
+    pub fn issuer(&self) -> Result<&IssuerClients, Failure> {
+        self.issuer_clients.as_ref().ok_or_else(|| {
+            Failure::new(
+                ErrorCode::CapabilityDisabled,
+                "this deployment holds no issuer clients",
             )
         })
     }
@@ -396,6 +474,62 @@ impl AppState {
         }
     }
 
+    /// Admits a read and answers it with the response `open` resolves to,
+    /// such as a stream whose body outlives the call: no deadline and no
+    /// send gate. `open` runs on a tracked task that writes the record with
+    /// its Alpaca traffic once it resolves, `answered` when the caller took
+    /// the response and `settled` when the caller had gone away or shutdown
+    /// answered first, as [`Self::run`] does.
+    pub async fn relay<Open>(&self, call: Call, intent: Intent, open: Open) -> Response
+    where
+        Open: Future<Output = Result<Response, Failure>> + Send + 'static,
+    {
+        if let Err(failure) = self.admit(&call, &intent) {
+            return self.refuse(&call, &intent, failure).into_response();
+        }
+        let (sender, mut receiver) = oneshot::channel::<Result<Response, Failure>>();
+        let (state, task_call, task_intent) = (self.clone(), call.clone(), intent.clone());
+        self.tasks.spawn(async move {
+            let (result, traffic) = request_id::collect(open).await;
+            let result = result.map_err(|failure| Failure {
+                request_id: task_call.request_id,
+                ..failure
+            });
+            let mut event = state.event(
+                &task_call,
+                &task_intent,
+                AuditPhase::Answered,
+                &traffic,
+                result.as_ref().map(|_| [].as_slice()),
+            );
+            if sender.send(result).is_err() {
+                event.phase = AuditPhase::Settled;
+            }
+            state.audit.emit(&event);
+        });
+        let result = tokio::select! {
+            result = &mut receiver => result.ok(),
+            () = self.shutdown.cancelled() => None,
+        };
+        // Close before answering shutdown. A result already queued remains
+        // the answer, and its task keeps the one audit record as `answered`.
+        let result = result.or_else(|| {
+            receiver.close();
+            receiver.try_recv().ok()
+        });
+        match result {
+            Some(Ok(response)) => tagged(call.request_id, response),
+            Some(Err(failure)) => failure.into_response(),
+            None => self
+                .refuse(
+                    &call,
+                    &intent,
+                    Failure::new(ErrorCode::Unavailable, "the gateway is shutting down"),
+                )
+                .into_response(),
+        }
+    }
+
     /// The answer to a call whose result came neither by its deadline nor
     /// before shutdown.
     fn without_result(&self, operation: Operation) -> Failure {
@@ -452,7 +586,7 @@ impl AppState {
             request_id: call.request_id,
             phase,
             at: Utc::now(),
-            deployment: DEPLOYMENT.to_string(),
+            deployment: self.config.profile.deployment().to_string(),
             environment: self.config.environment.as_str().to_string(),
             account_id: self.config.broker.account_id.to_string(),
             principal: call.principal.subject.clone(),
@@ -488,7 +622,11 @@ impl Drop for CloseOnDrop {
 }
 
 fn success<T: Serialize>(request_id: Uuid, body: &T) -> Response {
-    let mut response = Json(body).into_response();
+    tagged(request_id, Json(body).into_response())
+}
+
+/// `response` carrying the call's request id.
+fn tagged(request_id: Uuid, mut response: Response) -> Response {
     if let Ok(value) = HeaderValue::from_str(&request_id.to_string()) {
         response.headers_mut().insert(REQUEST_ID_HEADER, value);
     }

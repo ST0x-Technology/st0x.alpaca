@@ -10,8 +10,12 @@ use alloy_primitives::Address;
 use serde::{Deserialize, Serialize};
 use st0x_alpaca::broker::{AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode};
 use st0x_alpaca::core::{AlpacaAuth, Network};
+use st0x_alpaca::corporate_actions::{
+    CorporateActionEndpointError, CorporateActionStreamEndpoint,
+    DEFAULT_CORPORATE_ACTIONS_STREAM_URL,
+};
 use st0x_alpaca::endpoint::validate_credential_origin;
-use st0x_alpaca_gateway_api::Operation;
+use st0x_alpaca_gateway_api::{Operation, Profile};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -35,6 +39,8 @@ pub enum ConfigError {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GatewayConfig {
+    /// The deployment this is: its name and its capability matrix.
+    pub profile: Profile,
     /// Written into every audit record. A production deployment must sign
     /// with its Cloud KMS key.
     pub environment: Environment,
@@ -60,6 +66,9 @@ pub struct GatewayConfig {
     pub wallet: WalletConfig,
     #[serde(default)]
     pub tokenization: TokenizationConfig,
+    /// Read by the `s01` profile only.
+    #[serde(default)]
+    pub corporate_actions: CorporateActionsConfig,
 }
 
 const fn default_human_budget() -> u32 {
@@ -166,6 +175,58 @@ pub struct TokenizationConfig {
     pub mint_recipients: Vec<Address>,
 }
 
+/// The corporate action stream the `s01` profile relays.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CorporateActionsConfig {
+    /// The stream URL, carrying its type and region filter.
+    #[serde(default = "default_stream_url")]
+    pub stream_url: String,
+    /// Longest wait for the next stream chunk before the relay ends.
+    #[serde(default = "default_idle_timeout_secs")]
+    pub idle_timeout_secs: u64,
+}
+
+impl Default for CorporateActionsConfig {
+    fn default() -> Self {
+        Self {
+            stream_url: default_stream_url(),
+            idle_timeout_secs: default_idle_timeout_secs(),
+        }
+    }
+}
+
+impl CorporateActionsConfig {
+    /// The stream endpoint, checked the same way at startup and by
+    /// `--validate-config`.
+    ///
+    /// # Errors
+    ///
+    /// When `stream_url` is not an endpoint the stream client may call.
+    pub fn endpoint(&self) -> Result<CorporateActionStreamEndpoint, CorporateActionEndpointError> {
+        // Tests serve the stream from a loopback mock that still gets the
+        // credentials; a deployed gateway sends them to Alpaca's host only.
+        #[cfg(any(test, feature = "test-support"))]
+        if let Ok(endpoint) =
+            CorporateActionStreamEndpoint::authenticated_loopback(&self.stream_url)
+        {
+            return Ok(endpoint);
+        }
+        CorporateActionStreamEndpoint::parse(
+            &self.stream_url,
+            st0x_alpaca::corporate_actions::DevelopmentLoopback::Deny,
+        )
+    }
+}
+
+fn default_stream_url() -> String {
+    DEFAULT_CORPORATE_ACTIONS_STREAM_URL.to_string()
+}
+
+const fn default_idle_timeout_secs() -> u64 {
+    90
+}
+
 impl GatewayConfig {
     /// Loads and validates the config at `path`.
     ///
@@ -242,6 +303,16 @@ impl GatewayConfig {
         }
         check_jwks_url("google_jwks_url", &identity.google_jwks_url)?;
         check_jwks_url("iap_jwks_url", &identity.iap_jwks_url)?;
+
+        if self.profile == Profile::S01 {
+            let stream = &self.corporate_actions;
+            if let Err(error) = stream.endpoint() {
+                return invalid(&format!("corporate_actions.stream_url: {error}"));
+            }
+            if stream.idle_timeout_secs == 0 {
+                return invalid("corporate_actions.idle_timeout_secs must be above 0");
+            }
+        }
         Ok(())
     }
 
@@ -282,6 +353,7 @@ mod tests {
     fn sample(extra: &str) -> String {
         format!(
             r#"
+profile = "t0"
 environment = "staging"
 listen = "127.0.0.1:0"
 expected_account_number = "T0-0001"
@@ -430,5 +502,29 @@ mint_recipients = ["0x2222222222222222222222222222222222222222"]
             GatewayConfig::parse(&with("http://127.0.0.1:8080/certs")).unwrap();
             GatewayConfig::parse(&with("https://keys.example.com/certs")).unwrap();
         }
+    }
+
+    /// `--validate-config` refuses a stream config the relay could not use.
+    #[test]
+    fn an_s01_stream_config_the_relay_cannot_use_is_refused() {
+        let s01 = |corporate_actions: &str| {
+            format!(
+                "{}\n[corporate_actions]\n{corporate_actions}\n",
+                sample("").replace("profile = \"t0\"", "profile = \"s01\"")
+            )
+        };
+
+        for section in [
+            "stream_url = \"not a url\"",
+            "stream_url = \"http://stream.example.com/v2/events\"",
+            "idle_timeout_secs = 0",
+        ] {
+            let error = GatewayConfig::parse(&s01(section)).unwrap_err();
+            assert!(
+                matches!(&error, ConfigError::Invalid(message) if message.contains("corporate_actions")),
+                "{section}: {error}"
+            );
+        }
+        GatewayConfig::parse(&s01("")).unwrap();
     }
 }

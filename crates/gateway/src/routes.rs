@@ -1,5 +1,5 @@
 //! The router: one prefix per tier, each operation mounted only on the tiers
-//! the capability matrix allows, behind that tier's identity check.
+//! the profile's capability matrix allows, behind that tier's identity check.
 //! The check runs inside the operation's route, so it answers and audits a
 //! refusal as that operation.
 
@@ -77,7 +77,7 @@ pub fn app(state: AppState, verifiers: &Verifiers) -> Router {
     for tier in Tier::ALL {
         let guard = Guard::new(verifiers.for_tier(tier), state.clone());
         for operation in Operation::ALL {
-            if !operation.allows(tier) {
+            if !operation.allows(state.config.profile, tier) {
                 continue;
             }
             let Some(handler) = handlers::route(operation) else {

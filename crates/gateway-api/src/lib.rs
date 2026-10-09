@@ -1,4 +1,5 @@
-//! Wire contract of the account bound Alpaca gateway (`t0-alpaca`).
+//! Wire contract of the account bound Alpaca gateway (`t0-alpaca`,
+//! `s01-alpaca`).
 //!
 //! The gateway runs `st0x-alpaca` methods on behalf of bots and operators so
 //! that only the gateway holds Alpaca credentials. This crate is the contract
@@ -14,7 +15,7 @@ pub mod failure;
 pub mod ops;
 pub mod record;
 
-pub use access::{DEPLOYMENT, Tier};
+pub use access::{Profile, Tier};
 pub use failure::{ErrorBody, ErrorCode, Outcome, RejectionReason};
 pub use ops::{Method, Operation};
 pub use record::{AUDIT_TARGET, AuditEvent, AuditPhase};

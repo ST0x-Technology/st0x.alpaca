@@ -19,7 +19,8 @@ pub const fn cost(operation: Operation) -> u32 {
         | Operation::WalletTransfer
         | Operation::WalletFindDeposit
         | Operation::TokenizationRequest
-        | Operation::TokenizationFindRedemption => 0,
+        | Operation::TokenizationFindRedemption
+        | Operation::IssuerRequest => 0,
         _ => 1,
     }
 }

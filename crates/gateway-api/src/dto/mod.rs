@@ -5,6 +5,7 @@
 //! additive: clients ignore fields they do not know.
 
 pub mod account;
+pub mod issuer;
 pub mod market;
 pub mod orders;
 pub mod tokenization;
@@ -22,6 +23,9 @@ pub const NETWORK_MAX: usize = 32;
 
 /// Longest journal counterparty name a request may carry.
 pub const COUNTERPARTY_MAX: usize = 64;
+
+/// Longest tokenization or issuer request id a request may carry.
+pub const REQUEST_ID_MAX: usize = 128;
 
 /// Path parameter of every per symbol route.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -45,6 +49,14 @@ pub fn symbol<'de, D>(deserializer: D) -> Result<Symbol, D::Error>
 where
     D: Deserializer<'de>,
 {
+    Symbol::new(safe_symbol(deserializer)?).map_err(serde::de::Error::custom)
+}
+
+/// Reads a symbol by the [`symbol`] rule, keeping its exact text.
+fn safe_symbol<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
     let raw = bounded("symbol", SYMBOL_MAX, deserializer)?;
     if !is_safe_symbol(&raw) {
         return Err(serde::de::Error::custom(format_args!(
@@ -52,7 +64,7 @@ where
              parts"
         )));
     }
-    Symbol::new(raw).map_err(serde::de::Error::custom)
+    Ok(raw)
 }
 
 fn is_safe_symbol(raw: &str) -> bool {

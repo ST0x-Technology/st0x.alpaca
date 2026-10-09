@@ -67,7 +67,7 @@ async fn startup_fails_closed_on_an_inactive_or_another_account_or_an_unreachabl
             then.status(status).json_body(answer);
         });
 
-        let config = GatewayConfig::parse(&config_text(&alpaca, "", "")).unwrap();
+        let config = GatewayConfig::parse(&config_text(&alpaca, "t0", "", "")).unwrap();
         let error = AppState::connect(config, Arc::new(MemorySink::default()), "test".into())
             .await
             .err()

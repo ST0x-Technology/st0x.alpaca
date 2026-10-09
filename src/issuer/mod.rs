@@ -14,8 +14,27 @@ use uuid::Uuid;
 
 use st0x_finance::{EmptySymbolError, FractionalShares, Symbol, Usd};
 
-use crate::core::{AlpacaClient, AlpacaError, Network, TokenizationRequestId};
+use crate::core::{AlpacaClient, AlpacaError, IssuerCallError, Network, TokenizationRequestId};
 use crate::rate_limit::retry_after_from_response_headers;
+use crate::request_id;
+
+const REDEEM_IDEMPOTENCY_NAMESPACE: Uuid = uuid::uuid!("91943ff3-f69c-5dbe-a3e3-7ce22083bac6");
+const REDEEM_IDEMPOTENCY_KEY_LEN: usize = uuid::fmt::Hyphenated::LENGTH;
+
+/// A stable UUID key scoped to Alpaca issuer redeems. The body keeps the
+/// original issuer request id; only the retry key is bounded to 36 ASCII
+/// characters.
+fn redeem_idempotency_key<'a>(
+    issuer_request_id: &IssuerRequestId,
+    encoded: &'a mut [u8; REDEEM_IDEMPOTENCY_KEY_LEN],
+) -> &'a str {
+    Uuid::new_v5(
+        &REDEEM_IDEMPOTENCY_NAMESPACE,
+        issuer_request_id.0.as_bytes(),
+    )
+    .as_hyphenated()
+    .encode_lower(encoded)
+}
 
 pub mod itn;
 
@@ -103,7 +122,7 @@ pub struct RedeemRequest {
 }
 
 /// Response payload from Alpaca's redeem endpoint.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RedeemResponse {
     pub tokenization_request_id: TokenizationRequestId,
     pub issuer_request_id: IssuerRequestId,
@@ -147,7 +166,7 @@ pub enum RedeemRequestStatus {
 /// `"0.5"`); a JSON number is accepted too. Parsed into a Rain Float so
 /// consumers can use it in exact arithmetic; the lexical scale is not
 /// preserved because the value is never sent back to Alpaca.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Fees(pub Usd);
 
@@ -156,7 +175,7 @@ pub struct Fees(pub Usd);
 /// The endpoint returns a single object. This enum deserializes both Mint
 /// and Redeem variants via `#[serde(tag = "type")]`, with each variant
 /// carrying the appropriate `issuer_request_id` type.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum TokenizationRequest {
     Mint {},
@@ -267,9 +286,17 @@ impl Serialize for RedeemQty {
     }
 }
 
-#[async_trait]
-impl IssuerApi for AlpacaClient {
-    async fn send_mint_callback(&self, request: MintCallbackRequest) -> Result<(), AlpacaError> {
+impl AlpacaClient {
+    /// [`IssuerApi::send_mint_callback`], reporting whether the callback may
+    /// have reached Alpaca and the status of the last answer Alpaca gave.
+    ///
+    /// # Errors
+    ///
+    /// The [`IssuerApi::send_mint_callback`] error in an [`IssuerCallError`].
+    pub async fn send_mint_callback_reporting(
+        &self,
+        request: MintCallbackRequest,
+    ) -> Result<(), IssuerCallError> {
         let path = [
             "v1",
             "accounts",
@@ -279,24 +306,25 @@ impl IssuerApi for AlpacaClient {
             "mint",
         ];
 
-        self.with_retry(|| async {
-            let response = self.post(&path).await?.json(&request).send().await?;
+        self.with_retry_reporting(|| async {
+            let response = request_id::send(self.post(&path).await?.json(&request)).await?;
 
             let status = response.status();
+            request_id::record(status, response.headers());
             let retry_after = retry_after_from_response_headers(response.headers());
 
             match status {
                 StatusCode::OK => Ok(()),
                 StatusCode::TOO_MANY_REQUESTS => {
-                    let body = response.text().await?;
+                    let body = response.text().await.unwrap_or_default();
                     Err(AlpacaError::RateLimited { body, retry_after })
                 }
                 StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
-                    let body = response.text().await?;
+                    let body = response.text().await.unwrap_or_default();
                     Err(AlpacaError::Auth(body))
                 }
                 status => {
-                    let body = response.text().await?;
+                    let body = response.text().await.unwrap_or_default();
                     Err(AlpacaError::Api {
                         status_code: status.as_u16(),
                         body,
@@ -305,18 +333,35 @@ impl IssuerApi for AlpacaClient {
             }
         })
         .await
+        // Alpaca documents a 400 here as an internal failure while it
+        // processes the confirmation, not as a rejection.
+        .map_err(|failure| failure.written_on(400))
     }
 
-    async fn call_redeem_endpoint(
+    /// [`IssuerApi::call_redeem_endpoint`], reporting whether the redeem call
+    /// may have reached Alpaca and the status of the last answer Alpaca gave.
+    ///
+    /// # Errors
+    ///
+    /// The [`IssuerApi::call_redeem_endpoint`] error in an
+    /// [`IssuerCallError`].
+    pub async fn call_redeem_endpoint_reporting(
         &self,
         request: RedeemRequest,
-    ) -> Result<RedeemResponse, AlpacaError> {
+    ) -> Result<RedeemResponse, IssuerCallError> {
         if !itn::accepts_network_wire_string(request.network.as_str()) {
-            return Err(AlpacaError::UnsupportedTokenizationNetwork {
-                network: request.network,
-                reference: itn::REDEEM_CALLBACK_OPENAPI_REFERENCE,
+            return Err(IssuerCallError {
+                written: false,
+                alpaca_status: None,
+                error: AlpacaError::UnsupportedTokenizationNetwork {
+                    network: request.network,
+                    reference: itn::REDEEM_CALLBACK_OPENAPI_REFERENCE,
+                },
             });
         }
+
+        let mut encoded_key = [0; REDEEM_IDEMPOTENCY_KEY_LEN];
+        let idempotency_key = redeem_idempotency_key(&request.issuer_request_id, &mut encoded_key);
 
         let path = [
             "v1",
@@ -327,10 +372,18 @@ impl IssuerApi for AlpacaClient {
             "redeem",
         ];
 
-        self.with_retry(|| async {
-            let response = self.post(&path).await?.json(&request).send().await?;
+        self.with_retry_reporting(|| async {
+            // Every attempt carries the same bounded key derived from the
+            // issuer request id, so Alpaca replays the first answer.
+            let post = self
+                .post(&path)
+                .await?
+                .header("Idempotency-Key", idempotency_key)
+                .json(&request);
+            let response = request_id::send(post).await?;
 
             let status = response.status();
+            request_id::record(status, response.headers());
             let retry_after = retry_after_from_response_headers(response.headers());
 
             match status {
@@ -340,15 +393,15 @@ impl IssuerApi for AlpacaClient {
                         .map_err(|source| AlpacaError::Parse { body, source })
                 }
                 StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
-                    let body = response.text().await?;
+                    let body = response.text().await.unwrap_or_default();
                     Err(AlpacaError::Auth(body))
                 }
                 StatusCode::TOO_MANY_REQUESTS => {
-                    let body = response.text().await?;
+                    let body = response.text().await.unwrap_or_default();
                     Err(AlpacaError::RateLimited { body, retry_after })
                 }
                 status => {
-                    let body = response.text().await?;
+                    let body = response.text().await.unwrap_or_default();
                     Err(AlpacaError::Api {
                         status_code: status.as_u16(),
                         body,
@@ -357,12 +410,23 @@ impl IssuerApi for AlpacaClient {
             }
         })
         .await
+        // Alpaca answers 422 to an `issuer_request_id` it has already seen,
+        // so a resend after a lost answer gets 422 for an applied redeem.
+        .map_err(|failure| failure.written_on(422))
     }
 
-    async fn poll_request_status(
+    /// [`IssuerApi::poll_request_status`], reporting the status of the last
+    /// answer Alpaca gave. A read writes nothing, so its
+    /// [`IssuerCallError::written`] is always `false`.
+    ///
+    /// # Errors
+    ///
+    /// The [`IssuerApi::poll_request_status`] error in an
+    /// [`IssuerCallError`].
+    pub async fn poll_request_status_reporting(
         &self,
         tokenization_request_id: &TokenizationRequestId,
-    ) -> Result<TokenizationRequest, AlpacaError> {
+    ) -> Result<TokenizationRequest, IssuerCallError> {
         let path = [
             "v1",
             "accounts",
@@ -372,10 +436,11 @@ impl IssuerApi for AlpacaClient {
             tokenization_request_id.0.as_str(),
         ];
 
-        self.with_retry(|| async {
-            let response = self.get(&path).await?.send().await?;
+        self.with_retry_reporting(|| async {
+            let response = request_id::send(self.get(&path).await?).await?;
 
             let status = response.status();
+            request_id::record(status, response.headers());
             let retry_after = retry_after_from_response_headers(response.headers());
 
             match status {
@@ -398,22 +463,22 @@ impl IssuerApi for AlpacaClient {
                     Ok(request)
                 }
                 StatusCode::NOT_FOUND => {
-                    let body = response.text().await?;
+                    let body = response.text().await.unwrap_or_default();
                     Err(AlpacaError::RequestNotFound {
                         id: tokenization_request_id.clone(),
                         body,
                     })
                 }
                 StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
-                    let body = response.text().await?;
+                    let body = response.text().await.unwrap_or_default();
                     Err(AlpacaError::Auth(body))
                 }
                 StatusCode::TOO_MANY_REQUESTS => {
-                    let body = response.text().await?;
+                    let body = response.text().await.unwrap_or_default();
                     Err(AlpacaError::RateLimited { body, retry_after })
                 }
                 status => {
-                    let body = response.text().await?;
+                    let body = response.text().await.unwrap_or_default();
                     Err(AlpacaError::Api {
                         status_code: status.as_u16(),
                         body,
@@ -422,6 +487,37 @@ impl IssuerApi for AlpacaClient {
             }
         })
         .await
+        .map_err(|failure| IssuerCallError {
+            written: false,
+            ..failure
+        })
+    }
+}
+
+#[async_trait]
+impl IssuerApi for AlpacaClient {
+    async fn send_mint_callback(&self, request: MintCallbackRequest) -> Result<(), AlpacaError> {
+        self.send_mint_callback_reporting(request)
+            .await
+            .map_err(|failure| failure.error)
+    }
+
+    async fn call_redeem_endpoint(
+        &self,
+        request: RedeemRequest,
+    ) -> Result<RedeemResponse, AlpacaError> {
+        self.call_redeem_endpoint_reporting(request)
+            .await
+            .map_err(|failure| failure.error)
+    }
+
+    async fn poll_request_status(
+        &self,
+        tokenization_request_id: &TokenizationRequestId,
+    ) -> Result<TokenizationRequest, AlpacaError> {
+        self.poll_request_status_reporting(tokenization_request_id)
+            .await
+            .map_err(|failure| failure.error)
     }
 }
 
@@ -856,11 +952,14 @@ mod tests {
 
     use super::itn::{REDEEM_CALLBACK_OPENAPI_REFERENCE, accepts_network_wire_string};
     use super::{
-        ClientId, Fees, IssuerApi, IssuerRequestId, MintCallbackRequest, RedeemQty, RedeemRequest,
-        RedeemRequestStatus, RedeemResponse, TokenSymbol, TokenizationRequest,
+        ClientId, Fees, IssuerApi, IssuerRequestId, MintCallbackRequest, Qty, RedeemQty,
+        RedeemRequest, RedeemRequestStatus, RedeemResponse, TokenSymbol, TokenizationRequest,
         TokenizationRequestType, UnderlyingSymbol,
     };
     use crate::core::{AlpacaClient, AlpacaError, Network, TokenizationRequestId};
+    use crate::request_id::{
+        ALPACA_REQUEST_ID_HEADER, GateClosed, SendGate, Traffic, collect, gated,
+    };
 
     fn underlying_symbol(value: &str) -> UnderlyingSymbol {
         UnderlyingSymbol::new(value)
@@ -2199,13 +2298,16 @@ mod tests {
         success.assert_calls(1);
     }
 
+    /// Every attempt derives the same bounded `Idempotency-Key`, so Alpaca
+    /// replays the first answer to a resend.
     #[tokio::test]
     async fn test_call_redeem_endpoint_retries_transient_server_errors() {
         let server = MockServer::start();
 
         let mock = server.mock(|when, then| {
             when.method(POST)
-                .path("/v1/accounts/test-account/tokenization/callback/redeem");
+                .path("/v1/accounts/test-account/tokenization/callback/redeem")
+                .header("Idempotency-Key", "8e38d4e9-5eb6-5559-886c-4598f6f4544e");
             then.status(500).body("Internal Server Error");
         });
 
@@ -2222,6 +2324,299 @@ mod tests {
             })
         ));
         mock.assert_calls(3);
+    }
+
+    #[tokio::test]
+    async fn redeem_idempotency_keys_are_bounded_ascii_for_any_request_id() {
+        let server = MockServer::start();
+        let client =
+            make_client(&server, "test-account", "test-key", "test-secret").with_max_retries(5);
+
+        for (issuer_request_id, expected_key) in [
+            ("redemption 42", "a48752c4-66f4-58c5-ae15-4cc4d282b320"),
+            ("redemption-é", "08abad25-f017-51ab-8e37-b541979ece87"),
+            (
+                "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd",
+                "8e38d4e9-5eb6-5559-886c-4598f6f4544e",
+            ),
+        ] {
+            assert_eq!(expected_key.len(), 36);
+            assert!(expected_key.bytes().all(|byte| byte.is_ascii_graphic()));
+            let mut sent = server.mock(|when, then| {
+                when.method(POST)
+                    .path("/v1/accounts/test-account/tokenization/callback/redeem")
+                    .header("Idempotency-Key", expected_key);
+                then.status(400).body("malformed request");
+            });
+            let mut request = create_redeem_request();
+            request.issuer_request_id = IssuerRequestId(issuer_request_id.to_string());
+
+            let failure = client
+                .call_redeem_endpoint_reporting(request)
+                .await
+                .unwrap_err();
+
+            assert!(!failure.written);
+            assert_eq!(failure.alpaca_status, Some(400));
+            assert!(matches!(
+                failure.error,
+                AlpacaError::Api {
+                    status_code: 400,
+                    ..
+                }
+            ));
+            sent.assert_calls(1);
+            sent.delete();
+        }
+    }
+
+    /// The 500 may have applied the redeem, so the later definite 400 does
+    /// not make the call unwritten. Both answers reach the audit.
+    #[tokio::test]
+    async fn a_redeem_answered_500_then_400_is_written() {
+        let server = MockServer::start_async().await;
+        let mut failed = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/accounts/test-account/tokenization/callback/redeem");
+            then.status(500).header(ALPACA_REQUEST_ID_HEADER, "first");
+        });
+        let client = make_client(&server, "test-account", "test-key", "test-secret");
+        let call = tokio::spawn(collect(async move {
+            client
+                .call_redeem_endpoint_reporting(create_redeem_request())
+                .await
+        }));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while failed.calls() == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        failed.delete();
+        let rejected = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/accounts/test-account/tokenization/callback/redeem");
+            then.status(400).header(ALPACA_REQUEST_ID_HEADER, "second");
+        });
+
+        let (result, traffic) = tokio::time::timeout(Duration::from_secs(5), call)
+            .await
+            .unwrap()
+            .unwrap();
+        let failure = result.unwrap_err();
+
+        assert!(failure.written);
+        assert_eq!(failure.alpaca_status, Some(400));
+        assert!(
+            matches!(
+                failure.error,
+                AlpacaError::Api {
+                    status_code: 400,
+                    ..
+                }
+            ),
+            "{:?}",
+            failure.error
+        );
+        assert_eq!(
+            traffic,
+            Traffic {
+                request_ids: vec!["first".to_string(), "second".to_string()],
+                last_status: Some(400),
+            }
+        );
+        rejected.assert_calls(1);
+    }
+
+    /// A lone 4xx is a rejection, except the status each endpoint also gives
+    /// once the request may have been applied: a mint callback 400 (an
+    /// internal failure at Alpaca) and a redeem 422 (a reused
+    /// `issuer_request_id`).
+    #[tokio::test]
+    async fn a_lone_4xx_is_not_written_unless_it_may_follow_an_applied_request() {
+        for (endpoint, status, written) in [
+            ("mint", 400, true),
+            ("mint", 422, false),
+            ("redeem", 400, false),
+            ("redeem", 422, true),
+        ] {
+            let server = MockServer::start_async().await;
+            let answered = server.mock(|when, then| {
+                when.method(POST).path(format!(
+                    "/v1/accounts/test-account/tokenization/callback/{endpoint}"
+                ));
+                then.status(status);
+            });
+            let client = make_client(&server, "test-account", "test-key", "test-secret");
+
+            let failure = if endpoint == "mint" {
+                client
+                    .send_mint_callback_reporting(create_test_request())
+                    .await
+                    .unwrap_err()
+            } else {
+                client
+                    .call_redeem_endpoint_reporting(create_redeem_request())
+                    .await
+                    .unwrap_err()
+            };
+
+            assert_eq!(failure.written, written, "{endpoint} {status}");
+            assert_eq!(failure.alpaca_status, Some(status));
+            answered.assert_calls(1);
+        }
+    }
+
+    /// A definite rejection whose body is cut short is still that rejection,
+    /// as the credential mint reads its error bodies.
+    #[tokio::test]
+    async fn a_redeem_400_whose_body_is_cut_short_is_not_written() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = socket.read(&mut chunk).await.unwrap();
+                assert_ne!(read, 0, "the client closed before sending its request");
+                request.extend_from_slice(&chunk[..read]);
+            }
+            socket
+                .write_all(b"HTTP/1.1 400 Bad Request\r\ncontent-length: 100\r\n\r\n{\"")
+                .await
+                .unwrap();
+        });
+        let client = AlpacaClient::new(
+            &url,
+            "test-account".to_string(),
+            "test-key".to_string(),
+            "test-secret".to_string(),
+            Duration::from_secs(10),
+            Duration::from_secs(30),
+        )
+        .unwrap();
+
+        let failure = client
+            .call_redeem_endpoint_reporting(create_redeem_request())
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                failure.error,
+                AlpacaError::Api {
+                    status_code: 400,
+                    ..
+                }
+            ),
+            "{:?}",
+            failure.error
+        );
+        assert!(!failure.written);
+        assert_eq!(failure.alpaca_status, Some(400));
+    }
+
+    /// `Auth` covers 401 and 403 alike; the status is the one Alpaca sent.
+    #[tokio::test]
+    async fn a_request_read_answered_401_reports_401_and_is_not_written() {
+        let server = MockServer::start_async().await;
+        let refused = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/accounts/test-account/tokenization/requests/request-1");
+            then.status(401);
+        });
+        let client = make_client(&server, "test-account", "test-key", "test-secret");
+
+        let failure = client
+            .poll_request_status_reporting(&TokenizationRequestId("request-1".to_string()))
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(failure.error, AlpacaError::Auth(_)),
+            "{:?}",
+            failure.error
+        );
+        assert!(!failure.written);
+        assert_eq!(failure.alpaca_status, Some(401));
+        refused.assert_calls(1);
+    }
+
+    /// A read Alpaca answered 500 on every attempt wrote nothing.
+    #[tokio::test]
+    async fn a_request_read_answered_500_is_not_written() {
+        let server = MockServer::start_async().await;
+        let failed = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/accounts/test-account/tokenization/requests/request-1");
+            then.status(500);
+        });
+        let client =
+            make_client(&server, "test-account", "test-key", "test-secret").with_max_retries(1);
+
+        let failure = client
+            .poll_request_status_reporting(&TokenizationRequestId("request-1".to_string()))
+            .await
+            .unwrap_err();
+
+        assert!(!failure.written);
+        assert_eq!(failure.alpaca_status, Some(500));
+        failed.assert_calls(2);
+    }
+
+    #[tokio::test]
+    async fn a_mint_callback_the_send_gate_held_back_is_not_written() {
+        let server = MockServer::start_async().await;
+        let callback = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/accounts/test-account/tokenization/callback/mint");
+            then.status(200);
+        });
+        let client = make_client(&server, "test-account", "test-key", "test-secret");
+
+        let failure = gated(
+            SendGate::new(|| false),
+            client.send_mint_callback_reporting(create_test_request()),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(!failure.written);
+        assert!(
+            matches!(failure.error, AlpacaError::NotSent(GateClosed)),
+            "{:?}",
+            failure.error
+        );
+        callback.assert_calls(0);
+    }
+
+    /// The gateway answers with these types and its client reads them back
+    /// through the same `Deserialize`.
+    #[test]
+    fn issuer_answers_read_back_what_they_write() {
+        let request: TokenizationRequest =
+            serde_json::from_value(redeem_tokenization_request_json(Some(json!("")))).unwrap();
+        let wire = serde_json::to_value(&request).unwrap();
+        let read_back: TokenizationRequest = serde_json::from_value(wire.clone()).unwrap();
+        let TokenizationRequest::Redeem {
+            quantity, tx_hash, ..
+        } = &read_back
+        else {
+            panic!("expected a redeem, got {read_back:?}");
+        };
+        assert_eq!(*tx_hash, None);
+        assert_eq!(*quantity, Qty("50.00".parse().unwrap()));
+        assert_eq!(serde_json::to_value(&read_back).unwrap(), wire);
+
+        let response = redeem_response_with_fees(Some(json!("0.50")));
+        let wire = serde_json::to_value(&response).unwrap();
+        let read_back: RedeemResponse = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(read_back.fees, response.fees);
+        assert_eq!(serde_json::to_value(&read_back).unwrap(), wire);
     }
 
     #[tokio::test]
