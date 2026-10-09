@@ -1,9 +1,8 @@
 //! Position fetching for Alpaca Broker API.
 
 use rain_math_float::Float;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tracing::{debug, error, trace, warn};
-use urlencoding::encode;
 
 use st0x_finance::{HasZero, NotPositive, Usdc};
 use st0x_float_macro::float;
@@ -17,15 +16,22 @@ use crate::broker::{
 };
 
 /// An equity position with symbol, quantity, and optional market value.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct EquityPosition {
     pub symbol: Symbol,
     pub quantity: FractionalShares,
+    #[serde(
+        default,
+        serialize_with = "st0x_float_serde::serialize_option_float",
+        deserialize_with = "deserialize_option_float_from_number_or_string"
+    )]
     pub market_value: Option<Float>,
 }
 
 /// Account state from the broker.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Inventory {
     pub positions: Vec<EquityPosition>,
     /// USDC held at Alpaca after USD/USDC conversion and before withdrawal.
@@ -45,7 +51,8 @@ pub struct Inventory {
 }
 
 /// Account-level USD figures from the broker, all denominated in cents.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AccountFunds {
     pub balance: i64,
     pub buying_power: i64,
@@ -268,7 +275,7 @@ pub(super) async fn fetch_position_mark(
         "{}/v1/trading/accounts/{}/positions/{}",
         client.base_url(),
         client.account_id(),
-        encode(symbol.as_str())
+        urlencoding::encode(symbol.as_str())
     );
 
     debug!(%symbol, "Fetching open broker position mark from {url}");
@@ -1237,7 +1244,7 @@ mod tests {
         let position_mock = server.mock(|when, then| {
             when.method(GET).path(format!(
                 "/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/positions/{}",
-                encode(symbol)
+                urlencoding::encode(symbol)
             ));
             match position {
                 Some(position) => {

@@ -1,7 +1,7 @@
 //! Crypto amounts received from Alpaca API responses.
 
 use rain_math_float::{Float, FloatError};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::fmt::{Debug, Display};
 
 use st0x_finance::{HasZero, Usdc, UsdcConversionError};
@@ -85,6 +85,18 @@ impl<'de> Deserialize<'de> for AlpacaAmount {
             serde::de::Error::custom(format_args!("Invalid Alpaca crypto Float: {error}"))
         })?;
         Self::try_from(amount.inner()).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Writes the raw broker amount as a decimal string, so deserializing it
+/// rebuilds the same amount: the same normalized value and the same raw value
+/// for cash valuation.
+impl Serialize for AlpacaAmount {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.raw.serialize(serializer)
     }
 }
 

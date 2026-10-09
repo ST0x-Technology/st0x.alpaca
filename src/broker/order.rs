@@ -4,14 +4,15 @@ use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 use std::time::Duration;
-use tracing::{debug, trace, warn};
+use tracing::{debug, info, trace, warn};
 use uuid::Uuid;
 
 use st0x_float_macro::float;
 
 use super::client::AlpacaBrokerApiClient;
 use super::{
-    AlpacaBrokerApiError, CryptoOrderFailureReason, DeadlineCancel, MissingOrderField, TimeInForce,
+    AlpacaBrokerApiError, CryptoOrderFailureReason, DeadlineCancel, MissingOrderField,
+    PlacementError, TimeInForce,
 };
 use crate::broker::{
     AlpacaAmount, CancellationOutcome, ClientOrderId, Direction, ExecutorOrderId, FractionalShares,
@@ -19,6 +20,7 @@ use crate::broker::{
     Symbol, Usd, Usdc, deserialize_float_from_number_or_string,
     deserialize_option_float_from_number_or_string, serialize_float_as_string,
 };
+use crate::rate_limit::{next_poll_delay, poll_deadline};
 
 const ALPACA_CRYPTO_MAX_DECIMAL_PLACES: u8 = 6;
 
@@ -36,7 +38,7 @@ pub(crate) enum OrderSide {
 }
 
 /// Order status from Alpaca Broker API
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum BrokerOrderStatus {
     New,
@@ -308,8 +310,8 @@ pub(crate) struct CryptoOrderRequest {
     pub client_order_id: ClientOrderId,
 }
 
-/// Response from a crypto order placement
-#[derive(Debug, Clone, Deserialize)]
+/// A crypto order (the USDC/USD conversion) as Alpaca reports it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CryptoOrderResponse {
     pub id: Uuid,
     pub symbol: String,
@@ -323,6 +325,7 @@ pub struct CryptoOrderResponse {
     /// direction that has no `qty`.
     #[serde(
         default,
+        serialize_with = "st0x_float_serde::serialize_option_float",
         deserialize_with = "deserialize_option_float_from_number_or_string"
     )]
     pub notional: Option<Float>,
@@ -330,6 +333,7 @@ pub struct CryptoOrderResponse {
     #[serde(
         rename = "filled_avg_price",
         default,
+        serialize_with = "st0x_float_serde::serialize_option_float",
         deserialize_with = "deserialize_option_float_from_number_or_string"
     )]
     pub filled_average_price: Option<Float>,
@@ -501,17 +505,20 @@ fn validate_limit_price_precision(limit_price: Positive<Usd>) -> Result<(), Alpa
     Ok(())
 }
 
+/// Places a market order. The error reports whether the order request may
+/// have been written; see [`PlacementError`].
 pub(super) async fn place_market_order(
     client: &AlpacaBrokerApiClient,
     market_order: MarketOrder,
     time_in_force: TimeInForce,
-) -> Result<OrderPlacement<String>, AlpacaBrokerApiError> {
+) -> Result<OrderPlacement<String>, PlacementError> {
     debug!(
         "Placing Alpaca Broker API market order: {} {} shares of {} (time_in_force: {:?})",
         market_order.direction, market_order.shares, market_order.symbol, time_in_force
     );
 
-    let placed_shares = truncate_shares_to_alpaca_precision(market_order.shares)?;
+    let placed_shares = truncate_shares_to_alpaca_precision(market_order.shares)
+        .map_err(PlacementError::unwritten)?;
 
     let side = match market_order.direction {
         Direction::Buy => OrderSide::Buy,
@@ -545,6 +552,8 @@ pub(super) async fn place_market_order(
     // extended-hours limit order (e.g. a regular-hours market retry after a
     // lost extended-hours placement response), and the caller's convergence
     // sweep keys off the recorded `extended_hours` flag.
+    // Every failure past an accepted or duplicate key answer is one where
+    // Alpaca holds an order under this key, so it reports a written attempt.
     let (order_id, shares, extended_hours, limit_price, placed_at) = match client
         .place_order(&request)
         .await
@@ -560,7 +569,8 @@ pub(super) async fn place_market_order(
                 response.created_at,
                 response.submitted_at,
             )
-            .await?,
+            .await
+            .map_err(PlacementError::maybe_written)?,
         ),
         Err(error) if is_duplicate_client_order_id(&error) => {
             warn!(
@@ -568,27 +578,25 @@ pub(super) async fn place_market_order(
                 client_order_id = %market_order.client_order_id,
                 "Broker rejected duplicate client_order_id; reconciling the order it already accepted"
             );
-            let existing = client
-                .get_order_by_client_order_id(&market_order.client_order_id)
-                .await?
-                .ok_or_else(|| AlpacaBrokerApiError::DuplicateOrderNotFound {
-                    client_order_id: market_order.client_order_id.clone(),
-                })?;
+            let existing = find_duplicate_order(client, &market_order.client_order_id)
+                .await
+                .map_err(PlacementError::maybe_written)?;
             (
                 existing.id,
                 existing.quantity,
                 existing.extended_hours.unwrap_or(false),
-                parse_limit_price(existing.limit_price)?,
+                parse_limit_price(existing.limit_price).map_err(PlacementError::maybe_written)?,
                 broker_order_placed_at(
                     client,
                     existing.id,
                     existing.created_at,
                     existing.submitted_at,
                 )
-                .await?,
+                .await
+                .map_err(PlacementError::maybe_written)?,
             )
         }
-        Err(error) => return Err(error),
+        Err(error) => return Err(order_post_failure(error)),
     };
 
     Ok(OrderPlacement {
@@ -600,6 +608,52 @@ pub(super) async fn place_market_order(
         extended_hours,
         limit_price,
     })
+}
+
+/// Reads back the order Alpaca already holds under `client_order_id` after
+/// it answered the order POST with the duplicate key 422.
+async fn find_duplicate_order(
+    client: &AlpacaBrokerApiClient,
+    client_order_id: &ClientOrderId,
+) -> Result<OrderResponse, AlpacaBrokerApiError> {
+    client
+        .get_order_by_client_order_id(client_order_id)
+        .await?
+        .ok_or_else(|| AlpacaBrokerApiError::DuplicateOrderNotFound {
+            client_order_id: client_order_id.clone(),
+        })
+}
+
+/// Reports a failed order POST (other than the duplicate key 422) with
+/// whether the order request may have reached Alpaca, by
+/// [`may_have_reached_alpaca`].
+fn order_post_failure(error: AlpacaBrokerApiError) -> PlacementError {
+    PlacementError {
+        written: may_have_reached_alpaca(&error),
+        error,
+    }
+}
+
+/// Whether a failed order POST may have reached Alpaca and taken effect.
+///
+/// No only when nothing left this process (the request could not be built,
+/// the credential could not be minted, the connection never opened, the
+/// caller's send gate held it back), Alpaca answered with a definite
+/// rejection (a 4xx other than 408), or a gateway answered that the
+/// mutation was not applied. Every other failure may have applied.
+fn may_have_reached_alpaca(error: &AlpacaBrokerApiError) -> bool {
+    match error {
+        AlpacaBrokerApiError::ApiError { status, .. } => {
+            !(status.is_client_error() && *status != StatusCode::REQUEST_TIMEOUT)
+        }
+        AlpacaBrokerApiError::HttpClient(source) => !(source.is_builder() || source.is_connect()),
+        AlpacaBrokerApiError::Gateway(hop) => hop.outcome_unknown,
+        AlpacaBrokerApiError::KmsJwt(_)
+        | AlpacaBrokerApiError::InvalidHeader(_)
+        | AlpacaBrokerApiError::InvalidEndpoint(_)
+        | AlpacaBrokerApiError::NotSent(_) => false,
+        _ => true,
+    }
 }
 
 async fn broker_order_placed_at(
@@ -695,16 +749,16 @@ pub(super) async fn recover_order_by_client_id(
 /// re-uses a `client_order_id` already attached to an active order. This is the
 /// recoverable duplicate-submission case (the original 2xx was lost in flight),
 /// distinct from other 422s such as insufficient buying power or invalid order.
-fn is_duplicate_client_order_id(error: &AlpacaBrokerApiError) -> bool {
+pub(super) fn is_duplicate_client_order_id(error: &AlpacaBrokerApiError) -> bool {
     use AlpacaBrokerApiError::{
         AccountActivitiesPageLimitExceeded, AccountActivitiesPaginationInvariantViolation,
         AccountNotActive, AlpacaAmount, ApiError, AssetNotActive, AssetNotTradable, BelowPrecision,
         CalendarDateMismatch, CalendarIterationInvariantViolation, CalendarLocalTimeUnresolvable,
         ConversionCancelNotSettled, ConversionOrderNotFound, ConversionTimedOut, CryptoOrderFailed,
-        DuplicateOrderNotFound, FilledQuantityMismatch, FloatConversion, FractionalCents,
+        DuplicateOrderNotFound, FilledQuantityMismatch, FloatConversion, FractionalCents, Gateway,
         HttpClient, IncompleteOrder, InvalidAccountActivitiesUrl, InvalidEndpoint, InvalidHeader,
         InvalidLimitPricePrecision, InvalidOrderId, InvalidSymbol, JsonParse, KmsJwt, LatestQuote,
-        LatestTrade, MissingPositionQuantity, NotPositive, NotPositiveLimitPrice,
+        LatestTrade, MissingPositionQuantity, NotPositive, NotPositiveLimitPrice, NotSent,
         PositionSymbolMismatch, UsdBalanceConversion, UsdConversionInsufficientBalance,
         UsdcBelowPrecision, UsdcPrecisionExceeded,
     };
@@ -718,6 +772,8 @@ fn is_duplicate_client_order_id(error: &AlpacaBrokerApiError) -> bool {
         }
         UsdConversionInsufficientBalance { .. }
         | HttpClient(_)
+        | Gateway(_)
+        | NotSent(_)
         | KmsJwt(_)
         | JsonParse(_)
         | AlpacaAmount(_)
@@ -757,10 +813,12 @@ fn is_duplicate_client_order_id(error: &AlpacaBrokerApiError) -> bool {
     }
 }
 
+/// Places a limit order. The error reports whether the order request may have
+/// been written; see [`PlacementError`].
 pub(super) async fn place_limit_order(
     client: &AlpacaBrokerApiClient,
     limit_order: AlpacaLimitOrder,
-) -> Result<OrderPlacement<String>, AlpacaBrokerApiError> {
+) -> Result<OrderPlacement<String>, PlacementError> {
     debug!(
         direction = ?limit_order.direction,
         shares = %limit_order.shares,
@@ -770,7 +828,8 @@ pub(super) async fn place_limit_order(
         "Placing Alpaca Broker API limit order"
     );
 
-    let placed_shares = truncate_shares_to_alpaca_precision(limit_order.shares)?;
+    let placed_shares = truncate_shares_to_alpaca_precision(limit_order.shares)
+        .map_err(PlacementError::unwritten)?;
 
     let side = match limit_order.direction {
         Direction::Buy => OrderSide::Buy,
@@ -795,7 +854,7 @@ pub(super) async fn place_limit_order(
     // order during thin extended-hours liquidity.
     // Fresh placements report the REQUEST's terms; adoptions report the
     // ADOPTED order's terms -- see the matching comment in
-    // `place_market_order`.
+    // `place_market_order`, as is the written attempt reporting.
     let (order_id, shares, extended_hours, limit_price, placed_at) = match client
         .place_limit_order(&request)
         .await
@@ -811,7 +870,8 @@ pub(super) async fn place_limit_order(
                 response.created_at,
                 response.submitted_at,
             )
-            .await?,
+            .await
+            .map_err(PlacementError::maybe_written)?,
         ),
         Err(error) if is_duplicate_client_order_id(&error) => {
             warn!(
@@ -819,12 +879,9 @@ pub(super) async fn place_limit_order(
                 client_order_id = %limit_order.client_order_id,
                 "Broker rejected duplicate client_order_id; reconciling the order it already accepted"
             );
-            let existing = client
-                .get_order_by_client_order_id(&limit_order.client_order_id)
-                .await?
-                .ok_or_else(|| AlpacaBrokerApiError::DuplicateOrderNotFound {
-                    client_order_id: limit_order.client_order_id.clone(),
-                })?;
+            let existing = find_duplicate_order(client, &limit_order.client_order_id)
+                .await
+                .map_err(PlacementError::maybe_written)?;
             (
                 existing.id,
                 existing.quantity,
@@ -836,7 +893,8 @@ pub(super) async fn place_limit_order(
                 existing
                     .extended_hours
                     .unwrap_or(limit_order.extended_hours),
-                parse_limit_price(existing.limit_price)?
+                parse_limit_price(existing.limit_price)
+                    .map_err(PlacementError::maybe_written)?
                     .or(Some(*limit_order.limit_price.as_price())),
                 broker_order_placed_at(
                     client,
@@ -844,10 +902,11 @@ pub(super) async fn place_limit_order(
                     existing.created_at,
                     existing.submitted_at,
                 )
-                .await?,
+                .await
+                .map_err(PlacementError::maybe_written)?,
             )
         }
-        Err(error) => return Err(error),
+        Err(error) => return Err(order_post_failure(error)),
     };
 
     Ok(OrderPlacement {
@@ -1171,6 +1230,69 @@ fn classify_conversion_placement_error(
     }
 }
 
+/// The conversion order calls the conversion poll makes, so the same loop
+/// (deadline, cancel, settle window, partial fill rules) runs over a direct
+/// Alpaca client and over a gateway client.
+pub trait ConversionOrders {
+    /// Places a USDC/USD conversion order and answers once Alpaca accepts it.
+    fn submit_conversion(
+        &self,
+        conversion: ConversionOrder,
+        client_order_id: &ClientOrderId,
+    ) -> impl Future<Output = Result<CryptoOrderResponse, AlpacaBrokerApiError>> + Send;
+
+    /// Reads one conversion order by its Alpaca order id.
+    fn get_conversion_order(
+        &self,
+        order_id: Uuid,
+    ) -> impl Future<Output = Result<CryptoOrderResponse, AlpacaBrokerApiError>> + Send;
+
+    /// Looks up a conversion order by its `client_order_id`; `None` when
+    /// Alpaca answers 404.
+    fn find_conversion_order(
+        &self,
+        client_order_id: &ClientOrderId,
+    ) -> impl Future<Output = Result<Option<CryptoOrderResponse>, AlpacaBrokerApiError>> + Send;
+
+    /// Requests cancellation of the order with Alpaca order id `order_id`.
+    fn cancel_order(
+        &self,
+        order_id: &str,
+    ) -> impl Future<Output = Result<CancellationOutcome, AlpacaBrokerApiError>> + Send;
+}
+
+impl ConversionOrders for AlpacaBrokerApiClient {
+    async fn submit_conversion(
+        &self,
+        conversion: ConversionOrder,
+        client_order_id: &ClientOrderId,
+    ) -> Result<CryptoOrderResponse, AlpacaBrokerApiError> {
+        convert_usdc_usd(self, conversion, client_order_id).await
+    }
+
+    async fn get_conversion_order(
+        &self,
+        order_id: Uuid,
+    ) -> Result<CryptoOrderResponse, AlpacaBrokerApiError> {
+        self.get_crypto_order(order_id).await
+    }
+
+    async fn find_conversion_order(
+        &self,
+        client_order_id: &ClientOrderId,
+    ) -> Result<Option<CryptoOrderResponse>, AlpacaBrokerApiError> {
+        self.get_crypto_order_by_client_order_id(client_order_id)
+            .await
+    }
+
+    async fn cancel_order(
+        &self,
+        order_id: &str,
+    ) -> Result<CancellationOutcome, AlpacaBrokerApiError> {
+        Self::cancel_order(self, Uuid::parse_str(order_id)?).await
+    }
+}
+
 fn is_insufficient_usd_balance(error: &AlpacaBrokerApiError) -> bool {
     matches!(
         error,
@@ -1194,8 +1316,8 @@ fn is_insufficient_usd_balance(error: &AlpacaBrokerApiError) -> bool {
 /// the resolution propagates while the outer await is still active.
 const CONVERSION_ORDER_DEADLINE: Duration = Duration::from_secs(300);
 
-/// After a deadline cancel, how long to wait for the broker to report the
-/// cancelled order's terminal state before giving up.
+/// From the deadline cancel's answer, how long to wait for the broker to
+/// report the cancelled order's terminal state before giving up.
 ///
 /// A chosen bound, not a documented one: Alpaca publishes no cancel
 /// acknowledgement or settlement time for crypto orders, so this value is not
@@ -1221,12 +1343,83 @@ pub(crate) struct ConversionPollDeadlines {
     interval: Duration,
 }
 
+/// How long a conversion poll waits between order reads: the interval
+/// [`AlpacaBrokerApi`](super::AlpacaBrokerApi) passes to
+/// [`convert_usdc_usd_with`] and [`poll_conversion_to_terminal_with`], for a
+/// gateway client to pass the same.
+pub const CONVERSION_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
 impl ConversionPollDeadlines {
     pub(super) const PRODUCTION: Self = Self {
         order: CONVERSION_ORDER_DEADLINE,
         cancel_settle: CANCEL_SETTLE_DEADLINE,
-        interval: Duration::from_millis(500),
+        interval: CONVERSION_POLL_INTERVAL,
     };
+
+    /// The production deadlines, reading the order every `interval`.
+    const fn polling_every(interval: Duration) -> Self {
+        Self {
+            interval,
+            ..Self::PRODUCTION
+        }
+    }
+}
+
+/// Places a USDC/USD conversion and polls it until it fills, reading the
+/// order every `poll_interval`: the loop
+/// [`crate::broker::AlpacaBrokerApi::convert_usdc_usd`] runs, over any
+/// [`ConversionOrders`]. Past a 300 s deadline the remainder is cancelled,
+/// as `poll_crypto_order_until_filled` describes.
+///
+/// # Errors
+///
+/// The placement error, a read error `permanence()` does not call
+/// transient, a crypto order failure, or a conversion deadline error.
+pub async fn convert_usdc_usd_with(
+    orders: &impl ConversionOrders,
+    conversion: ConversionOrder,
+    client_order_id: &ClientOrderId,
+    poll_interval: Duration,
+) -> Result<CryptoOrderResponse, AlpacaBrokerApiError> {
+    let order = orders
+        .submit_conversion(conversion, client_order_id)
+        .await?;
+
+    info!(
+        order_id = %order.id,
+        ?conversion,
+        "USDC/USD conversion order placed, polling for completion..."
+    );
+
+    poll_crypto_order_until_filled(
+        orders,
+        order.id,
+        ConversionPollDeadlines::polling_every(poll_interval),
+    )
+    .await
+}
+
+/// Polls a placed conversion order until any terminal state, reading the
+/// order every `poll_interval`, and returns the final snapshot for the caller
+/// to classify: the loop
+/// [`crate::broker::AlpacaBrokerApi::poll_conversion_to_terminal`] runs, over
+/// any [`ConversionOrders`].
+///
+/// # Errors
+///
+/// A read error `permanence()` does not call transient, or a conversion
+/// deadline error.
+pub async fn poll_conversion_to_terminal_with(
+    orders: &impl ConversionOrders,
+    order_id: Uuid,
+    poll_interval: Duration,
+) -> Result<CryptoOrderResponse, AlpacaBrokerApiError> {
+    poll_crypto_order_to_terminal(
+        orders,
+        order_id,
+        ConversionPollDeadlines::polling_every(poll_interval),
+    )
+    .await
 }
 
 /// A conversion order that reached a state it can no longer leave, and
@@ -1252,13 +1445,13 @@ struct SettledConversionOrder {
 /// what keeps a stalled conversion from holding the single-concurrency
 /// transfer worker and the in-flight USDC rebalance guard indefinitely.
 pub(crate) async fn poll_crypto_order_until_filled(
-    client: &AlpacaBrokerApiClient,
+    orders: &impl ConversionOrders,
     order_id: Uuid,
     deadlines: ConversionPollDeadlines,
 ) -> Result<CryptoOrderResponse, AlpacaBrokerApiError> {
     use TerminalCryptoOutcome::{Failed, Filled};
 
-    let settled = poll_until_terminal(client, order_id, deadlines).await?;
+    let settled = poll_until_terminal(orders, order_id, deadlines).await?;
 
     match settled.outcome {
         Filled => Ok(settled.order),
@@ -1299,11 +1492,11 @@ pub(crate) async fn poll_crypto_order_until_filled(
 /// settled terminal order returned; the errors a stall can produce are the
 /// ones `cancel_and_settle` raises when the cancel itself does not resolve.
 pub(crate) async fn poll_crypto_order_to_terminal(
-    client: &AlpacaBrokerApiClient,
+    orders: &impl ConversionOrders,
     order_id: Uuid,
     deadlines: ConversionPollDeadlines,
 ) -> Result<CryptoOrderResponse, AlpacaBrokerApiError> {
-    poll_until_terminal(client, order_id, deadlines)
+    poll_until_terminal(orders, order_id, deadlines)
         .await
         .map(|settled| settled.order)
 }
@@ -1315,89 +1508,125 @@ pub(crate) async fn poll_crypto_order_to_terminal(
 /// (it is what bounds the wait), and a correction applied to one poll but not
 /// the other would reintroduce the unbounded wait for the path it missed.
 /// Callers only interpret the returned outcome.
+///
+/// A read error `permanence()` calls transient (a 5xx, 408 or 429, a
+/// transport failure, a retryable gateway hop) is read again at the next
+/// interval, or after the `Retry-After` it relayed when that is longer;
+/// every other read error ends the poll. No read starts at or after the
+/// deadline and a read still running there is dropped, so the remainder is
+/// cancelled on time.
 async fn poll_until_terminal(
-    client: &AlpacaBrokerApiClient,
+    orders: &impl ConversionOrders,
     order_id: Uuid,
     deadlines: ConversionPollDeadlines,
 ) -> Result<SettledConversionOrder, AlpacaBrokerApiError> {
-    let started = tokio::time::Instant::now();
+    let deadline = poll_deadline(tokio::time::Instant::now(), deadlines.order);
+    let mut last_seen = None;
+    // A read that omits the fill says nothing about it, and a fill only
+    // grows, so the last one reported stands until a read reports another.
+    let mut last_filled = None;
 
-    loop {
-        let order = client.get_crypto_order(order_id).await?;
+    while tokio::time::Instant::now() < deadline {
+        let Ok(read) =
+            tokio::time::timeout_at(deadline, orders.get_conversion_order(order_id)).await
+        else {
+            break;
+        };
 
-        match order.classify().terminal() {
-            Some(outcome) => {
-                return Ok(SettledConversionOrder {
-                    order,
-                    outcome,
-                    deadline_cancelled: false,
-                });
-            }
-            None if started.elapsed() >= deadlines.order => {
-                warn!(
-                    target: "broker",
-                    order_id = %order_id,
-                    deadline = ?deadlines.order,
-                    status = order.status_display(),
-                    filled = ?order.filled_quantity,
-                    "Conversion order still not terminal at the deadline; cancelling the remainder"
-                );
-                let (order, outcome) = cancel_and_settle(client, order_id, deadlines).await?;
+        let delay = match read {
+            Ok(order) => {
+                if let Some(outcome) = order.classify().terminal() {
+                    return Ok(SettledConversionOrder {
+                        order,
+                        outcome,
+                        deadline_cancelled: false,
+                    });
+                }
 
-                return Ok(SettledConversionOrder {
-                    order,
-                    outcome,
-                    deadline_cancelled: true,
-                });
-            }
-            None => {
                 trace!(
                     target: "broker",
                     order_id = %order_id,
                     status = order.status_display(),
                     "Crypto order can still change state, waiting..."
                 );
-                tokio::time::sleep(deadlines.interval).await;
+                last_filled = order.filled_quantity.or(last_filled);
+                last_seen = Some(order);
+                deadlines.interval
             }
-        }
+            // The rule of the wallet and tokenization polls: a read a later
+            // read can clear is read again, after any wait it relayed, so a
+            // passing failure never skips the deadline cancel.
+            Err(error) if error.permanence() == crate::core::Permanence::Transient => {
+                warn!(
+                    target: "broker",
+                    order_id = %order_id,
+                    %error,
+                    "Conversion order read failed, polling again"
+                );
+                error
+                    .backpressure()
+                    .and_then(|hint| hint.retry_after)
+                    .map_or(deadlines.interval, |wait| wait.max(deadlines.interval))
+            }
+            Err(error) => return Err(error),
+        };
+
+        tokio::time::sleep(next_poll_delay(delay, deadline)).await;
     }
+
+    warn!(
+        target: "broker",
+        order_id = %order_id,
+        deadline = ?deadlines.order,
+        status = last_seen.as_ref().map(CryptoOrderResponse::status_display),
+        filled = ?last_filled,
+        "Conversion order not seen terminal by the deadline; cancelling the remainder"
+    );
+
+    let (order, outcome) = cancel_and_settle(orders, order_id, deadlines, last_filled).await?;
+
+    Ok(SettledConversionOrder {
+        order,
+        outcome,
+        deadline_cancelled: true,
+    })
 }
 
-/// Cancel `order_id` and wait up to `deadlines.cancel_settle` for the broker
-/// to report its terminal state, returning that state alongside the order.
+/// Cancel `order_id` and wait up to `deadlines.cancel_settle` from the
+/// cancel's answer for the broker to report its terminal state, returning
+/// that state alongside the order.
 ///
-/// A cancel the broker never accepted is re-issued inside the settle window,
-/// so a single transient failure cannot leave the remainder live. An order
-/// still non-terminal after the settle window errors with
-/// [`AlpacaBrokerApiError::ConversionCancelNotSettled`], carrying how the
-/// broker answered the cancel so the persisted reason does not claim one that
-/// never took effect. See [`request_cancel`] for the per-answer handling.
+/// A cancel the broker never accepted is sent again inside the settle
+/// window, so a single transient failure cannot leave the remainder live. No
+/// status read runs past the window. An order not terminal by its end
+/// errors with [`AlpacaBrokerApiError::ConversionCancelNotSettled`], carrying
+/// how the broker answered the cancel, so the persisted reason does not
+/// claim one that never took effect, and the last fill reported, the reads
+/// before the cancel (`last_filled`) included. See [`request_cancel`] for
+/// the per answer handling.
 async fn cancel_and_settle(
-    client: &AlpacaBrokerApiClient,
+    orders: &impl ConversionOrders,
     order_id: Uuid,
     deadlines: ConversionPollDeadlines,
+    last_filled: Option<AlpacaAmount>,
 ) -> Result<(CryptoOrderResponse, TerminalCryptoOutcome), AlpacaBrokerApiError> {
-    let mut cancel = request_cancel(client, order_id).await?;
+    let mut cancel = request_cancel(orders, order_id).await?;
+    let window_end = poll_deadline(tokio::time::Instant::now(), deadlines.cancel_settle);
+    let mut filled_quantity = last_filled;
 
-    let started = tokio::time::Instant::now();
-    let mut filled_quantity = None;
+    while tokio::time::Instant::now() < window_end {
+        let Ok(read) =
+            tokio::time::timeout_at(window_end, orders.get_conversion_order(order_id)).await
+        else {
+            break;
+        };
 
-    loop {
-        // A cancel the broker never took leaves the remainder live, so it is
-        // re-issued for as long as the settle window lasts. Retrying is only
-        // meaningful after a transport or 5xx failure: an accepted cancel
-        // needs no repeat, and a declined one is refused for a reason that
-        // will not change.
-        if cancel == DeadlineCancel::Failed {
-            cancel = request_cancel(client, order_id).await?;
-        }
-
-        match client.get_crypto_order(order_id).await {
+        match read {
             Ok(order) => {
                 if let Some(outcome) = order.classify().terminal() {
                     return Ok((order, outcome));
                 }
-                filled_quantity = order.filled_quantity;
+                filled_quantity = order.filled_quantity.or(filled_quantity);
             }
             // A read that fails leaves the order's fate as unknown as a
             // non-terminal one, so it is retried inside the window rather
@@ -1410,16 +1639,22 @@ async fn cancel_and_settle(
             ),
         }
 
-        if started.elapsed() >= deadlines.cancel_settle {
-            return Err(AlpacaBrokerApiError::ConversionCancelNotSettled {
-                order_id,
-                cancel,
-                filled_quantity,
-            });
-        }
+        tokio::time::sleep(next_poll_delay(deadlines.interval, window_end)).await;
 
-        tokio::time::sleep(deadlines.interval).await;
+        // A cancel the broker never took leaves the remainder live, so it is
+        // sent again for as long as the settle window lasts. An accepted
+        // cancel needs no repeat, and a declined one is refused for a reason
+        // that will not change.
+        if cancel == DeadlineCancel::Failed && tokio::time::Instant::now() < window_end {
+            cancel = request_cancel(orders, order_id).await?;
+        }
     }
+
+    Err(AlpacaBrokerApiError::ConversionCancelNotSettled {
+        order_id,
+        cancel,
+        filled_quantity,
+    })
 }
 
 /// Issue the deadline cancel once, mapping the broker's answer to what may
@@ -1431,10 +1666,10 @@ async fn cancel_and_settle(
 /// DELETE -- and a transport or 5xx failure leaves the request unmade; both
 /// fall through to the status read, which observes whatever the order became.
 async fn request_cancel(
-    client: &AlpacaBrokerApiClient,
+    orders: &impl ConversionOrders,
     order_id: Uuid,
 ) -> Result<DeadlineCancel, AlpacaBrokerApiError> {
-    match client.cancel_order(order_id).await {
+    match orders.cancel_order(&order_id.to_string()).await {
         Ok(CancellationOutcome::Requested) => Ok(DeadlineCancel::Accepted),
         Ok(CancellationOutcome::OrderNotFound) => {
             Err(AlpacaBrokerApiError::ConversionOrderNotFound { order_id })
@@ -1475,6 +1710,7 @@ mod tests {
     use crate::broker::ClientOrderId;
     use crate::broker::auth::{AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode};
     use crate::broker::duplicate_client_order_id_body;
+    use crate::core::GatewayHopError;
     use st0x_float_macro::float;
 
     const TEST_ACCOUNT_ID: AlpacaAccountId =
@@ -2079,7 +2315,8 @@ mod tests {
 
         let err = place_market_order(&client, market_order, TimeInForce::Day)
             .await
-            .unwrap_err();
+            .unwrap_err()
+            .error;
 
         place_mock.assert();
         lookup_mock.assert();
@@ -2213,7 +2450,10 @@ mod tests {
             client_order_id: ClientOrderId::from_uuid(client_order_uuid),
         };
 
-        let err = place_limit_order(&client, limit_order).await.unwrap_err();
+        let err = place_limit_order(&client, limit_order)
+            .await
+            .unwrap_err()
+            .error;
 
         place_mock.assert();
         lookup_mock.assert();
@@ -2303,7 +2543,8 @@ mod tests {
 
         let error = place_market_order(&client, market_order, TimeInForce::Day)
             .await
-            .unwrap_err();
+            .unwrap_err()
+            .error;
 
         place_mock.assert();
         lookup_mock.assert();
@@ -2344,7 +2585,8 @@ mod tests {
 
         let error = place_market_order(&client, market_order, TimeInForce::Day)
             .await
-            .unwrap_err();
+            .unwrap_err()
+            .error;
 
         place_mock.assert();
         assert!(
@@ -4432,7 +4674,8 @@ mod tests {
 
         let err = place_market_order(&client, market_order, TimeInForce::Day)
             .await
-            .unwrap_err();
+            .unwrap_err()
+            .error;
 
         assert!(
             matches!(
@@ -4527,7 +4770,10 @@ mod tests {
             client_order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
         };
 
-        let err = place_limit_order(&client, limit_order).await.unwrap_err();
+        let err = place_limit_order(&client, limit_order)
+            .await
+            .unwrap_err()
+            .error;
 
         assert!(
             matches!(
@@ -4608,6 +4854,651 @@ mod tests {
             prop_assume!(!message.contains("client_order_id must be unique"));
             let error = api_error(StatusCode::UNPROCESSABLE_ENTITY, message);
             prop_assert!(!is_duplicate_client_order_id(&error));
+        }
+    }
+
+    const ORDERS_PATH: &str = "/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders";
+
+    fn reporting_market_order() -> MarketOrder {
+        MarketOrder {
+            symbol: Symbol::new("AAPL").unwrap(),
+            shares: Positive::new(FractionalShares::new(float!(10))).unwrap(),
+            direction: Direction::Buy,
+            client_order_id: ClientOrderId::from_uuid(uuid!(
+                "99999999-9999-4999-8999-999999999999"
+            )),
+        }
+    }
+
+    /// A 4xx other than 408 is Alpaca's definite answer that it did not take
+    /// this order; a 408 or a 5xx leaves an order that may exist.
+    #[tokio::test]
+    async fn placement_reports_whether_the_post_answer_leaves_an_order() {
+        for (status, written) in [
+            (403, false),
+            (422, false),
+            (429, false),
+            (408, true),
+            (500, true),
+            (503, true),
+        ] {
+            let server = MockServer::start();
+            let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+            let place = server.mock(|when, then| {
+                when.method(POST).path(ORDERS_PATH);
+                then.status(status)
+                    .header("content-type", "application/json")
+                    .json_body(json!({"message": "refused"}));
+            });
+            let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+
+            let failure = place_market_order(&client, reporting_market_order(), TimeInForce::Day)
+                .await
+                .unwrap_err();
+
+            place.assert();
+            assert_eq!(failure.written, written, "status {status}");
+            assert!(
+                matches!(
+                    failure.error,
+                    AlpacaBrokerApiError::ApiError { status: answered, .. }
+                        if answered.as_u16() == status
+                ),
+                "status {status}: {:?}",
+                failure.error
+            );
+        }
+    }
+
+    /// Nothing left the process when the connection never opened.
+    #[tokio::test]
+    async fn placement_reports_a_refused_connection_as_unwritten() {
+        // Port 1 is reserved and never listening.
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock("http://127.0.0.1:1".to_string()));
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+
+        let failure = place_market_order(&client, reporting_market_order(), TimeInForce::Day)
+            .await
+            .unwrap_err();
+
+        assert!(!failure.written);
+        assert!(matches!(failure.error, AlpacaBrokerApiError::HttpClient(_)));
+    }
+
+    /// Nothing left the process when the caller's send gate held the order
+    /// POST back, and a retry in the same scope would be held back alike.
+    #[tokio::test]
+    async fn placement_reports_a_post_the_send_gate_held_back_as_unwritten() {
+        use crate::request_id::{GateClosed, SendGate, gated};
+
+        let server = MockServer::start_async().await;
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+        let place = server.mock(|when, then| {
+            when.method(POST).path(ORDERS_PATH);
+            then.status(200);
+        });
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+
+        let failure = gated(
+            SendGate::new(|| false),
+            place_market_order(&client, reporting_market_order(), TimeInForce::Day),
+        )
+        .await
+        .unwrap_err();
+
+        place.assert_calls_async(0).await;
+        assert!(!failure.written);
+        assert!(
+            matches!(failure.error, AlpacaBrokerApiError::NotSent(GateClosed)),
+            "{:?}",
+            failure.error
+        );
+        assert_eq!(
+            failure.error.permanence(),
+            crate::core::Permanence::Permanent
+        );
+    }
+
+    /// A connection that drops after Alpaca received the whole order request
+    /// leaves an order that may exist.
+    #[tokio::test]
+    async fn placement_reports_a_lost_answer_as_written() {
+        use tokio::io::AsyncReadExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let alpaca = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            while !request.ends_with(b"}") {
+                let read = socket.read(&mut buffer).await.unwrap();
+                assert_ne!(read, 0, "the client closed before sending the order body");
+                request.extend_from_slice(&buffer[..read]);
+            }
+            String::from_utf8(request).unwrap()
+        });
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(format!("http://{address}")));
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+
+        let failure = place_market_order(&client, reporting_market_order(), TimeInForce::Day)
+            .await
+            .unwrap_err();
+
+        let request = alpaca.await.unwrap();
+        assert!(request.starts_with(&format!("POST {ORDERS_PATH} ")));
+        assert!(failure.written);
+        assert!(matches!(failure.error, AlpacaBrokerApiError::HttpClient(_)));
+    }
+
+    /// After the duplicate key 422 Alpaca holds an order under this key, so a
+    /// failed adoption lookup reports a written attempt even though the
+    /// lookup itself answered with a 4xx.
+    #[tokio::test]
+    async fn placement_reports_a_failed_duplicate_adoption_as_written() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+        server.mock(|when, then| {
+            when.method(POST).path(ORDERS_PATH);
+            then.status(422)
+                .header("content-type", "application/json")
+                .json_body(duplicate_client_order_id_body());
+        });
+        let lookup = server.mock(|when, then| {
+            when.method(GET)
+                .path(format!("{ORDERS_PATH}:by_client_order_id"));
+            then.status(403)
+                .header("content-type", "application/json")
+                .json_body(json!({"message": "forbidden"}));
+        });
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+
+        let failure = place_market_order(&client, reporting_market_order(), TimeInForce::Day)
+            .await
+            .unwrap_err();
+
+        lookup.assert();
+        assert!(failure.written);
+        assert!(matches!(
+            failure.error,
+            AlpacaBrokerApiError::ApiError { status, .. } if status == StatusCode::FORBIDDEN
+        ));
+    }
+
+    /// An accepted order whose answer omits its timestamps is read back, and a
+    /// failure of that read still leaves the accepted order.
+    #[tokio::test]
+    async fn placement_reports_a_failed_timestamp_read_as_written() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+        let order_id = "61e7b016-9c91-4a97-b912-615c9d365c9d";
+        server.mock(|when, then| {
+            when.method(POST).path(ORDERS_PATH);
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": order_id,
+                    "symbol": "AAPL",
+                    "qty": "10",
+                    "side": "buy",
+                    "status": "new"
+                }));
+        });
+        let read_back = server.mock(|when, then| {
+            when.method(GET).path(format!("{ORDERS_PATH}/{order_id}"));
+            then.status(500)
+                .header("content-type", "application/json")
+                .json_body(json!({"message": "unavailable"}));
+        });
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+        let limit_order = AlpacaLimitOrder {
+            symbol: Symbol::new("AAPL").unwrap(),
+            shares: Positive::new(FractionalShares::new(float!(10))).unwrap(),
+            direction: Direction::Buy,
+            limit_price: AlpacaLimitPrice::try_new(
+                Positive::new(Usd::new(float!(195.25))).unwrap(),
+            )
+            .unwrap(),
+            extended_hours: false,
+            client_order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
+        };
+
+        let failure = place_limit_order(&client, limit_order).await.unwrap_err();
+
+        read_back.assert();
+        assert!(failure.written);
+        assert!(matches!(
+            failure.error,
+            AlpacaBrokerApiError::ApiError { status, .. }
+                if status == StatusCode::INTERNAL_SERVER_ERROR
+        ));
+    }
+
+    /// A conversion order source scripted in memory: reads first answer the
+    /// gateway hop failures in `hops`, one per read, then walk `reads`, the
+    /// last one repeating, until a cancel is requested, and then answer
+    /// `after_cancel` when there is one. A stalling source starts every read
+    /// that `after_cancel` does not answer and never completes it; one whose
+    /// settle reads stall does so only once a cancel was requested. Cancels
+    /// are accepted after `cancel_delay`.
+    struct ScriptedConversion {
+        hops: Vec<GatewayHopError>,
+        hops_answered: std::sync::atomic::AtomicUsize,
+        alpaca_failures: Vec<fn() -> AlpacaBrokerApiError>,
+        alpaca_failures_answered: std::sync::atomic::AtomicUsize,
+        reads: Vec<CryptoOrderResponse>,
+        next_read: std::sync::atomic::AtomicUsize,
+        after_cancel: Option<CryptoOrderResponse>,
+        cancels: std::sync::atomic::AtomicUsize,
+        cancel_delay: Duration,
+        stalling: bool,
+        settle_reads_stall: bool,
+    }
+
+    impl ScriptedConversion {
+        fn new(
+            reads: impl IntoIterator<Item = CryptoOrderResponse>,
+            after_cancel: Option<CryptoOrderResponse>,
+        ) -> Self {
+            Self {
+                hops: Vec::new(),
+                hops_answered: std::sync::atomic::AtomicUsize::new(0),
+                alpaca_failures: Vec::new(),
+                alpaca_failures_answered: std::sync::atomic::AtomicUsize::new(0),
+                reads: reads.into_iter().collect(),
+                next_read: std::sync::atomic::AtomicUsize::new(0),
+                after_cancel,
+                cancels: std::sync::atomic::AtomicUsize::new(0),
+                cancel_delay: Duration::ZERO,
+                stalling: false,
+                settle_reads_stall: false,
+            }
+        }
+
+        fn failing_first(self, hops: impl IntoIterator<Item = GatewayHopError>) -> Self {
+            Self {
+                hops: hops.into_iter().collect(),
+                ..self
+            }
+        }
+
+        fn stalling(self) -> Self {
+            Self {
+                stalling: true,
+                ..self
+            }
+        }
+
+        fn stalling_after_cancel(self) -> Self {
+            Self {
+                settle_reads_stall: true,
+                ..self
+            }
+        }
+
+        fn cancelling_after(self, cancel_delay: Duration) -> Self {
+            Self {
+                cancel_delay,
+                ..self
+            }
+        }
+
+        fn cancels(&self) -> usize {
+            self.cancels.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn hops_left(&self) -> usize {
+            self.hops.len() - self.hops_answered.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        /// Answers the first reads with these Alpaca errors, before any hop.
+        fn failing_first_at_alpaca(self, failures: Vec<fn() -> AlpacaBrokerApiError>) -> Self {
+            Self {
+                alpaca_failures: failures,
+                ..self
+            }
+        }
+
+        /// Reads answered from `reads`, past the scripted hop failures, or
+        /// started and stalled.
+        fn reads_made(&self) -> usize {
+            self.next_read.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl ConversionOrders for ScriptedConversion {
+        async fn submit_conversion(
+            &self,
+            _: ConversionOrder,
+            _: &ClientOrderId,
+        ) -> Result<CryptoOrderResponse, AlpacaBrokerApiError> {
+            Ok(scripted_conversion_order(
+                BrokerOrderStatus::PendingNew,
+                "0",
+            ))
+        }
+
+        async fn get_conversion_order(
+            &self,
+            order_id: Uuid,
+        ) -> Result<CryptoOrderResponse, AlpacaBrokerApiError> {
+            assert_eq!(order_id, STALLED_ORDER_ID);
+            if self.cancels() > 0 {
+                if self.settle_reads_stall {
+                    self.next_read
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    return std::future::pending().await;
+                }
+                if let Some(order) = &self.after_cancel {
+                    return Ok(order.clone());
+                }
+            }
+            if self.stalling {
+                self.next_read
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                return std::future::pending().await;
+            }
+            let failure = self
+                .alpaca_failures_answered
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some(error) = self.alpaca_failures.get(failure) {
+                return Err(error());
+            }
+            if self.hops_left() > 0 {
+                let hop = self
+                    .hops_answered
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                return Err(AlpacaBrokerApiError::Gateway(self.hops[hop].clone()));
+            }
+            let read = self
+                .next_read
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                .min(self.reads.len() - 1);
+            Ok(self.reads[read].clone())
+        }
+
+        async fn find_conversion_order(
+            &self,
+            _: &ClientOrderId,
+        ) -> Result<Option<CryptoOrderResponse>, AlpacaBrokerApiError> {
+            Ok(None)
+        }
+
+        async fn cancel_order(
+            &self,
+            order_id: &str,
+        ) -> Result<CancellationOutcome, AlpacaBrokerApiError> {
+            assert_eq!(order_id, STALLED_ORDER_ID.to_string());
+            self.cancels
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            tokio::time::sleep(self.cancel_delay).await;
+            Ok(CancellationOutcome::Requested)
+        }
+    }
+
+    fn scripted_conversion_order(status: BrokerOrderStatus, filled: &str) -> CryptoOrderResponse {
+        CryptoOrderResponse {
+            id: STALLED_ORDER_ID,
+            symbol: "USDCUSD".to_string(),
+            quantity: Some(AlpacaAmount::try_from(float!(500)).unwrap()),
+            notional: None,
+            status,
+            filled_average_price: Some(float!(1.0001)),
+            filled_quantity: Some(
+                AlpacaAmount::try_from(Float::parse(filled.to_string()).unwrap()).unwrap(),
+            ),
+            created_at: Utc::now(),
+        }
+    }
+
+    /// A read lost on a gateway hop the gateway classified as retryable is
+    /// read again and the conversion completes without its deadline cancel;
+    /// one it classified as not retryable ends the poll on that read.
+    #[tokio::test]
+    async fn conversion_poll_reads_again_only_after_a_retryable_gateway_hop() {
+        for (retryable, reads_made) in [(true, 1), (false, 0)] {
+            let orders = ScriptedConversion::new(
+                [scripted_conversion_order(BrokerOrderStatus::Filled, "500")],
+                None,
+            )
+            .failing_first([GatewayHopError {
+                retryable,
+                ..GatewayHopError::transport("gateway restarting")
+            }]);
+
+            let result = poll_conversion_to_terminal_with(
+                &orders,
+                STALLED_ORDER_ID,
+                Duration::from_millis(1),
+            )
+            .await;
+
+            match result {
+                Ok(order) => assert_eq!(order.classify(), CryptoOrderOutcome::Filled),
+                Err(AlpacaBrokerApiError::Gateway(hop)) => assert!(!hop.retryable),
+                Err(error) => panic!("unexpected {error:?}"),
+            }
+            assert_eq!(orders.reads_made(), reads_made, "retryable {retryable}");
+            assert_eq!(orders.cancels(), 0);
+        }
+    }
+
+    /// A read Alpaca answers with a transient error is read again, after
+    /// the `Retry-After` it relayed, and the conversion completes without its
+    /// deadline cancel; a definite 4xx ends the poll on that read.
+    #[tokio::test(start_paused = true)]
+    async fn conversion_poll_reads_again_after_a_transient_alpaca_error() {
+        fn unavailable() -> AlpacaBrokerApiError {
+            AlpacaBrokerApiError::ApiError {
+                status: reqwest::StatusCode::TOO_MANY_REQUESTS,
+                alpaca_code: None,
+                message: "rate limited".to_string(),
+                retry_after: Some(Duration::from_secs(3)),
+            }
+        }
+        fn refused() -> AlpacaBrokerApiError {
+            AlpacaBrokerApiError::ApiError {
+                status: reqwest::StatusCode::FORBIDDEN,
+                alpaca_code: None,
+                message: "forbidden".to_string(),
+                retry_after: None,
+            }
+        }
+        let filled = || {
+            ScriptedConversion::new(
+                [scripted_conversion_order(BrokerOrderStatus::Filled, "500")],
+                None,
+            )
+        };
+
+        let orders = filled().failing_first_at_alpaca(vec![unavailable]);
+        let started = tokio::time::Instant::now();
+        let order =
+            poll_conversion_to_terminal_with(&orders, STALLED_ORDER_ID, Duration::from_millis(1))
+                .await
+                .unwrap();
+        assert_eq!(order.classify(), CryptoOrderOutcome::Filled);
+        assert_eq!(started.elapsed(), Duration::from_secs(3));
+        assert_eq!(orders.cancels(), 0);
+
+        let orders = filled().failing_first_at_alpaca(vec![refused]);
+        let error =
+            poll_conversion_to_terminal_with(&orders, STALLED_ORDER_ID, Duration::from_millis(1))
+                .await
+                .unwrap_err();
+        assert!(
+            matches!(error, AlpacaBrokerApiError::ApiError { status, .. } if status == 403),
+            "{error:?}"
+        );
+        assert_eq!(orders.reads_made(), 0);
+        assert_eq!(orders.cancels(), 0);
+    }
+
+    /// No read starts at the deadline: with the next read due past it, the
+    /// deadline cancel runs at the deadline instead, so the read that would
+    /// have answered there, a permanent refusal here, cannot end the poll
+    /// before the cancel.
+    #[tokio::test(start_paused = true)]
+    async fn conversion_poll_cancels_at_its_deadline_without_reading_there() {
+        let refusal = GatewayHopError {
+            retryable: false,
+            ..GatewayHopError::transport("capability disabled")
+        };
+        let orders = ScriptedConversion::new(
+            [scripted_conversion_order(BrokerOrderStatus::New, "0")],
+            Some(scripted_conversion_order(BrokerOrderStatus::Filled, "500")),
+        )
+        .failing_first([GatewayHopError::transport("gateway restarting"), refusal]);
+        let deadlines = ConversionPollDeadlines {
+            interval: Duration::from_secs(60),
+            ..FAST_DEADLINES
+        };
+
+        let started = tokio::time::Instant::now();
+        let order = poll_crypto_order_until_filled(&orders, STALLED_ORDER_ID, deadlines)
+            .await
+            .unwrap();
+
+        assert_eq!(started.elapsed(), FAST_DEADLINES.order);
+        assert_eq!(orders.hops_left(), 1);
+        assert_eq!(orders.reads_made(), 0);
+        assert_eq!(orders.cancels(), 1);
+        assert_eq!(order.classify(), CryptoOrderOutcome::Filled);
+    }
+
+    /// A read still running at the order deadline is dropped there and the
+    /// remainder cancelled at once, not when the read would have answered.
+    #[tokio::test(start_paused = true)]
+    async fn conversion_poll_drops_a_read_still_running_at_its_deadline_and_cancels() {
+        let orders = ScriptedConversion::new(
+            [scripted_conversion_order(BrokerOrderStatus::New, "0")],
+            Some(scripted_conversion_order(
+                BrokerOrderStatus::Canceled,
+                "300",
+            )),
+        )
+        .stalling();
+
+        let started = tokio::time::Instant::now();
+        let order = poll_crypto_order_until_filled(&orders, STALLED_ORDER_ID, FAST_DEADLINES)
+            .await
+            .unwrap();
+
+        assert_eq!(started.elapsed(), FAST_DEADLINES.order);
+        assert_eq!(orders.reads_made(), 1);
+        assert_eq!(orders.cancels(), 1);
+        assert_eq!(
+            Usdc::new(order.filled_quantity.unwrap().into_normalized()),
+            Usdc::new(float!(300))
+        );
+    }
+
+    /// A read still running at the end of the settle window is dropped
+    /// there: the poll reports the cancel unsettled at the cutoff.
+    #[tokio::test(start_paused = true)]
+    async fn settle_window_drops_a_read_still_running_at_its_end() {
+        let orders = ScriptedConversion::new(
+            [scripted_conversion_order(BrokerOrderStatus::New, "0")],
+            None,
+        )
+        .stalling();
+
+        let started = tokio::time::Instant::now();
+        let error = poll_crypto_order_to_terminal(&orders, STALLED_ORDER_ID, FAST_DEADLINES)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                AlpacaBrokerApiError::ConversionCancelNotSettled {
+                    cancel: DeadlineCancel::Accepted,
+                    filled_quantity: None,
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+        assert_eq!(
+            started.elapsed(),
+            FAST_DEADLINES.order + FAST_DEADLINES.cancel_settle
+        );
+        assert_eq!(orders.reads_made(), 2);
+        assert_eq!(orders.cancels(), 1);
+    }
+
+    /// The settle window starts when the deadline cancel answers, so a cancel
+    /// slower than the window (a gateway cancel may run to its 60 s client
+    /// bound) still leaves the whole window for the reads that see the order
+    /// settle.
+    #[tokio::test(start_paused = true)]
+    async fn settle_window_starts_when_a_slow_deadline_cancel_answers() {
+        let slow = Duration::from_secs(45);
+        let orders = ScriptedConversion::new(
+            [scripted_conversion_order(
+                BrokerOrderStatus::PartiallyFilled,
+                "300",
+            )],
+            Some(scripted_conversion_order(
+                BrokerOrderStatus::Canceled,
+                "300",
+            )),
+        )
+        .cancelling_after(slow);
+        let cancel_at_once = ConversionPollDeadlines {
+            order: Duration::ZERO,
+            ..FAST_DEADLINES
+        };
+
+        let started = tokio::time::Instant::now();
+        let order = poll_crypto_order_until_filled(&orders, STALLED_ORDER_ID, cancel_at_once)
+            .await
+            .unwrap();
+
+        assert_eq!(started.elapsed(), slow);
+        assert_eq!(orders.cancels(), 1);
+        assert_eq!(
+            order.classify(),
+            CryptoOrderOutcome::Failed(CryptoOrderFailureReason::Canceled)
+        );
+        assert_eq!(
+            Usdc::new(order.filled_quantity.unwrap().into_normalized()),
+            Usdc::new(float!(300))
+        );
+    }
+
+    /// The fill a read reported before the deadline cancel survives into
+    /// `ConversionCancelNotSettled` when no settle read reports one: every
+    /// settle read stalls, or the settle reads answer without the field.
+    #[tokio::test(start_paused = true)]
+    async fn a_fill_seen_before_the_cancel_survives_an_unsettled_cancel() {
+        let partial = || scripted_conversion_order(BrokerOrderStatus::PartiallyFilled, "120");
+        let without_fill = CryptoOrderResponse {
+            filled_quantity: None,
+            ..scripted_conversion_order(BrokerOrderStatus::New, "0")
+        };
+
+        for orders in [
+            ScriptedConversion::new([partial()], None).stalling_after_cancel(),
+            ScriptedConversion::new([partial()], Some(without_fill)),
+        ] {
+            let error = poll_crypto_order_to_terminal(&orders, STALLED_ORDER_ID, FAST_DEADLINES)
+                .await
+                .unwrap_err();
+
+            let AlpacaBrokerApiError::ConversionCancelNotSettled {
+                cancel,
+                filled_quantity,
+                ..
+            } = error
+            else {
+                panic!("expected ConversionCancelNotSettled, got {error:?}");
+            };
+            assert_eq!(cancel, DeadlineCancel::Accepted);
+            assert_eq!(
+                filled_quantity.map(|filled| Usdc::new(filled.into_normalized())),
+                Some(Usdc::new(float!(120)))
+            );
         }
     }
 }

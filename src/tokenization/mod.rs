@@ -15,8 +15,9 @@ use uuid::Uuid;
 
 pub use client::{
     AlpacaApiErrorMessage, AlpacaTokenizationError, AlpacaTokenizationService,
-    InvalidTokenizationParameters, TokenizationRequest, TokenizationRequestStatus,
-    TokenizationRequestType,
+    InvalidTokenizationParameters, TokenizationLookups, TokenizationRequest,
+    TokenizationRequestStatus, TokenizationRequestType, poll_for_redemption_with,
+    poll_request_until_complete_with,
 };
 
 /// Our internal tracking id for a tokenized equity mint, chosen at enqueue time.

@@ -1,0 +1,59 @@
+[package]
+name = "st0x-alpaca-gateway"
+version = "0.1.0"
+edition = "2024"
+description = "Account bound Alpaca gateway service (t0-alpaca)"
+license = "LicenseRef-Proprietary"
+publish = false
+
+[[bin]]
+name = "st0x-alpaca-gateway"
+path = "src/main.rs"
+
+[features]
+# Test only hooks for this crate's own integration tests: per test
+# deadlines and the in memory audit sink.
+test-support = []
+
+[dependencies]
+alloy-primitives = { version = "1", features = ["serde"] }
+axum = { version = "0.8", features = ["json", "query", "tokio", "http1"] }
+chrono = { version = "0.4", features = ["serde"] }
+hex = "0.4"
+jsonwebtoken = "9.3"
+reqwest = { version = "0.13", default-features = false, features = [
+  "json",
+  "rustls",
+] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+st0x-alpaca = { path = "../..", features = ["tokenization"] }
+st0x-alpaca-gateway-api = { path = "../gateway-api" }
+thiserror = "2"
+tokio = { version = "1", features = [
+  "macros",
+  "net",
+  "rt-multi-thread",
+  "signal",
+  "sync",
+  "time",
+] }
+tokio-util = { version = "0.7", features = ["rt"] }
+toml = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+uuid = { version = "1", features = ["serde", "v4"] }
+
+[dev-dependencies]
+base64 = "0.22"
+httpmock = "0.8"
+p256 = { version = "0.13", features = ["ecdsa", "pkcs8", "pem"] }
+rsa = { version = "0.9", features = ["pem"] }
+st0x-alpaca = { path = "../..", features = ["tokenization", "mock"] }
+st0x-alpaca-gateway = { path = ".", features = ["test-support"] }
+st0x-alpaca-gateway-api = { path = "../gateway-api", features = ["client"] }
+tower = { version = "0.5", features = ["util"] }
+
+[lints]
+workspace = true

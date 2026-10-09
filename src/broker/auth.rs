@@ -239,6 +239,10 @@ pub enum AccountStatus {
 pub(crate) struct AccountResponse {
     pub id: Uuid,
     pub status: AccountStatus,
+    /// Alpaca's human readable account number. Absent from some sandbox
+    /// answers.
+    #[serde(default)]
+    pub account_number: Option<String>,
 }
 
 #[cfg(test)]

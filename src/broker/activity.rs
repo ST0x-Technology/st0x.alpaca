@@ -24,10 +24,8 @@ const PNL_ACTIVITY_TYPES: &[&str] = &[
 
 const ACCOUNT_ACTIVITIES_PAGE_SIZE: usize = 100;
 
-#[cfg(not(test))]
+/// Page cap of [`AlpacaBrokerApiCtx::fetch_account_activities`].
 const MAX_ACCOUNT_ACTIVITIES_PAGES: usize = 1000;
-#[cfg(test)]
-const MAX_ACCOUNT_ACTIVITIES_PAGES: usize = 3;
 
 #[derive(Debug, Clone)]
 pub struct AccountActivitiesQuery {
@@ -86,14 +84,16 @@ pub struct AccountActivity {
     pub currency: Option<String>,
 }
 
+/// Reads every activity matching `query`, at most `max_pages` pages.
 pub(super) async fn get_account_activities(
     client: &AlpacaBrokerApiClient,
     query: &AccountActivitiesQuery,
+    max_pages: usize,
 ) -> Result<Vec<AccountActivity>, AlpacaBrokerApiError> {
     let mut rows = Vec::new();
     let mut page_token: Option<String> = None;
 
-    for _ in 0..MAX_ACCOUNT_ACTIVITIES_PAGES {
+    for _ in 0..max_pages {
         let page = fetch_account_activities_page(client, query, page_token.as_deref()).await?;
         if page.is_empty() {
             return Ok(rows);
@@ -116,13 +116,12 @@ pub(super) async fn get_account_activities(
         page_token = last_id;
     }
 
-    Err(AlpacaBrokerApiError::AccountActivitiesPageLimitExceeded {
-        pages: MAX_ACCOUNT_ACTIVITIES_PAGES,
-    })
+    Err(AlpacaBrokerApiError::AccountActivitiesPageLimitExceeded { pages: max_pages })
 }
 
 impl AlpacaBrokerApiCtx {
-    /// Fetches every account activity matching `query`, following page tokens.
+    /// Fetches every account activity matching `query`, following page tokens
+    /// for up to 1000 pages, on a client built for this call.
     ///
     /// # Errors
     ///
@@ -132,7 +131,7 @@ impl AlpacaBrokerApiCtx {
         query: &AccountActivitiesQuery,
     ) -> Result<Vec<AccountActivity>, AlpacaBrokerApiError> {
         let client = AlpacaBrokerApiClient::new(self)?;
-        get_account_activities(&client, query).await
+        get_account_activities(&client, query, MAX_ACCOUNT_ACTIVITIES_PAGES).await
     }
 }
 
@@ -182,8 +181,8 @@ mod tests {
     use uuid::uuid;
 
     use super::*;
-    use crate::broker::TimeInForce;
     use crate::broker::auth::{AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode};
+    use crate::broker::{AlpacaBrokerApi, TimeInForce};
 
     const TEST_ACCOUNT_ID: AlpacaAccountId =
         AlpacaAccountId::new(uuid!("904837e3-3b76-47ec-b432-046db621571b"));
@@ -275,6 +274,7 @@ mod tests {
                 after: None,
                 until: None,
             },
+            MAX_ACCOUNT_ACTIVITIES_PAGES,
         )
         .await
         .unwrap();
@@ -307,6 +307,7 @@ mod tests {
                 after: Utc.with_ymd_and_hms(2026, 6, 3, 0, 0, 0).single(),
                 until: Utc.with_ymd_and_hms(2026, 6, 4, 0, 0, 0).single(),
             },
+            MAX_ACCOUNT_ACTIVITIES_PAGES,
         )
         .await
         .unwrap();
@@ -344,6 +345,7 @@ mod tests {
                 after: None,
                 until: None,
             },
+            MAX_ACCOUNT_ACTIVITIES_PAGES,
         )
         .await
         .unwrap_err();
@@ -356,11 +358,25 @@ mod tests {
         ));
     }
 
+    /// A caller bounds one call's Alpaca requests with `max_pages`: the read
+    /// stops after that many full pages instead of following the next token.
     #[tokio::test]
-    async fn rejects_account_activities_after_page_limit() {
+    async fn account_activities_stop_at_the_callers_page_cap() {
+        const MAX_PAGES: usize = 3;
+
         let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET)
+                .path(format!("/v1/trading/accounts/{TEST_ACCOUNT_ID}/account"));
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({
+                    "id": TEST_ACCOUNT_ID.to_string(),
+                    "status": "ACTIVE"
+                }));
+        });
         let mut mocks = Vec::new();
-        for page_index in 0..MAX_ACCOUNT_ACTIVITIES_PAGES {
+        for page_index in 0..MAX_PAGES {
             let page_token = page_index
                 .checked_sub(1)
                 .map(|previous| format!("page-{previous}-last"));
@@ -383,26 +399,27 @@ mod tests {
             mocks.push(mock);
         }
 
-        let client = AlpacaBrokerApiClient::new(&create_test_ctx(&server)).unwrap();
-        let error = get_account_activities(
-            &client,
-            &AccountActivitiesQuery {
-                activity_types: Vec::new(),
-                after: None,
-                until: None,
-            },
-        )
-        .await
-        .unwrap_err();
+        let broker = AlpacaBrokerApi::try_from_ctx(create_test_ctx(&server))
+            .await
+            .unwrap();
+        let error = broker
+            .fetch_account_activities(
+                &AccountActivitiesQuery {
+                    activity_types: Vec::new(),
+                    after: None,
+                    until: None,
+                },
+                std::num::NonZeroUsize::new(MAX_PAGES).unwrap(),
+            )
+            .await
+            .unwrap_err();
 
         for mock in mocks {
             mock.assert();
         }
         assert!(matches!(
             error,
-            AlpacaBrokerApiError::AccountActivitiesPageLimitExceeded {
-                pages: MAX_ACCOUNT_ACTIVITIES_PAGES
-            }
+            AlpacaBrokerApiError::AccountActivitiesPageLimitExceeded { pages: MAX_PAGES }
         ));
     }
 

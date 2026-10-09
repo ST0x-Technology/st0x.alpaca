@@ -20,7 +20,12 @@ pub enum OrderFailureTerminality {
 }
 
 /// Runtime representation of an offchain order's lifecycle state.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "status",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
 pub enum OrderState {
     Pending,
     Submitted {

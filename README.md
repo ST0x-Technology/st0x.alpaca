@@ -44,13 +44,22 @@ st0x-alpaca = { git = "ssh://git@github.com/ST0x-Technology/st0x.alpaca", featur
   `tracing` events as the code they replace. The crate installs no
   subscriber. The issuer surface emits no events.
 
+## Gateway
+
+The workspace also holds the account bound Alpaca gateway (`t0-alpaca`), which runs these clients on behalf of bots and operators. It is the target credential boundary: once the bots call it ([RAI-1935](https://linear.app/makeitrain/issue/RAI-1935)) and their direct credentials are removed ([RAI-1938](https://linear.app/makeitrain/issue/RAI-1938)), only the gateway holds the account's Alpaca credential. Until then the bots keep calling Alpaca directly with their own credentials.
+
+- `crates/gateway-api` (`st0x-alpaca-gateway-api`): the wire contract (tiers, operation catalog and capability matrix, bodies, error body, audit event) and, with feature `client`, a typed client.
+- `crates/gateway` (`st0x-alpaca-gateway`): the service, packaged as the `gateway-oci` flake output.
+
+Running and rolling it back: [docs/gateway.md](docs/gateway.md).
+
 ## Development
 
 ```bash
 nix develop
-cargo check --all-features
-cargo test --all-features
-cargo clippy --all-targets --all-features -- -D warnings
+cargo check --workspace --all-features
+cargo test --workspace --all-features
+cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo fmt --all -- --check
 ```
 

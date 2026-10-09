@@ -1,7 +1,8 @@
-//! Shared `Retry-After` header parsing for Alpaca's broker, wallet, and
+//! Shared `Retry-After` handling for Alpaca's broker, wallet, and
 //! market-data HTTP clients. A single parser so every client
 //! captures the header the same way instead of duplicating the delay-seconds
-//! vs. HTTP-date branching per call site.
+//! vs. HTTP-date branching per call site, and the rule every poll follows:
+//! no read starts, runs or waits past its deadline.
 
 use std::str::FromStr;
 use std::time::{Duration, SystemTime};
@@ -90,6 +91,53 @@ pub fn retry_after_from_response_headers(headers: &HeaderMap) -> Option<Duration
     let header_value = headers.get(RETRY_AFTER)?.to_str().ok()?;
 
     parse_retry_after(header_value, SystemTime::now())
+}
+
+/// The wait before a poll's next read: `scheduled`, never past the poll
+/// `deadline`.
+#[cfg(feature = "broker")]
+pub(crate) fn next_poll_delay(scheduled: Duration, deadline: tokio::time::Instant) -> Duration {
+    scheduled.min(deadline.saturating_duration_since(tokio::time::Instant::now()))
+}
+
+/// The instant a poll started at `start` with `timeout` must stop reading:
+/// no read starts at or after it, and a read still running there is
+/// dropped. A timeout too long to add to an instant puts the deadline 30
+/// years out, as `tokio::time::sleep` does for such a duration, instead of
+/// panicking.
+#[cfg(feature = "broker")]
+pub(crate) fn poll_deadline(
+    start: tokio::time::Instant,
+    timeout: Duration,
+) -> tokio::time::Instant {
+    const FAR_FUTURE: Duration = Duration::from_secs(86_400 * 365 * 30);
+
+    start
+        .checked_add(timeout)
+        .unwrap_or_else(|| start + FAR_FUTURE)
+}
+
+/// Runs one poll read unless the poll `deadline` has come: no read starts
+/// at or after it, and a read started before it is dropped at it. Both end
+/// as the poll's own timeout, `timed_out()`. `read` is only called once the
+/// read may start, so not even a read that does its work when called runs
+/// past the deadline.
+#[cfg(feature = "wallet")]
+pub(crate) async fn read_before<T, E, F>(
+    deadline: tokio::time::Instant,
+    read: impl FnOnce() -> F,
+    timed_out: impl FnOnce() -> E,
+) -> Result<T, E>
+where
+    F: Future<Output = Result<T, E>>,
+{
+    if tokio::time::Instant::now() >= deadline {
+        return Err(timed_out());
+    }
+
+    tokio::time::timeout_at(deadline, read())
+        .await
+        .unwrap_or_else(|_| Err(timed_out()))
 }
 
 #[cfg(test)]

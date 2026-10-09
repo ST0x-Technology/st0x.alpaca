@@ -28,7 +28,8 @@ pub enum MarketSession {
 }
 
 /// Classifies the closure after the current extended session.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PostCloseGap {
     /// The next trading session begins on the following calendar day.
     OrdinaryOvernight,
@@ -43,7 +44,8 @@ pub enum PostCloseGap {
 
 /// Current market-session classification, with close metadata available only
 /// for an extended session.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct MarketSessionStatus {
     pub session: MarketSession,
     /// Earliest eligible broker session start for this calendar interval.

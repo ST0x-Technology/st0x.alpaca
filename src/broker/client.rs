@@ -16,6 +16,7 @@ use crate::auth::AuthRuntime;
 use crate::broker::{CancellationOutcome, ClientOrderId, FractionalShares, Positive, Symbol};
 use crate::endpoint::{EndpointRole, validate_origin};
 use crate::rate_limit::retry_after_from_response_headers;
+use crate::request_id;
 
 /// Request timeout applied to every Alpaca Broker API HTTP call.
 ///
@@ -250,7 +251,11 @@ impl AlpacaBrokerApiClient {
         &self,
         symbol: &Symbol,
     ) -> Result<AssetResponse, AlpacaBrokerApiError> {
-        let url = format!("{}/v1/assets/{symbol}", self.base_url);
+        let url = format!(
+            "{}/v1/assets/{}",
+            self.base_url,
+            urlencoding::encode(symbol.as_str())
+        );
         debug!("Fetching asset info for {symbol}");
         self.get(&url).await
     }
@@ -344,25 +349,24 @@ impl AlpacaBrokerApiClient {
         &self,
         url: &str,
     ) -> Result<T, AlpacaBrokerApiError> {
-        let response = self
+        let request = self
             .http_client
             .get(url)
-            .header(AUTHORIZATION, self.auth.broker_authorization().await?)
-            .send()
-            .await?;
+            .header(AUTHORIZATION, self.auth.broker_authorization().await?);
+        let response = request_id::send(request).await?;
 
         self.handle_response(Method::GET, response).await
     }
 
     /// Perform a DELETE request, expecting no response body.
     pub(super) async fn delete(&self, url: &str) -> Result<(), AlpacaBrokerApiError> {
-        let response = self
+        let request = self
             .http_client
             .delete(url)
-            .header(AUTHORIZATION, self.auth.broker_authorization().await?)
-            .send()
-            .await?;
+            .header(AUTHORIZATION, self.auth.broker_authorization().await?);
+        let response = request_id::send(request).await?;
         let status = response.status();
+        request_id::record(status, response.headers());
 
         if status.is_success() {
             return Ok(());
@@ -380,13 +384,12 @@ impl AlpacaBrokerApiClient {
         url: &str,
         body: &B,
     ) -> Result<T, AlpacaBrokerApiError> {
-        let response = self
+        let request = self
             .http_client
             .post(url)
             .json(body)
-            .header(AUTHORIZATION, self.auth.broker_authorization().await?)
-            .send()
-            .await?;
+            .header(AUTHORIZATION, self.auth.broker_authorization().await?);
+        let response = request_id::send(request).await?;
 
         self.handle_response(Method::POST, response).await
     }
@@ -397,6 +400,7 @@ impl AlpacaBrokerApiClient {
         response: reqwest::Response,
     ) -> Result<T, AlpacaBrokerApiError> {
         let status = response.status();
+        request_id::record(status, response.headers());
         let url = response.url().clone();
         // Captured before `response.bytes()` consumes the response --
         // headers are no longer readable afterward.
@@ -1009,6 +1013,77 @@ mod tests {
         mock.assert();
         assert!(
             matches!(err, AlpacaBrokerApiError::ApiError { status, .. } if status.as_u16() == 404)
+        );
+    }
+
+    /// The gateway audits each operation with its Alpaca traffic: the
+    /// request id of every answer on GET, DELETE and POST, refusals alike,
+    /// and the status of the last answer.
+    #[tokio::test]
+    async fn traffic_of_every_request_is_collected() {
+        let server = MockServer::start();
+        let account = server.mock(|when, then| {
+            when.method(GET)
+                .path(format!("/v1/trading/accounts/{TEST_ACCOUNT_ID}/account"));
+            then.status(200)
+                .header("content-type", "application/json")
+                .header("x-request-id", "read-answered")
+                .json_body(serde_json::json!({
+                    "id": TEST_ACCOUNT_ID.to_string(),
+                    "status": "ACTIVE"
+                }));
+        });
+        let order_id = uuid!("61e7b016-9c91-4a97-b912-615c9d365c9d");
+        let cancel = server.mock(|when, then| {
+            when.method(DELETE).path(format!(
+                "/v1/trading/accounts/{TEST_ACCOUNT_ID}/orders/{order_id}"
+            ));
+            then.status(422)
+                .header("content-type", "application/json")
+                .header("x-request-id", "cancel-refused")
+                .json_body(serde_json::json!({ "message": "order is not cancelable" }));
+        });
+        let journal = server.mock(|when, then| {
+            when.method(POST).path("/v1/journals");
+            then.status(500)
+                .header("content-type", "application/json")
+                .header("x-request-id", "journal-failed")
+                .json_body(serde_json::json!({ "message": "internal error" }));
+        });
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+        let quantity = Positive::new(FractionalShares::new(
+            Float::parse("1".to_string()).unwrap(),
+        ))
+        .unwrap();
+
+        let ((), traffic) = request_id::collect(async {
+            client.verify_account().await.unwrap();
+            client.cancel_order(order_id).await.unwrap_err();
+            client
+                .create_journal(
+                    DESTINATION_ACCOUNT_ID,
+                    &Symbol::new("AAPL").unwrap(),
+                    quantity,
+                )
+                .await
+                .unwrap_err();
+        })
+        .await;
+
+        account.assert();
+        cancel.assert();
+        journal.assert();
+        assert_eq!(
+            traffic,
+            request_id::Traffic {
+                request_ids: vec![
+                    "read-answered".to_string(),
+                    "cancel-refused".to_string(),
+                    "journal-failed".to_string(),
+                ],
+                last_status: Some(500),
+            }
         );
     }
 }

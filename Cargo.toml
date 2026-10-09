@@ -84,7 +84,7 @@ st0x-float-serde = { git = "https://github.com/ST0x-Technology/st0x.finance", ve
 st0x-finance = { git = "https://github.com/ST0x-Technology/st0x.finance", version = "0.3.0", optional = true, tag = "v0.3.0" }
 thiserror = "2"
 tracing = "0.1"
-tokio = { version = "1", features = ["time", "sync"] }
+tokio = { version = "1", features = ["rt", "time", "sync"] }
 url = "2"
 urlencoding = { version = "2", optional = true }
 uuid = { version = "1", features = ["serde", "v4", "v5"], optional = true }
@@ -111,12 +111,19 @@ tokio = { version = "1", features = [
   "macros",
   "net",
   "rt-multi-thread",
+  "test-util",
 ] }
 
-[lints.rust]
+[lints]
+workspace = true
+
+[workspace]
+members = ["crates/gateway-api", "crates/gateway"]
+
+[workspace.lints.rust]
 unsafe_code = "forbid"
 
-[lints.clippy]
+[workspace.lints.clippy]
 all = "deny"
 pedantic = "deny"
 unwrap_used = "deny"

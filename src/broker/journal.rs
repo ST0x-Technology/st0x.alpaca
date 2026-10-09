@@ -117,7 +117,7 @@ where
 }
 
 /// Status of an Alpaca journal entry.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum JournalStatus {
     Queued,

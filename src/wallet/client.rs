@@ -12,9 +12,10 @@ use super::transfer::{AlpacaTransferId, Network, TokenSymbol, TransferStatus};
 use super::whitelist::{TravelRuleInfo, WhitelistEntry, WhitelistStatus};
 use crate::auth::{AuthRuntime, KmsJwtError};
 use crate::broker::{AlpacaAccountId, Backpressure};
-use crate::core::AlpacaAuth;
+use crate::core::{AlpacaAuth, GatewayHopError, Permanence, response_status_permanence};
 use crate::endpoint::{EndpointError, EndpointRole, validate_origin};
 use crate::rate_limit::retry_after_from_response_headers;
+use crate::request_id::{GateClosed, SendError};
 
 #[derive(Debug, Error)]
 pub enum AlpacaWalletError {
@@ -86,14 +87,33 @@ pub enum AlpacaWalletError {
         previous: TransferStatus,
         next: TransferStatus,
     },
+    /// The hop to the Alpaca gateway failed or the gateway refused the call
+    /// without relaying an Alpaca answer. Backpressure only when the gateway
+    /// relayed a wait; the polls retry it only when the gateway classified it
+    /// as transient.
+    #[error(transparent)]
+    Gateway(#[from] GatewayHopError),
+    /// The caller's send gate held the request back: it never left.
+    #[error(transparent)]
+    NotSent(#[from] GateClosed),
+}
+
+impl From<SendError> for AlpacaWalletError {
+    fn from(error: SendError) -> Self {
+        match error {
+            SendError::Http(source) => Self::Reqwest(source),
+            SendError::NotSent(closed) => Self::NotSent(closed),
+        }
+    }
 }
 
 impl AlpacaWalletError {
-    /// Classifies this error as broker rate-limiting (HTTP 429), returning
-    /// its `Retry-After` hint when the broker sent one. Every other variant
-    /// returns `None` -- an exhaustive match so a new variant added later
-    /// forces a conscious decision here rather than silently classifying as
-    /// "not backpressure".
+    /// Classifies this error as rate limiting (a broker HTTP 429, a throttled
+    /// token mint, or a gateway hop that relayed a wait), returning the
+    /// `Retry-After` hint when one was sent. Every other variant returns
+    /// `None`: an exhaustive match so a new variant added later forces a
+    /// conscious decision here rather than silently classifying as "not
+    /// backpressure".
     #[must_use]
     pub fn backpressure(&self) -> Option<Backpressure> {
         match self {
@@ -111,8 +131,13 @@ impl AlpacaWalletError {
                 retry_after: error.retry_after(),
             }),
 
+            // The gateway relays a wait (a throttled credential mint behind
+            // it) as the hop's `retry_after`.
+            Self::Gateway(hop) => hop.backpressure(),
+
             Self::ApiError { .. }
             | Self::Reqwest(_)
+            | Self::NotSent(_)
             | Self::Auth(_)
             | Self::PrivateKeyJwtUnsupported
             | Self::InvalidBaseUrl(_)
@@ -131,7 +156,59 @@ impl AlpacaWalletError {
             | Self::InvalidDepositTransition { .. } => None,
         }
     }
+
+    /// Classifies whether a later call of the same request can plausibly
+    /// succeed, as `AlpacaBrokerApiError::permanence` does: an HTTP status by
+    /// the shared status rule, a request that never built or that a closed
+    /// send gate held back as permanent, any other transport failure and a
+    /// mint failure that is not deterministic as transient, a gateway hop by
+    /// the gateway's own classification, and everything decided from a
+    /// response already in hand (a body that does not parse, a missing
+    /// transfer, a concluded poll) or from configuration as permanent. An
+    /// exhaustive match, as [`Self::backpressure`] is.
+    #[must_use]
+    pub fn permanence(&self) -> Permanence {
+        match self {
+            Self::ApiError { status, .. } => response_status_permanence(*status),
+            // A request that never built fails the same way for the same
+            // inputs. Every other transport failure is transient, a body
+            // stream cut short included: reqwest reports that as a decode
+            // error, since `bytes()` wraps any body read failure that way,
+            // and a body that arrived whole but does not parse is
+            // `ParseError`.
+            Self::Reqwest(source) if source.is_builder() => Permanence::Permanent,
+            Self::Auth(error) if error.is_deterministic() => Permanence::Permanent,
+            Self::Reqwest(_) | Self::Auth(_) => Permanence::Transient,
+            Self::Gateway(hop) => hop.permanence(),
+
+            // A body that does not parse parses the same way on every read;
+            // a closed send gate stays closed for the rest of its scope, so
+            // a retry there is held back the same way; the rest are decided
+            // locally, from configuration or from a response already in
+            // hand, and are poll outcomes or refusals a fresh call cannot
+            // clear.
+            Self::NotSent(_)
+            | Self::ParseError(_)
+            | Self::Utf8(_)
+            | Self::FromHex(_)
+            | Self::PrivateKeyJwtUnsupported
+            | Self::InvalidBaseUrl(_)
+            | Self::TransferNotFound { .. }
+            | Self::FailedTransferHasTx { .. }
+            | Self::TransferFailed { .. }
+            | Self::CompletedTransferMissingTx { .. }
+            | Self::TransferTimeout { .. }
+            | Self::InvalidStatusTransition { .. }
+            | Self::AddressNotWhitelisted { .. }
+            | Self::NoWhitelistEntries { .. }
+            | Self::DepositTimeout { .. }
+            | Self::InvalidDepositTransition { .. } => Permanence::Permanent,
+        }
+    }
 }
+
+/// How long the wallet client waits for a connection.
+const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct AlpacaWalletClient {
     client: Client,
@@ -141,7 +218,9 @@ pub struct AlpacaWalletClient {
 }
 
 impl AlpacaWalletClient {
-    /// Builds the wallet HTTP client.
+    /// Builds the wallet HTTP client with a connection timeout and no total
+    /// request timeout. A timed out withdrawal POST is ambiguous and must
+    /// never invite an automatic retry.
     ///
     /// # Errors
     ///
@@ -154,12 +233,30 @@ impl AlpacaWalletClient {
         account_id: AlpacaAccountId,
         auth: AlpacaAuth,
     ) -> Result<Self, AlpacaWalletError> {
+        Self::build(base_url, account_id, auth, None)
+    }
+
+    pub(super) fn with_request_timeout(
+        base_url: String,
+        account_id: AlpacaAccountId,
+        auth: AlpacaAuth,
+        request_timeout: Duration,
+    ) -> Result<Self, AlpacaWalletError> {
+        Self::build(base_url, account_id, auth, Some(request_timeout))
+    }
+
+    fn build(
+        base_url: String,
+        account_id: AlpacaAccountId,
+        auth: AlpacaAuth,
+        request_timeout: Option<Duration>,
+    ) -> Result<Self, AlpacaWalletError> {
         // The wallet client carries a raw base_url with no mode, so JWT
         // credentials mint at the live authx endpoint. Basic and KmsJwt
-        // are production-only by construction; a private_key_jwt
-        // credential can belong to the sandbox, and minting it at the
-        // production authx answers a misleading 401 -- reject it here
-        // until the token URL is threaded from a mode-aware caller.
+        // are production only by construction. A private_key_jwt credential
+        // can belong to the sandbox, and minting it at the production authx
+        // answers a misleading 401. Reject it here until the token URL is
+        // threaded from a caller that knows the mode.
         match &auth {
             AlpacaAuth::PrivateKeyJwt { .. } => {
                 return Err(AlpacaWalletError::PrivateKeyJwtUnsupported);
@@ -171,10 +268,15 @@ impl AlpacaWalletClient {
 
         // Credentials ride on every request, so never follow a redirect to
         // a host the caller did not configure.
-        let client = Client::builder().redirect(Policy::none()).build()?;
+        let mut client = Client::builder()
+            .redirect(Policy::none())
+            .connect_timeout(HTTP_CONNECT_TIMEOUT);
+        if let Some(request_timeout) = request_timeout {
+            client = client.timeout(request_timeout);
+        }
 
         Ok(Self {
-            client,
+            client: client.build()?,
             account_id,
             base_url,
             auth: AuthRuntime::build(auth, crate::auth::ALPACA_TOKEN_URL)?,
@@ -186,7 +288,7 @@ impl AlpacaWalletClient {
         trace!(target: "wallet", "GET {url}");
 
         let request = self.auth.apply_wallet(self.client.get(&url)).await?;
-        let response = request.send().await?;
+        let response = crate::request_id::send(request).await?;
 
         read_response_body(Method::GET, response).await
     }
@@ -202,34 +304,48 @@ impl AlpacaWalletClient {
         // The legacy pair sends both Basic auth AND the APCA headers (the
         // wallet endpoints historically wanted both); keyless sends the
         // bearer token. AuthRuntime::apply_wallet owns that split.
-        let request = self.auth.apply_wallet(self.client.post(&url)).await?;
-        let response = request.json(body).send().await?;
+        let request = self
+            .auth
+            .apply_wallet(self.client.post(&url))
+            .await?
+            .json(body);
+        let response = crate::request_id::send(request).await?;
 
         read_response_body(Method::POST, response).await
     }
 
-    pub(super) async fn delete(&self, path: &str) -> Result<String, AlpacaWalletError> {
+    /// Sends a DELETE whose success answer carries nothing the caller needs.
+    /// It completes once Alpaca answered a success status, without reading
+    /// the body (see [`confirm_write`]).
+    pub(super) async fn delete(&self, path: &str) -> Result<(), AlpacaWalletError> {
         let url = format!("{}{}", self.base_url, path);
         trace!(target: "wallet", "DELETE {url}");
 
         let request = self.auth.apply_wallet(self.client.delete(&url)).await?;
-        let response = request.send().await?;
+        let response = crate::request_id::send(request).await?;
 
-        read_response_body(Method::DELETE, response).await
+        confirm_write(Method::DELETE, response).await
     }
 
+    /// Sends a PATCH whose success answer carries nothing the caller needs.
+    /// It completes once Alpaca answered a success status, without reading
+    /// the body (see [`confirm_write`]).
     pub(super) async fn patch<T: serde::Serialize + Sync>(
         &self,
         path: &str,
         body: &T,
-    ) -> Result<String, AlpacaWalletError> {
+    ) -> Result<(), AlpacaWalletError> {
         let url = format!("{}{}", self.base_url, path);
         trace!(target: "wallet", "PATCH {url}");
 
-        let request = self.auth.apply_wallet(self.client.patch(&url)).await?;
-        let response = request.json(body).send().await?;
+        let request = self
+            .auth
+            .apply_wallet(self.client.patch(&url))
+            .await?
+            .json(body);
+        let response = crate::request_id::send(request).await?;
 
-        read_response_body(Method::PATCH, response).await
+        confirm_write(Method::PATCH, response).await
     }
 
     pub(super) fn account_id(&self) -> &AlpacaAccountId {
@@ -310,8 +426,7 @@ impl AlpacaWalletClient {
             self.account_id, whitelist_id
         );
 
-        self.delete(&path).await?;
-        Ok(())
+        self.delete(&path).await
     }
 
     /// Updates travel rule info on an existing whitelisted address.
@@ -335,9 +450,31 @@ impl AlpacaWalletClient {
             self.account_id, whitelist_id
         );
 
-        self.patch(&path, &Request { travel_rule_info }).await?;
-        Ok(())
+        self.patch(&path, &Request { travel_rule_info }).await
     }
+}
+
+/// Completes a write whose success body the caller discards: a success
+/// status confirms it, so it returns at once with the body unread, and a
+/// success body that is cut short, is not UTF-8, or never ends cannot turn
+/// a write Alpaca confirmed into a failure. An error status reads the body
+/// through [`read_response_body`] for its message.
+async fn confirm_write(method: Method, response: Response) -> Result<(), AlpacaWalletError> {
+    let status = response.status();
+    if !status.is_success() {
+        return read_response_body(method, response).await.map(drop);
+    }
+
+    crate::request_id::record(status, response.headers());
+    trace!(
+        target: "wallet",
+        %method,
+        status = %status,
+        url = %response.url(),
+        "Alpaca wallet API write confirmed; success body not read"
+    );
+
+    Ok(())
 }
 
 async fn read_response_body(
@@ -345,6 +482,7 @@ async fn read_response_body(
     response: Response,
 ) -> Result<String, AlpacaWalletError> {
     let status = response.status();
+    crate::request_id::record(status, response.headers());
     let url = response.url().clone();
     let retry_after = retry_after_from_response_headers(response.headers());
     // Read raw bytes and convert the success body with `String::from_utf8` so
@@ -354,9 +492,9 @@ async fn read_response_body(
     let bytes = match response.bytes().await {
         Ok(bytes) => bytes,
         // Preserve the HTTP status on a non-success response even if the body
-        // stream fails to read, so the poll retry predicate (which only retries
-        // `ApiError { status }` with `status.is_server_error()`) still fires on
-        // a transient 5xx. Mirrors the pre-refactor `.text().unwrap_or_else(..)`.
+        // stream fails to read, so the polls classify it by its status (a
+        // 4xx stays permanent, a 5xx transient) rather than as a body read
+        // failure. Mirrors the `.text().unwrap_or_else(..)` this replaced.
         Err(_) if !status.is_success() => {
             return Err(AlpacaWalletError::ApiError {
                 status,
@@ -475,6 +613,33 @@ mod tests {
         .unwrap();
 
         assert_eq!(*client.account_id(), TEST_ACCOUNT_ID);
+    }
+
+    #[tokio::test]
+    async fn a_stalled_wallet_write_ends_at_the_request_timeout() {
+        let server = MockServer::start();
+        let write = server.mock(|when, then| {
+            when.method(POST).path("/stalled");
+            then.status(200).delay(Duration::from_secs(1)).body("{}");
+        });
+        let client = AlpacaWalletClient::with_request_timeout(
+            server.base_url(),
+            TEST_ACCOUNT_ID,
+            AlpacaAuth::Basic {
+                api_key: "test_key_id".to_string(),
+                api_secret: "test_secret_key".to_string(),
+            },
+            Duration::from_millis(100),
+        )
+        .unwrap();
+
+        let error = client.post("/stalled", &json!({})).await.unwrap_err();
+
+        assert!(
+            matches!(&error, AlpacaWalletError::Reqwest(source) if source.is_timeout()),
+            "{error:?}"
+        );
+        write.assert_calls(1);
     }
 
     #[test]
@@ -724,6 +889,55 @@ mod tests {
         let error = client.get("/v1/server_error").await.unwrap_err();
 
         assert_eq!(error.backpressure(), None);
+    }
+
+    /// A request that never built, or a body that arrived whole and does not
+    /// parse, fails the same way on every call, so it is permanent, unlike a
+    /// server error or a connection that failed; a gateway hop keeps the
+    /// gateway's own classification.
+    #[tokio::test]
+    async fn permanence_is_permanent_for_an_unbuilt_request_and_transient_for_a_transport_failure()
+    {
+        let unbuilt = Client::new().get("not a valid URL").build().unwrap_err();
+        assert!(unbuilt.is_builder());
+
+        let permanent = [
+            AlpacaWalletError::Reqwest(unbuilt),
+            AlpacaWalletError::ParseError(
+                serde_json::from_str::<serde_json::Value>("{").unwrap_err(),
+            ),
+            AlpacaWalletError::Utf8(String::from_utf8(vec![0xff]).unwrap_err()),
+            AlpacaWalletError::FromHex(FromHexError::OddLength),
+        ];
+        for error in permanent {
+            assert_eq!(error.permanence(), Permanence::Permanent, "{error:?}");
+        }
+
+        let unanswered = Client::new()
+            .get("http://127.0.0.1:1/")
+            .send()
+            .await
+            .unwrap_err();
+        let transient = [
+            AlpacaWalletError::Reqwest(unanswered),
+            AlpacaWalletError::ApiError {
+                status: StatusCode::BAD_GATEWAY,
+                message: String::new(),
+                retry_after: None,
+            },
+        ];
+        for error in transient {
+            assert_eq!(error.permanence(), Permanence::Transient, "{error:?}");
+        }
+
+        let hop = |retryable| {
+            AlpacaWalletError::Gateway(GatewayHopError {
+                retryable,
+                ..GatewayHopError::transport("gateway unavailable")
+            })
+        };
+        assert_eq!(hop(true).permanence(), Permanence::Transient);
+        assert_eq!(hop(false).permanence(), Permanence::Permanent);
     }
 
     #[tokio::test]
@@ -1081,5 +1295,38 @@ mod tests {
             .unwrap();
 
         patch_mock.assert();
+    }
+
+    #[tokio::test]
+    async fn a_void_whitelist_write_answered_with_an_error_status_fails_with_its_body() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(DELETE).path(format!(
+                "/v1/accounts/{TEST_ACCOUNT_ID}/wallets/whitelists/wl-1"
+            ));
+            then.status(422)
+                .json_body(json!({ "message": "whitelist entry is in use" }));
+        });
+        let client = AlpacaWalletClient::new(
+            server.base_url(),
+            TEST_ACCOUNT_ID,
+            AlpacaAuth::Basic {
+                api_key: "test_key_id".to_string(),
+                api_secret: "test_secret_key".to_string(),
+            },
+        )
+        .unwrap();
+
+        let error = client.delete_whitelist_entry("wl-1").await.unwrap_err();
+
+        assert!(
+            matches!(
+                &error,
+                AlpacaWalletError::ApiError { status, message, .. }
+                    if *status == StatusCode::UNPROCESSABLE_ENTITY
+                        && message.contains("whitelist entry is in use")
+            ),
+            "{error:?}"
+        );
     }
 }

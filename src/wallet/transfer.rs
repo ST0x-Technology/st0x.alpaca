@@ -97,7 +97,7 @@ impl TransferStatus {
 }
 
 /// Transfer response from Alpaca Crypto Wallets API.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Transfer {
     pub id: AlpacaTransferId,
     #[serde(rename = "tx_hash", default)]
@@ -313,18 +313,6 @@ pub(super) async fn find_deposit_by_tx_hash(
     client: &AlpacaWalletClient,
     tx_hash: &TxHash,
 ) -> Result<Option<Transfer>, AlpacaWalletError> {
-    scan_transfer_list_by_tx_hash(client, tx_hash, Some(TransferDirection::Incoming)).await
-}
-
-/// Chain-neutral scan of the account-wide transfer list for a tx-hash match,
-/// optionally constrained to one direction. Shared by both hash lookups so a
-/// foreign-chain row is skipped in one place instead of failing whichever
-/// caller deserializes the full list.
-async fn scan_transfer_list_by_tx_hash(
-    client: &AlpacaWalletClient,
-    tx_hash: &TxHash,
-    direction: Option<TransferDirection>,
-) -> Result<Option<Transfer>, AlpacaWalletError> {
     let path = format!("/v1/accounts/{}/wallets/transfers", client.account_id());
 
     let body = client.get(&path).await?;
@@ -347,7 +335,7 @@ async fn scan_transfer_list_by_tx_hash(
                 }
             };
 
-            direction.is_none_or(|wanted| key.direction == wanted)
+            key.direction == TransferDirection::Incoming
                 && key
                     .tx
                     .is_some_and(|raw| raw.parse::<TxHash>().ok().as_ref() == Some(tx_hash))
@@ -367,16 +355,60 @@ struct TransferListKey {
     direction: TransferDirection,
 }
 
-/// Finds a transfer by its transaction hash, in either direction.
+/// The transfer reads the wallet polls make: one transfer by id, and one
+/// incoming deposit by its onchain transaction hash.
 ///
-/// Scans the account-wide list through the shared chain-neutral scan, so a
-/// foreign-chain row cannot fail the lookup. Returns the first match or
-/// None if no transfer with that tx hash exists.
-pub(super) async fn find_transfer_by_tx_hash(
-    client: &AlpacaWalletClient,
-    tx_hash: &TxHash,
-) -> Result<Option<Transfer>, AlpacaWalletError> {
-    scan_transfer_list_by_tx_hash(client, tx_hash, None).await
+/// [`AlpacaWalletService`](super::AlpacaWalletService) answers them from
+/// Alpaca directly; a gateway client answers them through the gateway. The
+/// poll functions ([`poll_transfer_until_complete_with`],
+/// [`poll_transfer_tx_hash_with`], [`poll_deposit_by_tx_hash_with`]) run over
+/// either.
+///
+/// [`poll_transfer_until_complete_with`]: super::poll_transfer_until_complete_with
+/// [`poll_transfer_tx_hash_with`]: super::poll_transfer_tx_hash_with
+/// [`poll_deposit_by_tx_hash_with`]: super::poll_deposit_by_tx_hash_with
+pub trait WalletTransfers {
+    /// One transfer by id, without its fee fields.
+    ///
+    /// # Errors
+    ///
+    /// `TransferNotFound`, or the transport, API or parse error.
+    fn get_transfer(
+        &self,
+        transfer_id: &AlpacaTransferId,
+    ) -> impl Future<Output = Result<Transfer, AlpacaWalletError>> + Send;
+
+    /// The first incoming transfer on the account's transfer list carrying
+    /// `tx_hash`, or `None` when the list holds none. An outgoing transfer
+    /// with the same hash is never the deposit and never shadows the
+    /// incoming one behind it. Only the matched row may fail the lookup:
+    /// every other row (one on another chain, or one that does not parse as
+    /// a [`Transfer`]) is skipped, as the direct scan skips it.
+    ///
+    /// # Errors
+    ///
+    /// Returns the transport, API or parse error of the list read, or the
+    /// parse error of the matched row.
+    fn find_deposit_by_tx_hash(
+        &self,
+        tx_hash: &TxHash,
+    ) -> impl Future<Output = Result<Option<Transfer>, AlpacaWalletError>> + Send;
+}
+
+impl WalletTransfers for AlpacaWalletClient {
+    fn get_transfer(
+        &self,
+        transfer_id: &AlpacaTransferId,
+    ) -> impl Future<Output = Result<Transfer, AlpacaWalletError>> + Send {
+        get_transfer_status(self, transfer_id)
+    }
+
+    fn find_deposit_by_tx_hash(
+        &self,
+        tx_hash: &TxHash,
+    ) -> impl Future<Output = Result<Option<Transfer>, AlpacaWalletError>> + Send {
+        find_deposit_by_tx_hash(self, tx_hash)
+    }
 }
 
 #[cfg(test)]
@@ -1018,186 +1050,6 @@ mod tests {
         assert_eq!(network.as_ref(), "ethereum");
     }
 
-    #[tokio::test]
-    async fn test_find_transfer_by_tx_hash_found() {
-        let server = MockServer::start();
-        let tx_hash: TxHash =
-            fixed_bytes!("0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890");
-        let transfer_id = Uuid::new_v4();
-
-        let transfers_mock = server.mock(|when, then| {
-            when.method(GET)
-                .path(format!("/v1/accounts/{TEST_ACCOUNT_ID}/wallets/transfers"));
-            then.status(200)
-                .header("content-type", "application/json")
-                .json_body(json!([
-                    {
-                        "id": Uuid::new_v4(),
-                        "direction": "OUTGOING",
-                        "amount": "100",
-                        "usd_value": "99.98",
-                        "chain": "ETH",
-                        "asset": "USDC",
-                        "from_address": "0xabcdef1234567890abcdef1234567890abcdef12",
-                        "to_address": "0x1234567890abcdef1234567890abcdef12345678",
-                        "status": "COMPLETE",
-                        "tx_hash": "0x1111111111111111111111111111111111111111111111111111111111111111",
-                        "created_at": "2024-01-01T00:00:00Z",
-                        "network_fee": "0",
-                        "fees": "0"
-                    },
-                    {
-                        "id": transfer_id,
-                        "direction": "INCOMING",
-                        "amount": "500",
-                        "usd_value": "499.90",
-                        "chain": "ETH",
-                        "asset": "USDC",
-                        "from_address": "0x9999999999999999999999999999999999999999",
-                        "to_address": "0x1234567890abcdef1234567890abcdef12345678",
-                        "status": "COMPLETE",
-                        "tx_hash": tx_hash,
-                        "created_at": "2024-01-02T00:00:00Z",
-                        "network_fee": "0.5",
-                        "fees": "0"
-                    }
-                ]));
-        });
-
-        let client = AlpacaWalletClient::new(
-            server.base_url(),
-            TEST_ACCOUNT_ID,
-            AlpacaAuth::Basic {
-                api_key: "test_key_id".to_string(),
-                api_secret: "test_secret_key".to_string(),
-            },
-        )
-        .unwrap();
-
-        let transfer = find_transfer_by_tx_hash(&client, &tx_hash)
-            .await
-            .unwrap()
-            .unwrap();
-
-        assert_eq!(transfer.id, AlpacaTransferId::from(transfer_id));
-        assert_eq!(transfer.tx, Some(tx_hash));
-        assert_eq!(transfer.status, TransferStatus::Complete);
-
-        transfers_mock.assert();
-    }
-
-    #[tokio::test]
-    async fn test_find_transfer_by_tx_hash_not_found() {
-        let server = MockServer::start();
-        let tx_hash: TxHash =
-            fixed_bytes!("0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890");
-
-        let transfers_mock = server.mock(|when, then| {
-            when.method(GET)
-                .path(format!("/v1/accounts/{TEST_ACCOUNT_ID}/wallets/transfers"));
-            then.status(200)
-                .header("content-type", "application/json")
-                .json_body(json!([
-                    {
-                        "id": Uuid::new_v4(),
-                        "direction": "OUTGOING",
-                        "amount": "100",
-                        "usd_value": "99.98",
-                        "chain": "ETH",
-                        "asset": "USDC",
-                        "from_address": "0xabcdef1234567890abcdef1234567890abcdef12",
-                        "to_address": "0x1234567890abcdef1234567890abcdef12345678",
-                        "status": "COMPLETE",
-                        "tx_hash": "0x2222222222222222222222222222222222222222222222222222222222222222",
-                        "created_at": "2024-01-01T00:00:00Z",
-                        "network_fee": "0",
-                        "fees": "0"
-                    }
-                ]));
-        });
-
-        let client = AlpacaWalletClient::new(
-            server.base_url(),
-            TEST_ACCOUNT_ID,
-            AlpacaAuth::Basic {
-                api_key: "test_key_id".to_string(),
-                api_secret: "test_secret_key".to_string(),
-            },
-        )
-        .unwrap();
-
-        let result = find_transfer_by_tx_hash(&client, &tx_hash).await.unwrap();
-
-        assert!(result.is_none());
-
-        transfers_mock.assert();
-    }
-
-    #[tokio::test]
-    async fn test_find_transfer_by_tx_hash_empty_list() {
-        let server = MockServer::start();
-        let tx_hash: TxHash =
-            fixed_bytes!("0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890");
-
-        let transfers_mock = server.mock(|when, then| {
-            when.method(GET)
-                .path(format!("/v1/accounts/{TEST_ACCOUNT_ID}/wallets/transfers"));
-            then.status(200)
-                .header("content-type", "application/json")
-                .json_body(json!([]));
-        });
-
-        let client = AlpacaWalletClient::new(
-            server.base_url(),
-            TEST_ACCOUNT_ID,
-            AlpacaAuth::Basic {
-                api_key: "test_key_id".to_string(),
-                api_secret: "test_secret_key".to_string(),
-            },
-        )
-        .unwrap();
-
-        let result = find_transfer_by_tx_hash(&client, &tx_hash).await.unwrap();
-
-        assert!(result.is_none());
-
-        transfers_mock.assert();
-    }
-
-    #[tokio::test]
-    async fn test_find_transfer_by_tx_hash_api_error() {
-        let server = MockServer::start();
-        let tx_hash: TxHash =
-            fixed_bytes!("0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890");
-
-        let transfers_mock = server.mock(|when, then| {
-            when.method(GET)
-                .path(format!("/v1/accounts/{TEST_ACCOUNT_ID}/wallets/transfers"));
-            then.status(500).body("Internal Server Error");
-        });
-
-        let client = AlpacaWalletClient::new(
-            server.base_url(),
-            TEST_ACCOUNT_ID,
-            AlpacaAuth::Basic {
-                api_key: "test_key_id".to_string(),
-                api_secret: "test_secret_key".to_string(),
-            },
-        )
-        .unwrap();
-
-        let error = find_transfer_by_tx_hash(&client, &tx_hash)
-            .await
-            .unwrap_err();
-
-        assert!(matches!(
-            error,
-            AlpacaWalletError::ApiError { status, .. } if status == 500
-        ));
-
-        transfers_mock.assert();
-    }
-
     #[test]
     fn pending_and_processing_are_pending_statuses() {
         assert!(TransferStatus::Pending.is_pending());
@@ -1489,46 +1341,6 @@ mod tests {
         assert_eq!(transfer.direction, TransferDirection::Incoming);
     }
 
-    /// The direction-agnostic hash lookup shares the chain-neutral scan, so a
-    /// non-EVM row in the account-wide list must not fail the whole lookup.
-    #[tokio::test]
-    async fn find_transfer_skips_non_evm_rows_in_mixed_chain_list() {
-        let server = MockServer::start();
-        server.mock(|when, then| {
-            when.method(GET)
-                .path(format!("/v1/accounts/{TEST_ACCOUNT_ID}/wallets/transfers"));
-            then.status(200)
-                .header("content-type", "application/json")
-                .json_body(json!([
-                    {
-                        "id": Uuid::new_v4(),
-                        "direction": "OUTGOING",
-                        "amount": "2.5",
-                        "usd_value": "500",
-                        "chain": "solana",
-                        "asset": "SOL",
-                        "from_address": "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin",
-                        "to_address": "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d",
-                        "status": "COMPLETE",
-                        "tx_hash": "5wHu1qwD4kKKyN1EEPBLRZ8hUvmCwF9zPSNdPCVBLcNq\
-                                    QwR8DXCzB1FLZniqW6cBGXbmMDvBhSf5aG1qNW7Wj2Vt",
-                        "created_at": "2024-01-01T00:00:00Z",
-                        "network_fee": "0",
-                        "fees": "0"
-                    },
-                    transfer_list_entry(DEPOSIT_TX, "OUTGOING", "COMPLETE"),
-                ]));
-        });
-
-        let transfer = find_transfer_by_tx_hash(&test_wallet_client(&server), &DEPOSIT_TX)
-            .await
-            .unwrap()
-            .expect("the EVM transfer behind the non-EVM row must be found");
-
-        assert_eq!(transfer.tx, Some(DEPOSIT_TX));
-        assert_eq!(transfer.direction, TransferDirection::Outgoing);
-    }
-
     #[tokio::test]
     async fn find_deposit_returns_none_when_undetected() {
         let server = MockServer::start();
@@ -1545,5 +1357,48 @@ mod tests {
             .unwrap();
 
         assert_eq!(found.map(|transfer| transfer.id), None);
+    }
+
+    /// A failed list read is the lookup's error, never `None`: an empty
+    /// answer would claim the deposit is not listed.
+    #[tokio::test]
+    async fn find_deposit_returns_the_error_of_a_failed_list_read() {
+        let server = MockServer::start();
+        let transfers_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path(format!("/v1/accounts/{TEST_ACCOUNT_ID}/wallets/transfers"));
+            then.status(500).body("Internal Server Error");
+        });
+
+        let error = find_deposit_by_tx_hash(&test_wallet_client(&server), &DEPOSIT_TX)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, AlpacaWalletError::ApiError { status, .. } if status == 500),
+            "{error:?}"
+        );
+        transfers_mock.assert();
+    }
+
+    /// Only the matched row is parsed as a full transfer, and a parse failure
+    /// there is an error: answering `None` would claim no such transfer.
+    #[tokio::test]
+    async fn find_deposit_fails_on_an_unparsable_matched_row() {
+        let server = MockServer::start();
+        let mut broken = transfer_list_entry(DEPOSIT_TX, "INCOMING", "COMPLETE");
+        broken["amount"] = json!("not a number");
+        server.mock(|when, then| {
+            when.method(GET)
+                .path(format!("/v1/accounts/{TEST_ACCOUNT_ID}/wallets/transfers"));
+            then.status(200).json_body(json!([broken]));
+        });
+
+        let scanned = find_deposit_by_tx_hash(&test_wallet_client(&server), &DEPOSIT_TX).await;
+
+        assert!(
+            matches!(scanned, Err(AlpacaWalletError::ParseError(_))),
+            "{scanned:?}"
+        );
     }
 }
