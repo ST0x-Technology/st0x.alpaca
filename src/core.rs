@@ -548,7 +548,6 @@ fn may_have_reached_alpaca(error: &AlpacaError) -> bool {
         | AlpacaError::RequestNotFound { .. } => false,
     }
 }
-
 /// A failure on the hop between a gateway client and the Alpaca gateway: no
 /// answer, a timeout, the gateway itself unavailable, or a refusal the
 /// gateway decided without relaying an Alpaca answer. Every error type a
