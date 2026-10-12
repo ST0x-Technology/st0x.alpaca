@@ -193,6 +193,8 @@ impl AlpacaWalletService {
     /// - The transfer times out
     /// - An invalid status regression is detected
     /// - The API call fails persistently
+    /// - A throttled read's wait reaches the timeout (the throttle is
+    ///   returned with its hint)
     pub async fn poll_transfer_until_complete(
         &self,
         transfer_id: &AlpacaTransferId,
@@ -236,6 +238,8 @@ impl AlpacaWalletService {
     /// Returns an error if:
     /// - The deposit times out (not detected within timeout)
     /// - The API call fails persistently
+    /// - A throttled lookup's wait reaches the timeout (the throttle is
+    ///   returned with its hint)
     pub async fn poll_deposit_by_tx_hash(
         &self,
         tx_hash: &TxHash,

@@ -73,22 +73,37 @@ async fn place_market(
     call: Call,
     Body(request): Body<MarketOrderRequest>,
 ) -> Response {
-    let intent = Intent::of(&request)
+    let mut intent = Intent::of(&request)
         .key(&request.client_order_id)
         .reason(request.reason.as_deref())
         .note("symbol", &request.symbol)
         .note("side", &request.direction)
         .note("quantity", &request.shares);
+    if let Some(time_in_force) = request.time_in_force {
+        intent = intent.note("timeInForce", &time_in_force);
+    }
     let tier = call.principal.tier;
     state
         .run(call, intent, move |state, _| async move {
             require_key_form(tier, &request.client_order_id)?;
-            state
-                .broker
-                .place_market_order_reporting(request.into())
-                .await
-                .map(placed)
-                .map_err(|failure| placement(&failure))
+            let outcome = match request.time_in_force {
+                Some(time_in_force) => {
+                    state
+                        .broker
+                        .place_market_order_with_time_in_force_reporting(
+                            request.into(),
+                            time_in_force,
+                        )
+                        .await
+                }
+                None => {
+                    state
+                        .broker
+                        .place_market_order_reporting(request.into())
+                        .await
+                }
+            };
+            outcome.map(placed).map_err(|failure| placement(&failure))
         })
         .await
 }

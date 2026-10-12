@@ -39,8 +39,8 @@ use st0x_alpaca::broker::{
     AlpacaMarketDataError, AssetDetails, CONVERSION_POLL_INTERVAL, CancellationOutcome,
     ClientOrderId, ConversionOrder, ConversionOrders, CryptoOrderResponse, IndicativeQuote,
     Inventory, LatestQuote, LimitOrder, MarketOrder, MarketSession, MarketSessionStatus,
-    OrderPlacement, OrderState, PreparedShares, RecoveredOrderPlacement, convert_usdc_usd_with,
-    poll_conversion_to_terminal_with,
+    OrderPlacement, OrderState, PreparedShares, RecoveredOrderPlacement, TimeInForce,
+    convert_usdc_usd_with, poll_conversion_to_terminal_with,
 };
 use st0x_alpaca::core::Network as Chain;
 use st0x_alpaca::st0x_finance::{FractionalShares, Positive, Symbol, Usd, Usdc};
@@ -613,6 +613,28 @@ impl<Token: TokenSource> GatewayBroker<Token> {
         reason: Option<&str>,
     ) -> Result<OrderPlacement<String>, AlpacaBrokerApiError> {
         let request = MarketOrderRequest::new(order, reason.map(str::to_string));
+        self.call(Operation::OrdersPlaceMarket, &[], NONE, Some(&request))
+            .await
+    }
+
+    /// [`Self::place_market_order`] with `time_in_force` for this order
+    /// instead of the gateway's configured one, as
+    /// `AlpacaBrokerApi::place_market_order_with_time_in_force_reporting`.
+    /// [`Self::place_market_order`] sends no `timeInForce` at all.
+    ///
+    /// # Errors
+    ///
+    /// See the module docs.
+    pub async fn place_market_order_with_time_in_force(
+        &self,
+        order: MarketOrder,
+        time_in_force: TimeInForce,
+        reason: Option<&str>,
+    ) -> Result<OrderPlacement<String>, AlpacaBrokerApiError> {
+        let request = MarketOrderRequest {
+            time_in_force: Some(time_in_force),
+            ..MarketOrderRequest::new(order, reason.map(str::to_string))
+        };
         self.call(Operation::OrdersPlaceMarket, &[], NONE, Some(&request))
             .await
     }
@@ -1249,6 +1271,7 @@ impl<Token: TokenSource> TokenizationLookups for GatewayTokenization<Token> {
 mod tests {
     use serde_json::json;
     use st0x_alpaca::Permanence;
+    use st0x_alpaca::broker::Direction;
 
     use super::*;
     use crate::Tier;
@@ -1822,5 +1845,68 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    /// `place_market_order` sends no `timeInForce`, so a gateway that
+    /// predates the field still takes the body; only
+    /// `place_market_order_with_time_in_force` names one.
+    #[tokio::test]
+    async fn a_market_order_names_its_time_in_force_only_when_the_caller_sets_it() {
+        let server = httpmock::MockServer::start_async().await;
+        let broker = GatewayClient::new(&server.base_url(), Tier::Bot, StaticToken("token".into()))
+            .unwrap()
+            .broker();
+        let key = "66666666-6666-4666-8666-666666666666";
+        let order = MarketOrder {
+            symbol: Symbol::new("AAPL").unwrap(),
+            shares: serde_json::from_value(json!("7")).unwrap(),
+            direction: Direction::Buy,
+            client_order_id: ClientOrderId::from_uuid(key.parse().unwrap()),
+        };
+        let placed = json!({
+            "orderId": "7b3f5c1e-2d4a-4b6c-8e9f-0a1b2c3d4e5f",
+            "symbol": "AAPL",
+            "shares": "7",
+            "direction": "buy",
+            "placedAt": "2026-09-17T10:15:29Z",
+            "extendedHours": false,
+            "limitPrice": null
+        });
+        let request = json!({
+            "symbol": "AAPL",
+            "shares": "7",
+            "direction": "buy",
+            "clientOrderId": key,
+            "reason": null
+        });
+        let mut market_on_close = request.clone();
+        market_on_close["timeInForce"] = json!("market_on_close");
+        let configured = server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST).json_body(request);
+                then.status(200).json_body(placed.clone());
+            })
+            .await;
+        let explicit = server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST)
+                    .json_body(market_on_close);
+                then.status(200).json_body(placed);
+            })
+            .await;
+
+        broker
+            .place_market_order(order.clone(), None)
+            .await
+            .unwrap();
+        configured.assert_calls_async(1).await;
+        explicit.assert_calls_async(0).await;
+
+        broker
+            .place_market_order_with_time_in_force(order, TimeInForce::MarketOnClose, None)
+            .await
+            .unwrap();
+        configured.assert_calls_async(1).await;
+        explicit.assert_calls_async(1).await;
     }
 }

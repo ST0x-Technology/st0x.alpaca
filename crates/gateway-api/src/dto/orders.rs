@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use st0x_alpaca::broker::{
     AlpacaBrokerApiError, AlpacaLimitOrder, AlpacaLimitPrice, CancellationOutcome, ClientOrderId,
     ConversionOrder, CryptoOrderResponse, Direction, LimitOrder, MarketOrder, OrderPlacement,
-    RecoveredOrderPlacement,
+    RecoveredOrderPlacement, TimeInForce,
 };
 use st0x_alpaca::st0x_finance::{FractionalShares, Positive, Symbol, Usd, Usdc};
 
@@ -19,6 +19,11 @@ pub struct MarketOrderRequest {
     pub direction: Direction,
     pub client_order_id: ClientOrderId,
     pub reason: Option<String>,
+    /// `day` or `market_on_close` for this order; absent places it with the
+    /// deployment's configured time in force. Left out of the body when
+    /// absent, so a gateway that predates the field still takes the request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_in_force: Option<TimeInForce>,
 }
 
 impl From<MarketOrderRequest> for MarketOrder {
@@ -43,6 +48,7 @@ impl MarketOrderRequest {
             direction: order.direction,
             client_order_id: order.client_order_id,
             reason,
+            time_in_force: None,
         }
     }
 }
@@ -295,6 +301,41 @@ mod tests {
         .unwrap();
         let order = AlpacaLimitOrder::try_from(through_wire(&exact)).unwrap();
         assert_eq!(LimitOrderRequest::exact(order, "manual hedge"), exact);
+    }
+
+    /// A market order without `timeInForce` keeps the body it had before the
+    /// field existed; with it, the value survives the wire, and a value the
+    /// library does not name is refused.
+    #[test]
+    fn market_order_time_in_force_is_optional_and_left_out_when_absent() {
+        let order = json!({
+            "symbol": "AAPL",
+            "shares": "7",
+            "direction": "buy",
+            "clientOrderId": "cli-66666666-6666-4666-8666-666666666666",
+            "reason": "close auction"
+        });
+        let absent: MarketOrderRequest = serde_json::from_value(order.clone()).unwrap();
+        assert_eq!(absent.time_in_force, None);
+        assert_eq!(serde_json::to_value(&absent).unwrap(), order);
+
+        for (wire, time_in_force) in [
+            ("day", TimeInForce::Day),
+            ("market_on_close", TimeInForce::MarketOnClose),
+        ] {
+            let mut with = order.clone();
+            with["timeInForce"] = json!(wire);
+            let request: MarketOrderRequest = serde_json::from_value(with.clone()).unwrap();
+            assert_eq!(request.time_in_force, Some(time_in_force));
+            assert_eq!(serde_json::to_value(&request).unwrap(), with);
+            assert_eq!(through_wire(&request), request);
+        }
+
+        for refused in ["cls", "market-on-close", "gtc"] {
+            let mut with = order.clone();
+            with["timeInForce"] = json!(refused);
+            serde_json::from_value::<MarketOrderRequest>(with).unwrap_err();
+        }
     }
 
     #[test]

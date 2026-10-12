@@ -197,6 +197,47 @@ async fn each_placement_route_sends_its_alpaca_order_and_is_audited_as_applied()
     }
 }
 
+/// A market order's `timeInForce` reaches Alpaca in its wire spelling and is
+/// noted in the audit record; without one the order takes the configured
+/// time in force, not `day`.
+#[tokio::test]
+async fn a_market_order_time_in_force_overrides_the_configured_one_for_that_order() {
+    let configured_close = "time_in_force = \"market_on_close\"";
+    for (broker, requested, sent, noted) in [
+        ("", Some("market_on_close"), "cls", Some("market-on-close")),
+        (configured_close, None, "cls", None),
+        (configured_close, Some("day"), "day", Some("day")),
+    ] {
+        let harness = Harness::start_with_broker(broker).await;
+        serve_tradable_asset(&harness);
+        let mut request = market_order(CLIENT_UUID);
+        if let Some(requested) = requested {
+            request["timeInForce"] = json!(requested);
+        }
+        let mut expected = alpaca_market_order(CLIENT_UUID);
+        expected["time_in_force"] = json!(sent);
+        let place = harness.alpaca.mock(|when, then| {
+            when.method(POST).path(orders_path()).json_body(expected);
+            then.status(200).json_body(alpaca_order(CLIENT_UUID));
+        });
+
+        let (status, body) = harness
+            .call(Tier::Bot, "POST", "/orders/market", Some(request))
+            .await;
+
+        assert_eq!(status, StatusCode::OK, "{requested:?}: {body}");
+        place.assert_calls(1);
+        let events = harness.audit_events();
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0].outcome, Some(Outcome::Applied));
+        assert_eq!(
+            events[0].summary.get("timeInForce").map(String::as_str),
+            noted,
+            "{requested:?}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn replaying_a_bot_placement_adopts_the_order_alpaca_already_holds() {
     let harness = Harness::start().await;

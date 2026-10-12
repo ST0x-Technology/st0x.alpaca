@@ -90,7 +90,7 @@ pub mod mock {
 /// Time-in-force specifies how long an order remains active before it expires.
 ///
 /// This is specific to Alpaca Broker API and configurable at the executor level.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TimeInForce {
     /// Day order - expires at the end of the regular trading day

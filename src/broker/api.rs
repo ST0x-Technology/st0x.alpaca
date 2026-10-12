@@ -254,14 +254,30 @@ impl AlpacaBrokerApi {
     /// reached Alpaca.
     pub async fn place_market_order_reporting(
         &self,
+        order: MarketOrder,
+    ) -> Result<OrderPlacement<String>, PlacementError> {
+        self.place_market_order_with_time_in_force_reporting(order, self.time_in_force)
+            .await
+    }
+
+    /// [`Self::place_market_order_reporting`] with `time_in_force` for this
+    /// order instead of the configured one, so an operator can place a
+    /// market on close order from a deployment configured for day orders.
+    ///
+    /// # Errors
+    ///
+    /// The [`Self::place_market_order_reporting`] errors.
+    pub async fn place_market_order_with_time_in_force_reporting(
+        &self,
         mut order: MarketOrder,
+        time_in_force: TimeInForce,
     ) -> Result<OrderPlacement<String>, PlacementError> {
         order.shares = self
             .prepare_order_shares_for_placement(&order.symbol, order.shares, false)
             .await
             .map_err(PlacementError::unwritten)?;
 
-        super::order::place_market_order(&self.client, order, self.time_in_force).await
+        super::order::place_market_order(&self.client, order, time_in_force).await
     }
 
     /// Reads an order and maps it to a validated [`OrderState`].
@@ -2015,6 +2031,61 @@ mod tests {
                     "99999999-9999-4999-8999-999999999999"
                 )),
             })
+            .await
+            .unwrap();
+
+        asset_mock.assert();
+        order_mock.assert();
+        assert_eq!(placement.shares, positive_shares("1951"));
+    }
+
+    /// An explicit time in force replaces the configured `day` for that
+    /// order alone, and the quantity is prepared as for any market order.
+    #[tokio::test]
+    async fn market_order_with_explicit_time_in_force_sends_it_instead_of_the_configured_one() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+        let account_mock = create_account_mock(&server);
+        let asset_mock = create_asset_fractionability_mock(&server, "FGI", false);
+        let order_mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders")
+                .json_body(json!({
+                    "symbol": "FGI",
+                    "qty": "1951",
+                    "side": "buy",
+                    "type": "market",
+                    "time_in_force": "cls",
+                    "extended_hours": false,
+                    "client_order_id": "99999999-9999-4999-8999-999999999999"
+                }));
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": "61e7b016-9c91-4a97-b912-615c9d365c9d",
+                    "symbol": "FGI",
+                    "qty": "1951",
+                    "side": "buy",
+                    "status": "new",
+                    "created_at": "2026-09-17T10:15:29Z",
+                    "filled_avg_price": null
+                }));
+        });
+
+        let executor = AlpacaBrokerApi::try_from_ctx(ctx).await.unwrap();
+        account_mock.assert();
+        let placement = executor
+            .place_market_order_with_time_in_force_reporting(
+                MarketOrder {
+                    symbol: Symbol::new("FGI").unwrap(),
+                    shares: Positive::new(FractionalShares::new(float!(1951.126))).unwrap(),
+                    direction: Direction::Buy,
+                    client_order_id: ClientOrderId::from_uuid(uuid!(
+                        "99999999-9999-4999-8999-999999999999"
+                    )),
+                },
+                TimeInForce::MarketOnClose,
+            )
             .await
             .unwrap();
 

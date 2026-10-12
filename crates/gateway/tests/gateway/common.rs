@@ -103,9 +103,15 @@ pub fn account_body(account_number: &str) -> Value {
 
 /// Config text for a `profile` gateway pointed at the mock server, which
 /// serves Alpaca, the corporate action stream and, through [`serve_keys`],
-/// the signing keys. `extra` is spliced in as top level keys; `tables` is
-/// appended as extra tables.
-pub fn config_text(alpaca: &MockServer, profile: &str, extra: &str, tables: &str) -> String {
+/// the signing keys. `extra` is spliced in as top level keys, `broker` as
+/// keys of the `[broker]` table; `tables` is appended as extra tables.
+pub fn config_text(
+    alpaca: &MockServer,
+    profile: &str,
+    extra: &str,
+    broker: &str,
+    tables: &str,
+) -> String {
     format!(
         r#"
 profile = "{profile}"
@@ -119,6 +125,7 @@ api_key = "key"
 api_secret = "secret"
 account_id = "{ACCOUNT_ID}"
 mode = {{ type = "mock", base_url = "{alpaca}" }}
+{broker}
 
 [identity]
 bot_audience = "{BOT_AUDIENCE}"
@@ -178,26 +185,32 @@ impl Harness {
     /// A `t0` gateway whose startup account check passed, with the default
     /// config.
     pub async fn start() -> Self {
-        Self::start_full("t0", "", "", None).await
+        Self::start_full("t0", "", "", "", None).await
     }
 
     /// An `s01` gateway, otherwise as [`Self::start`].
     pub async fn start_s01() -> Self {
-        Self::start_full("s01", "", "", None).await
+        Self::start_full("s01", "", "", "", None).await
     }
 
     pub async fn start_with(extra: &str, tables: &str) -> Self {
-        Self::start_full("t0", extra, tables, None).await
+        Self::start_full("t0", extra, "", tables, None).await
+    }
+
+    /// A gateway whose `[broker]` table also holds the keys in `broker`.
+    pub async fn start_with_broker(broker: &str) -> Self {
+        Self::start_full("t0", "", broker, "", None).await
     }
 
     /// A gateway whose every operation deadline is `deadline`.
     pub async fn start_with_deadline(deadline: Duration) -> Self {
-        Self::start_full("t0", "", "", Some(deadline)).await
+        Self::start_full("t0", "", "", "", Some(deadline)).await
     }
 
     async fn start_full(
         profile: &str,
         extra: &str,
+        broker: &str,
         tables: &str,
         deadline: Option<Duration>,
     ) -> Self {
@@ -211,7 +224,8 @@ impl Harness {
                 .json_body(account_body(ACCOUNT_NUMBER));
         });
 
-        let config = GatewayConfig::parse(&config_text(&alpaca, profile, extra, tables)).unwrap();
+        let config =
+            GatewayConfig::parse(&config_text(&alpaca, profile, extra, broker, tables)).unwrap();
         let audit = MemorySink::default();
         let state = AppState::connect_with_deadline(
             config,
