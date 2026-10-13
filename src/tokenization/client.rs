@@ -1091,7 +1091,7 @@ impl AlpacaTokenizationClient {
             body = %message,
             "Alpaca tokenization mint error response body received"
         );
-        warn!(target: "tokenization", status = %status, message = %message, "Tokenization request failed");
+        warn!(target: "tokenization", status = %status, error_body = %message, "Tokenization request failed");
         Err(map_mint_error(
             status,
             message,
@@ -1801,6 +1801,9 @@ mod tests {
         ));
         assert!(logs_contain("tokenization_marker"));
         assert!(logs_contain("mint-error-body"));
+        assert!(logs_contain("Tokenization request failed"));
+        assert!(logs_contain("error_body="));
+        assert!(!logs_contain("message="));
 
         mint_mock.assert();
     }
