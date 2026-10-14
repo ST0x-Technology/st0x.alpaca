@@ -1,5 +1,5 @@
-//! Wire contract of the account bound Alpaca gateway (`t0-alpaca`,
-//! `s01-alpaca`).
+//! Wire contract of the account bound Alpaca gateway (`t0-liqbot`,
+//! `t0-humans`, `s01-alpaca`).
 //!
 //! The gateway runs `st0x-alpaca` methods on behalf of bots and operators so
 //! that only the gateway holds Alpaca credentials. This crate is the contract

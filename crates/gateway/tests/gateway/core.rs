@@ -237,6 +237,33 @@ async fn readers_have_no_mutation_routes() {
     assert!(harness.audit_events().is_empty());
 }
 
+/// A bot only deployment has no human routes and a human only deployment
+/// no bot routes: a tier it does not serve answers `unknown_operation` even
+/// to that tier's valid credential, and nothing is audited for it.
+#[tokio::test]
+async fn a_deployment_answers_only_on_the_tiers_it_serves() {
+    for (served, unserved) in [
+        (&[Tier::Bot][..], &[Tier::Read, Tier::Write][..]),
+        (&[Tier::Read, Tier::Write][..], &[Tier::Bot][..]),
+    ] {
+        let harness = Harness::start_serving(served).await;
+
+        for tier in unserved {
+            let (status, body) = harness.call(*tier, "GET", "/account/funds", None).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{tier:?}: {body}");
+            assert_eq!(body["code"], "unknown_operation", "{tier:?}");
+            assert_eq!(body["outcome"], "not_applied", "{tier:?}");
+        }
+        assert!(harness.audit_events().is_empty(), "{served:?}");
+
+        for tier in served {
+            let (status, body) = harness.call(*tier, "GET", "/account/funds", None).await;
+            assert_eq!(status, StatusCode::OK, "{tier:?}: {body}");
+        }
+        assert_eq!(harness.audit_events().len(), served.len(), "{served:?}");
+    }
+}
+
 #[tokio::test]
 async fn an_account_id_in_a_request_is_refused() {
     let harness = Harness::start().await;

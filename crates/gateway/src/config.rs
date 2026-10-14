@@ -15,7 +15,7 @@ use st0x_alpaca::corporate_actions::{
     DEFAULT_CORPORATE_ACTIONS_STREAM_URL,
 };
 use st0x_alpaca::endpoint::validate_credential_origin;
-use st0x_alpaca_gateway_api::{Operation, Profile};
+use st0x_alpaca_gateway_api::{Operation, Profile, Tier};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -51,6 +51,11 @@ pub struct GatewayConfig {
     /// Credential, account and mode. The only place an account id appears.
     pub broker: AlpacaBrokerApiCtx,
     pub identity: IdentityConfig,
+    /// The tiers this deployment serves. Each served tier needs its
+    /// identity fields, and a tier not listed has no routes at all, so one
+    /// image can run a bot only and a human only deployment of one profile.
+    #[serde(default = "default_tiers")]
+    pub tiers: Vec<Tier>,
     /// Operations switched off in this deployment. They answer
     /// `403 capability_disabled`.
     #[serde(default)]
@@ -69,6 +74,10 @@ pub struct GatewayConfig {
     /// Read by the `s01` profile only.
     #[serde(default)]
     pub corporate_actions: CorporateActionsConfig,
+}
+
+fn default_tiers() -> Vec<Tier> {
+    Tier::ALL.to_vec()
 }
 
 const fn default_human_budget() -> u32 {
@@ -102,17 +111,18 @@ impl fmt::Display for Environment {
     }
 }
 
+/// Each tier's identity fields are set exactly when `tiers` lists the tier.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IdentityConfig {
     /// Audience bot ID tokens must carry: the Cloud Run service URL.
-    pub bot_audience: String,
+    pub bot_audience: Option<String>,
     /// Unique ids (`sub`) of the service accounts allowed on the bot tier.
-    pub bot_principals: Vec<String>,
+    pub bot_principals: Option<Vec<String>>,
     /// IAP audience of the read backend.
-    pub read_audience: String,
+    pub read_audience: Option<String>,
     /// IAP audience of the write backend.
-    pub write_audience: String,
+    pub write_audience: Option<String>,
     /// Overrides Google's ID token keys, for tests. HTTPS, or HTTP on a
     /// loopback host.
     #[serde(default = "default_google_jwks_url")]
@@ -121,6 +131,18 @@ pub struct IdentityConfig {
     /// loopback host.
     #[serde(default = "default_iap_jwks_url")]
     pub iap_jwks_url: String,
+}
+
+impl IdentityConfig {
+    /// The audience `tier`'s credential must carry, when configured.
+    #[must_use]
+    pub fn audience(&self, tier: Tier) -> Option<&str> {
+        match tier {
+            Tier::Bot => self.bot_audience.as_deref(),
+            Tier::Read => self.read_audience.as_deref(),
+            Tier::Write => self.write_audience.as_deref(),
+        }
+    }
 }
 
 fn default_google_jwks_url() -> String {
@@ -292,17 +314,9 @@ impl GatewayConfig {
             AlpacaAuth::Basic { .. } | AlpacaAuth::KmsJwt { .. } => {}
         }
 
-        let identity = &self.identity;
-        let audiences = [
-            &identity.bot_audience,
-            &identity.read_audience,
-            &identity.write_audience,
-        ];
-        if audiences.iter().collect::<HashSet<_>>().len() != audiences.len() {
-            return invalid("bot, read and write audiences must differ");
-        }
-        check_jwks_url("google_jwks_url", &identity.google_jwks_url)?;
-        check_jwks_url("iap_jwks_url", &identity.iap_jwks_url)?;
+        self.validate_tiers()?;
+        check_jwks_url("google_jwks_url", &self.identity.google_jwks_url)?;
+        check_jwks_url("iap_jwks_url", &self.identity.iap_jwks_url)?;
 
         if self.profile == Profile::S01 {
             let stream = &self.corporate_actions;
@@ -316,9 +330,82 @@ impl GatewayConfig {
         Ok(())
     }
 
+    /// Each served tier has its identity fields and each other tier has
+    /// none, so a field never sits in config for a tier nobody serves.
+    fn validate_tiers(&self) -> Result<(), ConfigError> {
+        let invalid = |message: String| Err(ConfigError::Invalid(message));
+
+        if self.tiers.is_empty() {
+            return invalid("tiers must list at least one tier".to_string());
+        }
+        if self.tiers.iter().collect::<HashSet<_>>().len() != self.tiers.len() {
+            return invalid("tiers must not list a tier twice".to_string());
+        }
+
+        let identity = &self.identity;
+        for tier in Tier::ALL {
+            let name = tier_name(tier);
+            match (self.serves(tier), identity.audience(tier)) {
+                (true, None) => {
+                    return invalid(format!(
+                        "identity.{name}_audience is required when tiers lists {name}"
+                    ));
+                }
+                (false, Some(_)) => {
+                    return invalid(format!(
+                        "identity.{name}_audience is set but tiers does not list {name}"
+                    ));
+                }
+                (true, Some(_)) | (false, None) => {}
+            }
+        }
+        match (self.serves(Tier::Bot), &identity.bot_principals) {
+            (true, None) => {
+                return invalid(
+                    "identity.bot_principals is required when tiers lists bot".to_string(),
+                );
+            }
+            (true, Some(principals)) if principals.is_empty() => {
+                return invalid(
+                    "identity.bot_principals must list at least one service account".to_string(),
+                );
+            }
+            (false, Some(_)) => {
+                return invalid(
+                    "identity.bot_principals is set but tiers does not list bot".to_string(),
+                );
+            }
+            (true, Some(_)) | (false, None) => {}
+        }
+
+        let audiences: Vec<&str> = Tier::ALL
+            .into_iter()
+            .filter_map(|tier| identity.audience(tier))
+            .collect();
+        if audiences.iter().collect::<HashSet<_>>().len() != audiences.len() {
+            return invalid("the served tiers' audiences must differ".to_string());
+        }
+        Ok(())
+    }
+
+    /// Whether this deployment serves `tier`.
+    #[must_use]
+    pub fn serves(&self, tier: Tier) -> bool {
+        self.tiers.contains(&tier)
+    }
+
     #[must_use]
     pub fn is_disabled(&self, operation: Operation) -> bool {
         self.disabled_operations.contains(&operation)
+    }
+}
+
+/// The name `tiers` and the identity fields use for `tier`.
+const fn tier_name(tier: Tier) -> &'static str {
+    match tier {
+        Tier::Bot => "bot",
+        Tier::Read => "read",
+        Tier::Write => "write",
     }
 }
 
@@ -395,6 +482,99 @@ mint_recipients = ["0x2222222222222222222222222222222222222222"]
         );
         let error = GatewayConfig::parse(&text).unwrap_err();
         assert!(matches!(error, ConfigError::Invalid(_)), "{error}");
+    }
+
+    const BOT_FIELDS: &str =
+        "bot_audience = \"https://t0-alpaca.run.app\"\nbot_principals = [\"111\"]\n";
+    const READ_FIELD: &str = "read_audience = \"/projects/1/global/backendServices/11\"\n";
+    const WRITE_FIELD: &str = "write_audience = \"/projects/1/global/backendServices/22\"\n";
+
+    /// [`sample`] serving `tiers`, with `identity` as its identity fields.
+    fn serving(tiers: &str, identity: &str) -> String {
+        let all = format!("[identity]\n{BOT_FIELDS}{READ_FIELD}{WRITE_FIELD}");
+        let text = sample(&format!("tiers = {tiers}"));
+        assert!(text.contains(&all), "the sample's identity table changed");
+        text.replace(&all, &format!("[identity]\n{identity}"))
+    }
+
+    #[test]
+    fn a_deployment_may_serve_only_some_tiers() {
+        let bot = GatewayConfig::parse(&serving("[\"bot\"]", BOT_FIELDS)).unwrap();
+        assert_eq!(Tier::ALL.map(|tier| bot.serves(tier)), [true, false, false]);
+
+        let humans = GatewayConfig::parse(&serving(
+            "[\"read\", \"write\"]",
+            &format!("{READ_FIELD}{WRITE_FIELD}"),
+        ))
+        .unwrap();
+        assert_eq!(
+            Tier::ALL.map(|tier| humans.serves(tier)),
+            [false, true, true]
+        );
+
+        let unlisted = GatewayConfig::parse(&sample("")).unwrap();
+        assert_eq!(unlisted.tiers, Tier::ALL);
+    }
+
+    #[test]
+    fn each_served_tier_needs_its_identity_and_no_other_tier_has_any() {
+        let bot_audience = "bot_audience = \"https://t0-alpaca.run.app\"\n";
+        let bot_principals = "bot_principals = [\"111\"]\n";
+        let humans = "[\"read\", \"write\"]";
+        for (tiers, identity, expected) in [
+            (
+                "[\"bot\"]",
+                format!("{BOT_FIELDS}{READ_FIELD}"),
+                "read_audience is set",
+            ),
+            (
+                "[\"bot\"]",
+                format!("{BOT_FIELDS}{WRITE_FIELD}"),
+                "write_audience is set",
+            ),
+            (
+                humans,
+                format!("{bot_audience}{READ_FIELD}{WRITE_FIELD}"),
+                "bot_audience is set",
+            ),
+            (
+                humans,
+                format!("{bot_principals}{READ_FIELD}{WRITE_FIELD}"),
+                "bot_principals is set",
+            ),
+            (humans, READ_FIELD.to_string(), "write_audience is required"),
+            (
+                "[\"bot\"]",
+                bot_principals.to_string(),
+                "bot_audience is required",
+            ),
+            (
+                "[\"bot\"]",
+                bot_audience.to_string(),
+                "bot_principals is required",
+            ),
+            (
+                "[\"bot\"]",
+                format!("{bot_audience}bot_principals = []\n"),
+                "at least one service account",
+            ),
+            ("[]", String::new(), "at least one tier"),
+            ("[\"bot\", \"bot\"]", BOT_FIELDS.to_string(), "twice"),
+            (
+                humans,
+                format!("{READ_FIELD}{}", READ_FIELD.replace("read", "write")),
+                "must differ",
+            ),
+        ] {
+            let error = GatewayConfig::parse(&serving(tiers, &identity)).unwrap_err();
+            assert!(
+                matches!(&error, ConfigError::Invalid(message) if message.contains(expected)),
+                "{tiers} {identity:?}: {error}"
+            );
+        }
+
+        let error = GatewayConfig::parse(&serving("[\"admin\"]", "")).unwrap_err();
+        assert!(matches!(error, ConfigError::Parse(_)), "{error}");
     }
 
     /// A config error is logged at startup and by `--validate-config`, so

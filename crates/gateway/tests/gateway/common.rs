@@ -178,21 +178,26 @@ impl Harness {
     /// A `t0` gateway whose startup account check passed, with the default
     /// config.
     pub async fn start() -> Self {
-        Self::start_full("t0", "", "", None).await
+        Self::start_full("t0", "", "", None, None).await
     }
 
     /// An `s01` gateway, otherwise as [`Self::start`].
     pub async fn start_s01() -> Self {
-        Self::start_full("s01", "", "", None).await
+        Self::start_full("s01", "", "", None, None).await
     }
 
     pub async fn start_with(extra: &str, tables: &str) -> Self {
-        Self::start_full("t0", extra, tables, None).await
+        Self::start_full("t0", extra, tables, None, None).await
     }
 
     /// A gateway whose every operation deadline is `deadline`.
     pub async fn start_with_deadline(deadline: Duration) -> Self {
-        Self::start_full("t0", "", "", Some(deadline)).await
+        Self::start_full("t0", "", "", Some(deadline), None).await
+    }
+
+    /// A `t0` gateway serving only `tiers`, with only their identity fields.
+    pub async fn start_serving(tiers: &[Tier]) -> Self {
+        Self::start_full("t0", "", "", None, Some(tiers)).await
     }
 
     async fn start_full(
@@ -200,6 +205,7 @@ impl Harness {
         extra: &str,
         tables: &str,
         deadline: Option<Duration>,
+        tiers: Option<&[Tier]>,
     ) -> Self {
         let alpaca = MockServer::start_async().await;
         serve_keys(&alpaca);
@@ -211,7 +217,12 @@ impl Harness {
                 .json_body(account_body(ACCOUNT_NUMBER));
         });
 
-        let config = GatewayConfig::parse(&config_text(&alpaca, profile, extra, tables)).unwrap();
+        let text = config_text(&alpaca, profile, extra, tables);
+        let text = match tiers {
+            Some(tiers) => serving_only(&text, tiers),
+            None => text,
+        };
+        let config = GatewayConfig::parse(&text).unwrap();
         let audit = MemorySink::default();
         let state = AppState::connect_with_deadline(
             config,
@@ -300,6 +311,39 @@ pub async fn answer(app: Router, request: Request<Body>) -> (StatusCode, Value) 
         .unwrap();
     let value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
     (status, value)
+}
+
+/// `text` serving only `tiers`: the `tiers` key added and the identity
+/// fields of every other tier removed.
+fn serving_only(text: &str, tiers: &[Tier]) -> String {
+    let names: Vec<String> = tiers
+        .iter()
+        .map(|tier| serde_json::to_string(tier).unwrap())
+        .collect();
+    let fields: [(Tier, &[&str]); 3] = [
+        (Tier::Bot, &["bot_audience", "bot_principals"]),
+        (Tier::Read, &["read_audience"]),
+        (Tier::Write, &["write_audience"]),
+    ];
+    let unserved: Vec<&str> = fields
+        .into_iter()
+        .filter(|(tier, _)| !tiers.contains(tier))
+        .flat_map(|(_, names)| names.iter().copied())
+        .collect();
+
+    let kept: Vec<&str> = text
+        .lines()
+        .filter(|line| {
+            !unserved
+                .iter()
+                .any(|field| line.starts_with(&format!("{field} =")))
+        })
+        .collect();
+    kept.join("\n").replacen(
+        "\n[broker]",
+        &format!("tiers = [{}]\n\n[broker]", names.join(", ")),
+        1,
+    )
 }
 
 /// Waits until `mock` has received a request. The hit is counted before

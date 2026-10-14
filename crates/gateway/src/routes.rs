@@ -1,7 +1,7 @@
-//! The router: one prefix per tier, each operation mounted only on the tiers
-//! the profile's capability matrix allows, behind that tier's identity check.
-//! The check runs inside the operation's route, so it answers and audits a
-//! refusal as that operation.
+//! The router: one prefix per served tier, each operation mounted only on
+//! the tiers the profile's capability matrix allows, behind that tier's
+//! identity check. The check runs inside the operation's route, so it
+//! answers and audits a refusal as that operation.
 
 use std::sync::Arc;
 
@@ -17,16 +17,17 @@ use crate::auth::{self, Guard, TokenVerifier};
 use crate::handlers;
 use crate::state::AppState;
 
-/// Identity verifiers, one per tier.
+/// Identity verifiers, one per served tier. A tier the deployment does not
+/// serve has none, and so no routes.
 pub struct Verifiers {
-    pub bot: Arc<TokenVerifier>,
-    pub read: Arc<TokenVerifier>,
-    pub write: Arc<TokenVerifier>,
+    pub bot: Option<Arc<TokenVerifier>>,
+    pub read: Option<Arc<TokenVerifier>>,
+    pub write: Option<Arc<TokenVerifier>>,
 }
 
 impl Verifiers {
-    /// Builds the verifiers from config, sharing one HTTP client with
-    /// timeouts for the key fetches.
+    /// Builds the served tiers' verifiers from config, sharing one HTTP
+    /// client with timeouts for the key fetches.
     ///
     /// # Errors
     ///
@@ -36,46 +37,57 @@ impl Verifiers {
             .connect_timeout(std::time::Duration::from_secs(5))
             .timeout(std::time::Duration::from_secs(10))
             .build()?;
-        let identity = &state.config.identity;
+        let config = &state.config;
+        let identity = &config.identity;
+        let human = |tier: Tier| match (config.serves(tier), identity.audience(tier)) {
+            (true, Some(audience)) => Some(Arc::new(TokenVerifier::iap(
+                tier,
+                audience,
+                identity.iap_jwks_url.clone(),
+                http.clone(),
+            ))),
+            _ => None,
+        };
+
         Ok(Self {
-            bot: Arc::new(TokenVerifier::bot(
-                &identity.bot_audience,
-                &identity.bot_principals,
-                identity.google_jwks_url.clone(),
-                http.clone(),
-            )),
-            read: Arc::new(TokenVerifier::iap(
-                Tier::Read,
-                &identity.read_audience,
-                identity.iap_jwks_url.clone(),
-                http.clone(),
-            )),
-            write: Arc::new(TokenVerifier::iap(
-                Tier::Write,
-                &identity.write_audience,
-                identity.iap_jwks_url.clone(),
-                http,
-            )),
+            bot: match (
+                config.serves(Tier::Bot),
+                identity.audience(Tier::Bot),
+                identity.bot_principals.as_deref(),
+            ) {
+                (true, Some(audience), Some(principals)) => Some(Arc::new(TokenVerifier::bot(
+                    audience,
+                    principals,
+                    identity.google_jwks_url.clone(),
+                    http.clone(),
+                ))),
+                _ => None,
+            },
+            read: human(Tier::Read),
+            write: human(Tier::Write),
         })
     }
 
-    fn for_tier(&self, tier: Tier) -> Arc<TokenVerifier> {
+    fn for_tier(&self, tier: Tier) -> Option<Arc<TokenVerifier>> {
         match tier {
-            Tier::Bot => Arc::clone(&self.bot),
-            Tier::Read => Arc::clone(&self.read),
-            Tier::Write => Arc::clone(&self.write),
+            Tier::Bot => self.bot.clone(),
+            Tier::Read => self.read.clone(),
+            Tier::Write => self.write.clone(),
         }
     }
 }
 
-/// The whole service: health routes plus every tier's operations.
+/// The whole service: health routes plus every served tier's operations.
 pub fn app(state: AppState, verifiers: &Verifiers) -> Router {
     let mut router = Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz));
 
     for tier in Tier::ALL {
-        let guard = Guard::new(verifiers.for_tier(tier), state.clone());
+        let Some(verifier) = verifiers.for_tier(tier) else {
+            continue;
+        };
+        let guard = Guard::new(verifier, state.clone());
         for operation in Operation::ALL {
             if !operation.allows(state.config.profile, tier) {
                 continue;
