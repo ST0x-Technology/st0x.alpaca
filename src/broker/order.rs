@@ -20,7 +20,8 @@ use crate::broker::{
     Symbol, Usd, Usdc, deserialize_float_from_number_or_string,
     deserialize_option_float_from_number_or_string, serialize_float_as_string,
 };
-use crate::rate_limit::{next_poll_delay, poll_deadline};
+use crate::core::BackpressurePolicy;
+use crate::rate_limit::{capped_backpressure_wait, next_poll_delay, poll_deadline};
 
 const ALPACA_CRYPTO_MAX_DECIMAL_PLACES: u8 = 6;
 
@@ -1330,7 +1331,8 @@ const CANCEL_SETTLE_DEADLINE: Duration = Duration::from_secs(30);
 /// The bounds a conversion poll runs under, carried together so a call
 /// site cannot swap them and so tests control the real timing: a settle
 /// deadline shorter than the poll interval would otherwise silently wait a
-/// full interval anyway.
+/// full interval anyway. `backpressure` rides along so the one value a
+/// caller threads through decides how a throttled read ends the wait too.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ConversionPollDeadlines {
     /// How long the order may stay non-terminal before its remainder is
@@ -1341,6 +1343,8 @@ pub(crate) struct ConversionPollDeadlines {
     /// How long to wait between order reads, both before the deadline and
     /// inside the settle window.
     interval: Duration,
+    /// What a throttled order read before the deadline does to the poll.
+    backpressure: BackpressurePolicy,
 }
 
 /// How long a conversion poll waits between order reads: the interval
@@ -1354,6 +1358,7 @@ impl ConversionPollDeadlines {
         order: CONVERSION_ORDER_DEADLINE,
         cancel_settle: CANCEL_SETTLE_DEADLINE,
         interval: CONVERSION_POLL_INTERVAL,
+        backpressure: BackpressurePolicy::RetryInPlace,
     };
 
     /// The production deadlines, reading the order every `interval`.
@@ -1363,13 +1368,22 @@ impl ConversionPollDeadlines {
             ..Self::PRODUCTION
         }
     }
+
+    /// These deadlines, ending the poll on a throttled read as `policy` says.
+    pub(super) const fn with_backpressure(self, policy: BackpressurePolicy) -> Self {
+        Self {
+            backpressure: policy,
+            ..self
+        }
+    }
 }
 
 /// Places a USDC/USD conversion and polls it until it fills, reading the
 /// order every `poll_interval`: the loop
 /// [`crate::broker::AlpacaBrokerApi::convert_usdc_usd`] runs, over any
 /// [`ConversionOrders`]. Past a 300 s deadline the remainder is cancelled,
-/// as `poll_crypto_order_until_filled` describes.
+/// as `poll_crypto_order_until_filled` describes. A throttled read is
+/// waited out in place ([`BackpressurePolicy::RetryInPlace`]).
 ///
 /// # Errors
 ///
@@ -1381,6 +1395,22 @@ pub async fn convert_usdc_usd_with(
     client_order_id: &ClientOrderId,
     poll_interval: Duration,
 ) -> Result<CryptoOrderResponse, AlpacaBrokerApiError> {
+    place_and_poll_conversion(
+        orders,
+        conversion,
+        client_order_id,
+        ConversionPollDeadlines::polling_every(poll_interval),
+    )
+    .await
+}
+
+/// [`convert_usdc_usd_with`] under `deadlines`.
+pub(super) async fn place_and_poll_conversion(
+    orders: &impl ConversionOrders,
+    conversion: ConversionOrder,
+    client_order_id: &ClientOrderId,
+    deadlines: ConversionPollDeadlines,
+) -> Result<CryptoOrderResponse, AlpacaBrokerApiError> {
     let order = orders
         .submit_conversion(conversion, client_order_id)
         .await?;
@@ -1391,19 +1421,15 @@ pub async fn convert_usdc_usd_with(
         "USDC/USD conversion order placed, polling for completion..."
     );
 
-    poll_crypto_order_until_filled(
-        orders,
-        order.id,
-        ConversionPollDeadlines::polling_every(poll_interval),
-    )
-    .await
+    poll_crypto_order_until_filled(orders, order.id, deadlines).await
 }
 
 /// Polls a placed conversion order until any terminal state, reading the
 /// order every `poll_interval`, and returns the final snapshot for the caller
 /// to classify: the loop
 /// [`crate::broker::AlpacaBrokerApi::poll_conversion_to_terminal`] runs, over
-/// any [`ConversionOrders`].
+/// any [`ConversionOrders`]. A throttled read is waited out in place
+/// ([`BackpressurePolicy::RetryInPlace`]).
 ///
 /// # Errors
 ///
@@ -1511,10 +1537,14 @@ pub(crate) async fn poll_crypto_order_to_terminal(
 ///
 /// A read error `permanence()` calls transient (a 5xx, 408 or 429, a
 /// transport failure, a retryable gateway hop) is read again at the next
-/// interval, or after the `Retry-After` it relayed when that is longer;
-/// every other read error ends the poll. No read starts at or after the
-/// deadline and a read still running there is dropped, so the remainder is
-/// cancelled on time.
+/// interval, or after the `Retry-After` it relayed when that is longer,
+/// capped at five minutes; every other read error ends the poll. Under
+/// [`BackpressurePolicy::Return`] a throttled read ends the poll at once
+/// with its error, the order left live and uncancelled for the caller to
+/// resume. No read starts at or after the deadline and a read still running
+/// there is dropped, so the remainder is cancelled on time: a throttled read
+/// that reaches the deadline under the default policy still leads to the
+/// cancel, never to the bare 429, because the order may still fill.
 async fn poll_until_terminal(
     orders: &impl ConversionOrders,
     order_id: Uuid,
@@ -1555,18 +1585,22 @@ async fn poll_until_terminal(
             }
             // The rule of the wallet and tokenization polls: a read a later
             // read can clear is read again, after any wait it relayed, so a
-            // passing failure never skips the deadline cancel.
+            // passing failure never skips the deadline cancel. Only a caller
+            // that asked for throttles back (`Return`) gets one instead.
             Err(error) if error.permanence() == crate::core::Permanence::Transient => {
+                let backpressure = error.backpressure();
+                if backpressure.is_some() && deadlines.backpressure == BackpressurePolicy::Return {
+                    return Err(error);
+                }
                 warn!(
                     target: "broker",
                     order_id = %order_id,
                     %error,
                     "Conversion order read failed, polling again"
                 );
-                error
-                    .backpressure()
-                    .and_then(|hint| hint.retry_after)
-                    .map_or(deadlines.interval, |wait| wait.max(deadlines.interval))
+                backpressure.map_or(deadlines.interval, |backpressure| {
+                    capped_backpressure_wait(backpressure, deadlines.interval)
+                })
             }
             Err(error) => return Err(error),
         };
@@ -3958,6 +3992,7 @@ mod tests {
         order: Duration::from_millis(100),
         cancel_settle: Duration::from_secs(30),
         interval: Duration::from_millis(10),
+        backpressure: BackpressurePolicy::RetryInPlace,
     };
 
     /// A conversion order that partially fills and then stops progressing must
@@ -4281,6 +4316,7 @@ mod tests {
                 order: Duration::from_millis(50),
                 cancel_settle: Duration::from_millis(200),
                 interval: Duration::from_millis(25),
+                backpressure: BackpressurePolicy::RetryInPlace,
             },
         )
         .await
@@ -4333,6 +4369,7 @@ mod tests {
                 order: Duration::from_millis(50),
                 cancel_settle: Duration::from_millis(200),
                 interval: Duration::from_millis(25),
+                backpressure: BackpressurePolicy::RetryInPlace,
             },
         )
         .await
@@ -4397,6 +4434,7 @@ mod tests {
                 order: Duration::from_millis(50),
                 cancel_settle: Duration::from_millis(200),
                 interval: Duration::from_millis(25),
+                backpressure: BackpressurePolicy::RetryInPlace,
             },
         )
         .await
@@ -4498,6 +4536,7 @@ mod tests {
                     order: Duration::from_secs(30),
                     cancel_settle: Duration::from_secs(30),
                     interval: Duration::from_millis(10),
+                    backpressure: BackpressurePolicy::RetryInPlace,
                 },
             )
             .await
@@ -5332,6 +5371,95 @@ mod tests {
         );
         assert_eq!(orders.reads_made(), 0);
         assert_eq!(orders.cancels(), 0);
+    }
+
+    fn rate_limited(retry_after: Duration) -> AlpacaBrokerApiError {
+        AlpacaBrokerApiError::ApiError {
+            status: reqwest::StatusCode::TOO_MANY_REQUESTS,
+            alpaca_code: None,
+            message: "rate limited".to_string(),
+            retry_after: Some(retry_after),
+        }
+    }
+
+    /// Under `BackpressurePolicy::Return` a throttled read ends the
+    /// conversion poll at once with the 429 and its hint, the order neither
+    /// read again nor cancelled.
+    #[tokio::test(start_paused = true)]
+    async fn conversion_poll_returns_a_429_at_once_under_the_return_policy() {
+        let orders = ScriptedConversion::new(
+            [scripted_conversion_order(BrokerOrderStatus::Filled, "500")],
+            None,
+        )
+        .failing_first_at_alpaca(vec![|| rate_limited(Duration::from_secs(30))]);
+        let deadlines = ConversionPollDeadlines {
+            order: Duration::from_hours(1),
+            ..FAST_DEADLINES
+        }
+        .with_backpressure(BackpressurePolicy::Return);
+
+        let started = tokio::time::Instant::now();
+        let error = poll_crypto_order_to_terminal(&orders, STALLED_ORDER_ID, deadlines)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, AlpacaBrokerApiError::ApiError { status, .. } if status == 429),
+            "{error:?}"
+        );
+        assert_eq!(
+            error.backpressure().and_then(|hint| hint.retry_after),
+            Some(Duration::from_secs(30))
+        );
+        assert_eq!(started.elapsed(), Duration::ZERO);
+        assert_eq!(orders.reads_made(), 0);
+        assert_eq!(orders.cancels(), 0);
+    }
+
+    /// An unbounded `Retry-After` holds the conversion poll for at most
+    /// `MAX_RETRY_AFTER_HOLD` before its next read.
+    #[tokio::test(start_paused = true)]
+    async fn conversion_poll_caps_a_retry_after_wait_at_the_max_hold() {
+        let orders = ScriptedConversion::new(
+            [scripted_conversion_order(BrokerOrderStatus::Filled, "500")],
+            None,
+        )
+        .failing_first_at_alpaca(vec![|| rate_limited(Duration::from_secs(86_400))]);
+        let deadlines = ConversionPollDeadlines {
+            order: Duration::from_hours(1),
+            ..FAST_DEADLINES
+        };
+
+        let started = tokio::time::Instant::now();
+        let order = poll_crypto_order_to_terminal(&orders, STALLED_ORDER_ID, deadlines)
+            .await
+            .unwrap();
+
+        assert_eq!(order.classify(), CryptoOrderOutcome::Filled);
+        assert_eq!(started.elapsed(), crate::rate_limit::MAX_RETRY_AFTER_HOLD);
+        assert_eq!(orders.cancels(), 0);
+    }
+
+    /// Under the default policy a `Retry-After` that outlasts the order
+    /// deadline still leads to the deadline cancel there, not to the bare
+    /// 429: the order may still fill, so the poll settles it first.
+    #[tokio::test(start_paused = true)]
+    async fn conversion_poll_cancels_at_its_deadline_after_a_retry_after_past_it() {
+        let orders = ScriptedConversion::new(
+            [scripted_conversion_order(BrokerOrderStatus::New, "0")],
+            Some(scripted_conversion_order(BrokerOrderStatus::Filled, "500")),
+        )
+        .failing_first_at_alpaca(vec![|| rate_limited(Duration::from_secs(86_400))]);
+
+        let started = tokio::time::Instant::now();
+        let order = poll_crypto_order_until_filled(&orders, STALLED_ORDER_ID, FAST_DEADLINES)
+            .await
+            .unwrap();
+
+        assert_eq!(started.elapsed(), FAST_DEADLINES.order);
+        assert_eq!(orders.reads_made(), 0);
+        assert_eq!(orders.cancels(), 1);
+        assert_eq!(order.classify(), CryptoOrderOutcome::Filled);
     }
 
     /// No read starts at the deadline: with the next read due past it, the

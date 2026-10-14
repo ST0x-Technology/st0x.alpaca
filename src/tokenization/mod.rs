@@ -13,6 +13,7 @@ use std::fmt::Display;
 use std::str::FromStr;
 use uuid::Uuid;
 
+pub use crate::core::BackpressurePolicy;
 pub use client::{
     AlpacaApiErrorMessage, AlpacaTokenizationError, AlpacaTokenizationService,
     InvalidTokenizationParameters, TokenizationLookups, TokenizationRequest,

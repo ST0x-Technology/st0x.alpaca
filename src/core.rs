@@ -616,6 +616,24 @@ pub struct Backpressure {
     pub retry_after: Option<Duration>,
 }
 
+/// What a poll does with a failed lookup classified as backpressure (a 429,
+/// or a throttle relayed as one: `backpressure()` is `Some`). Other transient
+/// lookup errors are read again in place under either policy.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum BackpressurePolicy {
+    /// Waits out the hint, capped at five minutes, and reads again. In the
+    /// wallet and tokenization polls, a wait that would reach the poll
+    /// deadline ends the poll with that error instead of the poll's timeout,
+    /// as does a deadline reached by the read that follows such a wait. The
+    /// broker conversion polls instead keep their deadline handling: at the
+    /// deadline they cancel the order and settle it.
+    #[default]
+    RetryInPlace,
+    /// Ends the poll at once with that error, hint included, so the caller
+    /// can reschedule rather than hold its worker for the wait.
+    Return,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Permanence {
     Permanent,

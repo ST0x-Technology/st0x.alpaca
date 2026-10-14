@@ -14,8 +14,8 @@ use tracing::{info, warn};
 
 use super::client::AlpacaWalletError;
 use super::transfer::{AlpacaTransferId, Transfer, TransferStatus, WalletTransfers};
-use crate::core::Permanence;
-use crate::rate_limit::{next_poll_delay, poll_deadline, read_before};
+use crate::core::{BackpressurePolicy, Permanence};
+use crate::rate_limit::{backpressure_wait, next_poll_delay, poll_deadline, read_before};
 
 pub struct PollingConfig {
     pub interval: Duration,
@@ -37,10 +37,16 @@ impl Default for PollingConfig {
     }
 }
 
+/// Runs one read of a backoff poll, reading again after a retried error
+/// (`is_retried`) until the retry budget runs out. A backpressure error is
+/// waited out as [`retry_wait`] decides; when the deadline then comes before
+/// the next read answers, the poll ends with that backpressure error rather
+/// than its timeout.
 async fn retry_read_before<T, Read, ReadFuture>(
     deadline: Instant,
     mut read: Read,
     strategy: ExponentialBuilder,
+    policy: BackpressurePolicy,
     timed_out: &impl Fn() -> AlpacaWalletError,
 ) -> Result<T, AlpacaWalletError>
 where
@@ -48,39 +54,82 @@ where
     ReadFuture: Future<Output = Result<T, AlpacaWalletError>>,
 {
     let mut backoff = strategy.build();
+    let mut throttled = None;
     loop {
-        match read_before(deadline, &mut read, timed_out).await {
+        let outcome = read_before(deadline, &mut read, || {
+            throttled.take().unwrap_or_else(timed_out)
+        })
+        .await;
+
+        match outcome {
             Ok(value) => return Ok(value),
             Err(error) if is_retried(&error) => {
                 let Some(backoff_delay) = backoff.next() else {
                     return Err(error);
                 };
-                let retry_after = error
-                    .backpressure()
-                    .and_then(|hint| hint.retry_after)
-                    .unwrap_or_default();
-                sleep(next_poll_delay(backoff_delay.max(retry_after), deadline)).await;
+                let Some(wait) = retry_wait(&error, backoff_delay, policy, deadline) else {
+                    return Err(error);
+                };
+                throttled = error.backpressure().is_some().then_some(error);
+                sleep(next_poll_delay(wait, deadline)).await;
             }
             Err(error) => return Err(error),
         }
     }
 }
 
+/// The wait before a retried read error (`is_retried`) is read again, or
+/// `None` when the poll ends with it now. Any error but backpressure waits
+/// `scheduled`; a backpressure error follows `policy`, as
+/// [`backpressure_wait`] describes.
+fn retry_wait(
+    error: &AlpacaWalletError,
+    scheduled: Duration,
+    policy: BackpressurePolicy,
+    deadline: Instant,
+) -> Option<Duration> {
+    match error.backpressure() {
+        Some(backpressure) => backpressure_wait(policy, backpressure, scheduled, deadline),
+        None => Some(scheduled),
+    }
+}
+
 /// Polls a transfer until it reaches a terminal state (Complete or Failed).
 ///
 /// A failed read the poll retries (`is_retried`) is read again after the
-/// longer of its exponential backoff and its `Retry-After` hint. No read or
-/// backoff wait runs past the timeout.
+/// longer of its exponential backoff and its `Retry-After` hint, the hint
+/// capped at five minutes. No read or backoff wait runs past the timeout.
+/// Backpressure follows [`BackpressurePolicy::RetryInPlace`]; see
+/// [`AlpacaWalletService::with_backpressure_policy`](super::AlpacaWalletService::with_backpressure_policy)
+/// to return it instead.
 ///
 /// # Errors
 ///
 /// `TransferTimeout` once `config.timeout` passes, `InvalidStatusTransition`
-/// when the status moves backwards, or the read error once retries run out
-/// or at once when it is not retried.
+/// when the status moves backwards, the backpressure error when its wait
+/// would reach the timeout or the timeout comes during the read after it,
+/// or the read error once retries run out or at once when it is not
+/// retried.
 pub async fn poll_transfer_until_complete_with(
     transfers: &impl WalletTransfers,
     transfer_id: &AlpacaTransferId,
     config: &PollingConfig,
+) -> Result<Transfer, AlpacaWalletError> {
+    poll_transfer_until_complete_under(
+        transfers,
+        transfer_id,
+        config,
+        BackpressurePolicy::RetryInPlace,
+    )
+    .await
+}
+
+/// [`poll_transfer_until_complete_with`] under the backpressure `policy`.
+pub(super) async fn poll_transfer_until_complete_under(
+    transfers: &impl WalletTransfers,
+    transfer_id: &AlpacaTransferId,
+    config: &PollingConfig,
+    policy: BackpressurePolicy,
 ) -> Result<Transfer, AlpacaWalletError> {
     info!(target: "wallet", %transfer_id, timeout = ?config.timeout, "Polling transfer status");
 
@@ -102,6 +151,7 @@ pub async fn poll_transfer_until_complete_with(
             deadline,
             || transfers.get_transfer(transfer_id),
             retry_strategy,
+            policy,
             &timed_out,
         )
         .await?;
@@ -124,18 +174,38 @@ pub async fn poll_transfer_until_complete_with(
 /// Polls a transfer until it is `Complete` and Alpaca reports its onchain tx
 /// hash. A hash on a transfer that is not yet `Complete` is ignored. A failed
 /// read the poll retries (`is_retried`) is read again at the next interval,
-/// or after the `Retry-After` it relayed when that is longer. No read starts
-/// at or after the timeout, and a read still running there is dropped.
+/// or after the `Retry-After` it relayed when that is longer, capped at five
+/// minutes. No read starts at or after the timeout, and a read still running
+/// there is dropped. Backpressure follows
+/// [`BackpressurePolicy::RetryInPlace`], as in
+/// [`poll_transfer_until_complete_with`].
 ///
 /// # Errors
 ///
 /// `TransferTimeout` once `config.timeout` passes, `TransferFailed` or
-/// `FailedTransferHasTx` as soon as the transfer is `Failed`, or a read
-/// error that is not retried.
+/// `FailedTransferHasTx` as soon as the transfer is `Failed`, the
+/// backpressure error when its wait would reach the timeout or the timeout
+/// comes during the read after it, or a read error that is not retried.
 pub async fn poll_transfer_tx_hash_with(
     transfers: &impl WalletTransfers,
     transfer_id: &AlpacaTransferId,
     config: &PollingConfig,
+) -> Result<TxHash, AlpacaWalletError> {
+    poll_transfer_tx_hash_under(
+        transfers,
+        transfer_id,
+        config,
+        BackpressurePolicy::RetryInPlace,
+    )
+    .await
+}
+
+/// [`poll_transfer_tx_hash_with`] under the backpressure `policy`.
+pub(super) async fn poll_transfer_tx_hash_under(
+    transfers: &impl WalletTransfers,
+    transfer_id: &AlpacaTransferId,
+    config: &PollingConfig,
+    policy: BackpressurePolicy,
 ) -> Result<TxHash, AlpacaWalletError> {
     info!(target: "wallet", %transfer_id, timeout = ?config.timeout, "Polling transfer tx hash");
 
@@ -146,20 +216,33 @@ pub async fn poll_transfer_tx_hash_with(
         elapsed: start.elapsed(),
     };
 
+    let mut throttled = None;
+
     loop {
-        let read = read_before(deadline, || transfers.get_transfer(transfer_id), timed_out).await;
+        let read = read_before(
+            deadline,
+            || transfers.get_transfer(transfer_id),
+            || throttled.take().unwrap_or_else(timed_out),
+        )
+        .await;
 
         let delay = match read {
-            Ok(transfer) => match transfer_tx_hash_state(&transfer, *transfer_id)? {
-                Some(tx_hash) => return Ok(tx_hash),
-                None => config.interval,
-            },
+            Ok(transfer) => {
+                if let Some(tx_hash) = transfer_tx_hash_state(&transfer, *transfer_id)? {
+                    return Ok(tx_hash);
+                }
+                // A read answered, so the throttle is over: a later deadline
+                // is a plain pending timeout, not that 429.
+                throttled = None;
+                config.interval
+            }
             Err(error) if is_retried(&error) => {
                 warn!(target: "wallet", %transfer_id, %error, "Transfer read failed while waiting for its tx hash");
-                error
-                    .backpressure()
-                    .and_then(|hint| hint.retry_after)
-                    .map_or(config.interval, |hint| hint.max(config.interval))
+                let Some(wait) = retry_wait(&error, config.interval, policy, deadline) else {
+                    return Err(error);
+                };
+                throttled = error.backpressure().is_some().then_some(error);
+                wait
             }
             Err(error) => return Err(error),
         };
@@ -269,18 +352,33 @@ fn log_transfer_final_status(transfer_id: AlpacaTransferId, status: TransferStat
 /// [`WalletTransfers::find_deposit_by_tx_hash`], until it is detected and
 /// reaches a terminal state. A failed lookup the poll retries
 /// (`is_retried`) is looked up again after the longer of its exponential
-/// backoff and its `Retry-After` hint. No lookup or backoff wait runs past
-/// the timeout.
+/// backoff and its `Retry-After` hint, the hint capped at five minutes. No
+/// lookup or backoff wait runs past the timeout. Backpressure follows
+/// [`BackpressurePolicy::RetryInPlace`], as in
+/// [`poll_transfer_until_complete_with`].
 ///
 /// # Errors
 ///
 /// `DepositTimeout` once `config.timeout` passes, `InvalidDepositTransition`
-/// when the status moves backwards, or the lookup error once retries run out
-/// or at once when it is not retried.
+/// when the status moves backwards, the backpressure error when its wait
+/// would reach the timeout or the timeout comes during the lookup after it,
+/// or the lookup error once retries run out or at once when it is not
+/// retried.
 pub async fn poll_deposit_by_tx_hash_with(
     transfers: &impl WalletTransfers,
     tx_hash: &TxHash,
     config: &PollingConfig,
+) -> Result<Transfer, AlpacaWalletError> {
+    poll_deposit_by_tx_hash_under(transfers, tx_hash, config, BackpressurePolicy::RetryInPlace)
+        .await
+}
+
+/// [`poll_deposit_by_tx_hash_with`] under the backpressure `policy`.
+pub(super) async fn poll_deposit_by_tx_hash_under(
+    transfers: &impl WalletTransfers,
+    tx_hash: &TxHash,
+    config: &PollingConfig,
+    policy: BackpressurePolicy,
 ) -> Result<Transfer, AlpacaWalletError> {
     info!(target: "wallet", %tx_hash, timeout = ?config.timeout, "Polling deposit status");
 
@@ -302,6 +400,7 @@ pub async fn poll_deposit_by_tx_hash_with(
             deadline,
             || transfers.find_deposit_by_tx_hash(tx_hash),
             retry_strategy,
+            policy,
             &timed_out,
         )
         .await?;
@@ -385,6 +484,7 @@ mod tests {
 
     use crate::broker::AlpacaAccountId;
     use crate::core::{AlpacaAuth, GatewayHopError};
+    use crate::rate_limit::MAX_RETRY_AFTER_HOLD;
     use crate::wallet::client::AlpacaWalletClient;
 
     const TEST_ACCOUNT_ID: AlpacaAccountId =
@@ -647,8 +747,10 @@ mod tests {
         stalled_read.assert();
     }
 
+    /// A `Retry-After` that outlasts the timeout ends the poll with the 429
+    /// and its hint at once, not with the timeout once the deadline comes.
     #[tokio::test]
-    async fn transfer_tx_hash_poll_respects_retry_after_without_exceeding_deadline() {
+    async fn transfer_tx_hash_poll_returns_a_429_whose_retry_after_outlasts_the_deadline() {
         let server = MockServer::start();
         let transfer_id = Uuid::new_v4();
         let rate_limited = server.mock(|when, then| {
@@ -676,21 +778,22 @@ mod tests {
             max_retry_delay: Duration::from_millis(10),
         };
 
-        let result = tokio::time::timeout(
+        let error = tokio::time::timeout(
             Duration::from_millis(500),
             poll_transfer_tx_hash_with(&client, &transfer_id.into(), &config),
         )
         .await
-        .expect("the Retry-After delay must be clamped to the polling deadline");
-        assert!(matches!(
-            result,
-            Err(AlpacaWalletError::TransferTimeout { .. })
-        ));
-        assert_eq!(
-            rate_limited.calls(),
-            1,
-            "the Retry-After hint must delay the next read"
+        .expect("the poll must end before its deadline")
+        .unwrap_err();
+        assert!(
+            matches!(error, AlpacaWalletError::ApiError { status, .. } if status == StatusCode::TOO_MANY_REQUESTS),
+            "{error:?}"
         );
+        assert_eq!(
+            error.backpressure().and_then(|hint| hint.retry_after),
+            Some(Duration::from_secs(1))
+        );
+        assert_eq!(rate_limited.calls(), 1);
     }
 
     #[tokio::test]
@@ -1375,6 +1478,38 @@ mod tests {
         }
     }
 
+    /// A 429 that a later read answers is over: a tx hash poll that then only
+    /// reads `PENDING` ends with `TransferTimeout`, not that old 429.
+    #[tokio::test(start_paused = true)]
+    async fn transfer_tx_hash_poll_times_out_after_a_429_that_later_reads_answered() {
+        let transfer_id = Uuid::new_v4();
+        let pending = transfer_for_hash_poll(transfer_id, "PENDING", None);
+        let config = PollingConfig {
+            interval: Duration::from_secs(1),
+            timeout: Duration::from_secs(5),
+            max_retries: 1,
+            min_retry_delay: Duration::from_secs(1),
+            max_retry_delay: Duration::from_secs(1),
+        };
+        let limited = AlpacaWalletError::ApiError {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            message: String::new(),
+            retry_after: Some(Duration::from_secs(1)),
+        };
+        let mut reads = vec![Err(limited)];
+        reads.extend((0..20).map(|_| Ok(pending.clone())));
+        let transfers = ScriptedTransfers::new(reads, vec![]);
+
+        let error = poll_transfer_tx_hash_with(&transfers, &transfer_id.into(), &config)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, AlpacaWalletError::TransferTimeout { .. }),
+            "{error:?}"
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn backoff_polls_wait_out_retry_after_before_their_next_read() {
         let transfer_id = Uuid::new_v4();
@@ -1630,5 +1765,218 @@ mod tests {
             "{error:?}"
         );
         assert_eq!(started.elapsed(), deadline);
+    }
+
+    fn rate_limited(retry_after: Duration) -> AlpacaWalletError {
+        AlpacaWalletError::ApiError {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            message: String::new(),
+            retry_after: Some(retry_after),
+        }
+    }
+
+    fn assert_rate_limited(error: &AlpacaWalletError, retry_after: Duration) {
+        assert!(
+            matches!(error, AlpacaWalletError::ApiError { status, .. } if *status == StatusCode::TOO_MANY_REQUESTS),
+            "{error:?}"
+        );
+        assert_eq!(
+            error.backpressure().and_then(|hint| hint.retry_after),
+            Some(retry_after)
+        );
+    }
+
+    /// A `Retry-After` that outlasts the timeout ends each wallet poll at
+    /// once with the 429 and its hint, not with the timeout: a caller that
+    /// keeps a pending deposit only on backpressure still sees it.
+    #[tokio::test(start_paused = true)]
+    async fn wallet_polls_return_a_429_whose_wait_would_reach_the_timeout() {
+        let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
+        let tx_hash =
+            fixed_bytes!("abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890");
+        let retry_after = Duration::from_mins(2);
+        let config = fast_polling(Duration::from_mins(1));
+
+        let transfers = ScriptedTransfers::new(vec![Err(rate_limited(retry_after))], vec![]);
+        let started = Instant::now();
+        let error = poll_transfer_until_complete_with(&transfers, &transfer_id, &config)
+            .await
+            .unwrap_err();
+        assert_rate_limited(&error, retry_after);
+        assert_eq!(started.elapsed(), Duration::ZERO);
+        assert_eq!(transfers.left(), 0);
+
+        let hashes = ScriptedTransfers::new(vec![Err(rate_limited(retry_after))], vec![]);
+        let error = poll_transfer_tx_hash_with(&hashes, &transfer_id, &config)
+            .await
+            .unwrap_err();
+        assert_rate_limited(&error, retry_after);
+        assert_eq!(started.elapsed(), Duration::ZERO);
+        assert_eq!(hashes.left(), 0);
+
+        let deposits = ScriptedTransfers::new(vec![], vec![Err(rate_limited(retry_after))]);
+        let error = poll_deposit_by_tx_hash_with(&deposits, &tx_hash, &config)
+            .await
+            .unwrap_err();
+        assert_rate_limited(&error, retry_after);
+        assert_eq!(started.elapsed(), Duration::ZERO);
+        assert_eq!(deposits.left(), 0);
+    }
+
+    /// An unbounded `Retry-After` holds each wallet poll for at most
+    /// `MAX_RETRY_AFTER_HOLD` before its next read.
+    #[tokio::test(start_paused = true)]
+    async fn wallet_polls_cap_a_retry_after_wait_at_the_max_hold() {
+        let transfer_id = Uuid::new_v4();
+        let tx_hash =
+            fixed_bytes!("abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890");
+        let complete = transfer_for_hash_poll(transfer_id, "COMPLETE", Some(tx_hash));
+        let unbounded = || rate_limited(Duration::from_secs(86_400));
+        let config = fast_polling(Duration::from_hours(1));
+
+        let transfers =
+            ScriptedTransfers::new(vec![Err(unbounded()), Ok(complete.clone())], vec![]);
+        let started = Instant::now();
+        poll_transfer_until_complete_with(&transfers, &transfer_id.into(), &config)
+            .await
+            .unwrap();
+        assert_eq!(started.elapsed(), MAX_RETRY_AFTER_HOLD);
+
+        let hashes = ScriptedTransfers::new(vec![Err(unbounded()), Ok(complete.clone())], vec![]);
+        let started = Instant::now();
+        poll_transfer_tx_hash_with(&hashes, &transfer_id.into(), &config)
+            .await
+            .unwrap();
+        assert_eq!(started.elapsed(), MAX_RETRY_AFTER_HOLD);
+
+        let deposits = ScriptedTransfers::new(vec![], vec![Err(unbounded()), Ok(Some(complete))]);
+        let started = Instant::now();
+        poll_deposit_by_tx_hash_with(&deposits, &tx_hash, &config)
+            .await
+            .unwrap();
+        assert_eq!(started.elapsed(), MAX_RETRY_AFTER_HOLD);
+    }
+
+    /// Answers the first read and lookup with a 429, then stalls the next
+    /// one past any deadline.
+    struct ThrottledThenStalled {
+        retry_after: Duration,
+        throttled: std::cell::Cell<bool>,
+    }
+
+    impl ThrottledThenStalled {
+        fn new(retry_after: Duration) -> Self {
+            Self {
+                retry_after,
+                throttled: std::cell::Cell::new(false),
+            }
+        }
+
+        fn answer<T: Send>(&self) -> impl Future<Output = Result<T, AlpacaWalletError>> + Send {
+            let first = !self.throttled.replace(true);
+            let error = first.then(|| rate_limited(self.retry_after));
+            async move {
+                match error {
+                    Some(error) => Err(error),
+                    None => std::future::pending().await,
+                }
+            }
+        }
+    }
+
+    impl WalletTransfers for ThrottledThenStalled {
+        fn get_transfer(
+            &self,
+            _transfer_id: &AlpacaTransferId,
+        ) -> impl Future<Output = Result<Transfer, AlpacaWalletError>> + Send {
+            self.answer()
+        }
+
+        fn find_deposit_by_tx_hash(
+            &self,
+            _tx_hash: &TxHash,
+        ) -> impl Future<Output = Result<Option<Transfer>, AlpacaWalletError>> + Send {
+            self.answer()
+        }
+    }
+
+    /// A deadline that comes during the read after a backpressure wait ends
+    /// each wallet poll with that 429, not with the timeout.
+    #[tokio::test(start_paused = true)]
+    async fn wallet_polls_return_the_last_429_when_the_deadline_comes_after_its_wait() {
+        let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
+        let tx_hash =
+            fixed_bytes!("abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890");
+        let retry_after = Duration::from_secs(30);
+        let timeout = Duration::from_mins(1);
+        let config = fast_polling(timeout);
+
+        let started = Instant::now();
+        let error = poll_transfer_until_complete_with(
+            &ThrottledThenStalled::new(retry_after),
+            &transfer_id,
+            &config,
+        )
+        .await
+        .unwrap_err();
+        assert_rate_limited(&error, retry_after);
+        assert_eq!(started.elapsed(), timeout);
+
+        let started = Instant::now();
+        let error = poll_transfer_tx_hash_with(
+            &ThrottledThenStalled::new(retry_after),
+            &transfer_id,
+            &config,
+        )
+        .await
+        .unwrap_err();
+        assert_rate_limited(&error, retry_after);
+        assert_eq!(started.elapsed(), timeout);
+
+        let started = Instant::now();
+        let error = poll_deposit_by_tx_hash_with(
+            &ThrottledThenStalled::new(retry_after),
+            &tx_hash,
+            &config,
+        )
+        .await
+        .unwrap_err();
+        assert_rate_limited(&error, retry_after);
+        assert_eq!(started.elapsed(), timeout);
+    }
+
+    /// Under `BackpressurePolicy::Return` each wallet poll ends on its first
+    /// throttled read with the 429 and its hint, even with time to spare.
+    #[tokio::test(start_paused = true)]
+    async fn wallet_polls_return_a_429_at_once_under_the_return_policy() {
+        let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
+        let tx_hash =
+            fixed_bytes!("abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890");
+        let retry_after = Duration::from_secs(1);
+        let config = fast_polling(Duration::from_hours(1));
+        let policy = BackpressurePolicy::Return;
+
+        let transfers = ScriptedTransfers::new(vec![Err(rate_limited(retry_after))], vec![]);
+        let started = Instant::now();
+        let error = poll_transfer_until_complete_under(&transfers, &transfer_id, &config, policy)
+            .await
+            .unwrap_err();
+        assert_rate_limited(&error, retry_after);
+        assert_eq!(transfers.left(), 0);
+
+        let hashes = ScriptedTransfers::new(vec![Err(rate_limited(retry_after))], vec![]);
+        let error = poll_transfer_tx_hash_under(&hashes, &transfer_id, &config, policy)
+            .await
+            .unwrap_err();
+        assert_rate_limited(&error, retry_after);
+        assert_eq!(hashes.left(), 0);
+
+        let deposits = ScriptedTransfers::new(vec![], vec![Err(rate_limited(retry_after))]);
+        let error = poll_deposit_by_tx_hash_under(&deposits, &tx_hash, &config, policy)
+            .await
+            .unwrap_err();
+        assert_rate_limited(&error, retry_after);
+        assert_eq!(deposits.left(), 0);
+        assert_eq!(started.elapsed(), Duration::ZERO);
     }
 }

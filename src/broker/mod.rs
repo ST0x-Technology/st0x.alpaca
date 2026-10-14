@@ -47,6 +47,7 @@ mod session;
 pub use activity::{AccountActivitiesQuery, AccountActivity};
 pub use amount::AlpacaAmount;
 // `AssetDetails` is the CLI's overnight/fractional asset-inspection surface.
+pub use crate::core::BackpressurePolicy;
 pub use api::{AlpacaBrokerApi, AssetDetails, PreparedShares};
 pub use auth::{AccountStatus, AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode};
 // Exposed as the single source of truth for the broker HTTP request timeout so

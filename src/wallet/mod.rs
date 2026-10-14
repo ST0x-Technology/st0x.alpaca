@@ -37,6 +37,7 @@ use st0x_finance::Usdc;
 
 use crate::broker::{AlpacaAccountId, Positive};
 
+pub use crate::core::BackpressurePolicy;
 #[cfg(any(test, feature = "test-support"))]
 pub use client::AlpacaWalletClient;
 #[cfg(not(any(test, feature = "test-support")))]
@@ -45,6 +46,9 @@ pub use client::AlpacaWalletError;
 pub use status::{
     PollingConfig, poll_deposit_by_tx_hash_with, poll_transfer_tx_hash_with,
     poll_transfer_until_complete_with,
+};
+use status::{
+    poll_deposit_by_tx_hash_under, poll_transfer_tx_hash_under, poll_transfer_until_complete_under,
 };
 pub use transfer::{
     AlpacaTransferId, Network, ReportedFeesError, TokenSymbol, Transfer, TransferDirection,
@@ -59,6 +63,7 @@ pub use whitelist::{TravelRuleInfo, WhitelistEntry, WhitelistStatus};
 pub struct AlpacaWalletService {
     client: Arc<AlpacaWalletClient>,
     polling_config: PollingConfig,
+    backpressure_policy: BackpressurePolicy,
 }
 
 impl AlpacaWalletService {
@@ -77,6 +82,7 @@ impl AlpacaWalletService {
         Ok(Self {
             client: Arc::new(client),
             polling_config: PollingConfig::default(),
+            backpressure_policy: BackpressurePolicy::default(),
         })
     }
 
@@ -101,6 +107,7 @@ impl AlpacaWalletService {
         Ok(Self {
             client: Arc::new(client),
             polling_config: PollingConfig::default(),
+            backpressure_policy: BackpressurePolicy::default(),
         })
     }
 
@@ -112,7 +119,24 @@ impl AlpacaWalletService {
         Self {
             client: Arc::new(client),
             polling_config: polling_config.unwrap_or_default(),
+            backpressure_policy: BackpressurePolicy::default(),
         }
+    }
+
+    /// Sets what the transfer and deposit polls do with a read throttled by
+    /// Alpaca (a 429, or a throttle relayed as one).
+    /// [`BackpressurePolicy::RetryInPlace`], the default, waits it out
+    /// inside the poll; [`BackpressurePolicy::Return`] ends the poll with it
+    /// at once, `Retry-After` hint included, so a caller on a shared worker
+    /// can reschedule instead.
+    ///
+    /// The policy covers this service only. The public `*_with` poll
+    /// functions, which the gateway adapters in `crates/gateway-api` run,
+    /// always retry in place.
+    #[must_use]
+    pub fn with_backpressure_policy(mut self, policy: BackpressurePolicy) -> Self {
+        self.backpressure_policy = policy;
+        self
     }
 
     /// Initiates a withdrawal to a whitelisted address: the whitelist check
@@ -183,7 +207,8 @@ impl AlpacaWalletService {
     }
 
     /// Polls a transfer until it reaches a terminal state (Complete or Failed).
-    /// See [`poll_transfer_until_complete_with`].
+    /// See [`poll_transfer_until_complete_with`]; a throttled read follows
+    /// [`Self::with_backpressure_policy`].
     ///
     /// This method will retry transient errors and timeout after the configured duration.
     ///
@@ -191,17 +216,26 @@ impl AlpacaWalletService {
     ///
     /// Returns an error if:
     /// - The transfer times out
+    /// - A read is throttled under [`BackpressurePolicy::Return`], or its
+    ///   wait would reach the timeout
     /// - An invalid status regression is detected
     /// - The API call fails persistently
     pub async fn poll_transfer_until_complete(
         &self,
         transfer_id: &AlpacaTransferId,
     ) -> Result<Transfer, AlpacaWalletError> {
-        poll_transfer_until_complete_with(&*self.client, transfer_id, &self.polling_config).await
+        poll_transfer_until_complete_under(
+            &*self.client,
+            transfer_id,
+            &self.polling_config,
+            self.backpressure_policy,
+        )
+        .await
     }
 
     /// Polls a transfer until it is `Complete` and Alpaca reports its onchain
-    /// tx hash. See [`poll_transfer_tx_hash_with`].
+    /// tx hash. See [`poll_transfer_tx_hash_with`]; a throttled read follows
+    /// [`Self::with_backpressure_policy`].
     ///
     /// # Errors
     ///
@@ -210,7 +244,13 @@ impl AlpacaWalletService {
         &self,
         transfer_id: &AlpacaTransferId,
     ) -> Result<TxHash, AlpacaWalletError> {
-        poll_transfer_tx_hash_with(&*self.client, transfer_id, &self.polling_config).await
+        poll_transfer_tx_hash_under(
+            &*self.client,
+            transfer_id,
+            &self.polling_config,
+            self.backpressure_policy,
+        )
+        .await
     }
 
     /// Reads a transfer's current state once, with no polling.
@@ -226,7 +266,8 @@ impl AlpacaWalletService {
     }
 
     /// Polls for an incoming deposit by its onchain transaction hash. See
-    /// [`poll_deposit_by_tx_hash_with`].
+    /// [`poll_deposit_by_tx_hash_with`]; a throttled lookup follows
+    /// [`Self::with_backpressure_policy`].
     ///
     /// Alpaca auto-detects incoming transfers to their funding wallet addresses.
     /// This method polls until the deposit is detected and reaches a terminal state.
@@ -235,12 +276,20 @@ impl AlpacaWalletService {
     ///
     /// Returns an error if:
     /// - The deposit times out (not detected within timeout)
+    /// - A lookup is throttled under [`BackpressurePolicy::Return`], or its
+    ///   wait would reach the timeout
     /// - The API call fails persistently
     pub async fn poll_deposit_by_tx_hash(
         &self,
         tx_hash: &TxHash,
     ) -> Result<Transfer, AlpacaWalletError> {
-        poll_deposit_by_tx_hash_with(&*self.client, tx_hash, &self.polling_config).await
+        poll_deposit_by_tx_hash_under(
+            &*self.client,
+            tx_hash,
+            &self.polling_config,
+            self.backpressure_policy,
+        )
+        .await
     }
 
     /// Finds an incoming deposit by its on-chain transaction hash with a
@@ -937,5 +986,57 @@ mod tests {
         assert_eq!(found.direction, TransferDirection::Incoming);
         assert_eq!(missing.map(|transfer| transfer.id), None);
         transfers.assert_calls(2);
+    }
+
+    /// A service set to `BackpressurePolicy::Return` ends each poll on the
+    /// first 429, with its `Retry-After` hint, after one call to Alpaca.
+    #[tokio::test]
+    async fn polls_return_a_429_at_once_under_the_return_policy() {
+        let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
+        let tx_hash =
+            fixed_bytes!("abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890");
+        let retry_after = Duration::from_secs(30);
+
+        for poll in 0..3 {
+            let server = MockServer::start();
+            let throttled = server.mock(|when, then| {
+                when.method(GET).path_includes(
+                    "/v1/accounts/904837e3-3b76-47ec-b432-046db621571b/wallets/transfers",
+                );
+                then.status(429)
+                    .header("Retry-After", "30")
+                    .body("rate limited");
+            });
+            let service =
+                create_test_service(&server).with_backpressure_policy(BackpressurePolicy::Return);
+
+            let error = tokio::time::timeout(Duration::from_secs(5), async {
+                match poll {
+                    0 => service
+                        .poll_transfer_until_complete(&transfer_id)
+                        .await
+                        .map(drop),
+                    1 => service.poll_transfer_tx_hash(&transfer_id).await.map(drop),
+                    _ => service.poll_deposit_by_tx_hash(&tx_hash).await.map(drop),
+                }
+            })
+            .await
+            .expect("the poll must return the 429 at once")
+            .unwrap_err();
+
+            assert!(
+                matches!(
+                    error,
+                    AlpacaWalletError::ApiError { status, .. }
+                        if status == reqwest::StatusCode::TOO_MANY_REQUESTS
+                ),
+                "{error:?}"
+            );
+            assert_eq!(
+                error.backpressure().and_then(|hint| hint.retry_after),
+                Some(retry_after)
+            );
+            throttled.assert_calls(1);
+        }
     }
 }
