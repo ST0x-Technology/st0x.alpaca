@@ -22,7 +22,7 @@ One image serves both accounts. `profile` in config picks the account's operatio
 
 `t0` serves none of the four issuer and stream operations on any tier.
 
-`tiers` in config picks which tiers a deployment serves, so one profile can run as more than one deployment, each with its own credential. The T0 account runs two:
+`tiers` in config picks which tiers a deployment serves, so one profile can run as more than one deployment, each with its own config and runtime service account. The T0 account runs two:
 
 | Deployment | `profile` | `tiers` | Caller | Credential |
 | --- | --- | --- | --- | --- |
@@ -112,7 +112,7 @@ read_audience = "/projects/<number>/global/backendServices/<read backend id>"
 write_audience = "/projects/<number>/global/backendServices/<write backend id>"
 
 [wallet]
-# Every address the t0-liqbot config lists: an operator withdrawal to any of them is refused. Add a bot destination here before t0-liqbot, and remove one from t0-liqbot before here. Validation refuses an empty list here.
+# Every address the t0-liqbot config lists: an operator withdrawal to any of them is refused. Change both lists in the order the Rollback section gives. Validation refuses an empty list here.
 bot_withdrawal_destinations = ["<liquidity market maker wallet>"]
 travel_rule_beneficiary = "<beneficiary entity name>"
 
@@ -159,7 +159,7 @@ The image has no base layer and a pinned creation time, so a commit always rebui
 
 ## Deploying the T0 gateways to staging
 
-The T0 account runs two Cloud Run services from the same image, each with its own runtime service account, credential, and config: `t0-liqbot` for the liquidity runtime and `t0-humans` for operators. Concrete organization, project, identity, key, registry, secret, and log routing names belong in the private infrastructure repository.
+The T0 account runs two Cloud Run services from the same image, each with its own runtime service account and config: `t0-liqbot` for the liquidity runtime, with the liquidity bot's existing credential, and `t0-humans` for operators, with a new one. Concrete organization, project, identity, key, registry, secret, and log routing names belong in the private infrastructure repository.
 
 `t0-liqbot` needs:
 
@@ -215,7 +215,7 @@ gcloud run services update-traffic <service> --project <project> --region <regio
 
 ## Rollback
 
-All three deployments roll back the same way. Every action below changes one deployment, its config or its service. To change the whole T0 account, apply it to both `t0-liqbot` and `t0-humans`. When the change moves `wallet.bot_withdrawal_destinations`, the `t0-humans` list must hold every `t0-liqbot` address at every moment: roll `t0-humans` first when a change adds an address, and `t0-liqbot` first, serving before `t0-humans` moves, when it removes one (a rollback that restores an older list included).
+All three deployments roll back the same way. Every action below changes one deployment, its config or its service. To change the whole T0 account, apply it to both `t0-liqbot` and `t0-humans`. When the change moves `wallet.bot_withdrawal_destinations`, the `t0-humans` list must hold every `t0-liqbot` address at every moment, so every change (a rollback that restores an older list included) takes three rolls, each serving before the next starts: `t0-humans` to the old and new addresses together, then `t0-liqbot` to the new list, then `t0-humans` to the new list. A change that only adds an address skips the last roll, and one that only removes an address skips the first. Emptying the `t0-liqbot` list to stop the bot (the row below) is the one change that leaves `t0-humans` as it is: validation refuses an empty list there, and an extra address there only refuses operators an address the bot no longer uses.
 
 | Problem | Action | Effect |
 | --- | --- | --- |
