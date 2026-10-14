@@ -39,11 +39,14 @@ use super::{ClientRequestId, IssuerRequestId, TokenizationRequestId};
 use crate::auth::{ALPACA_TOKEN_URL, AuthRuntime, KmsJwtError};
 use crate::broker::AlpacaAccountId;
 use crate::core::{
-    AlpacaAuth, Backpressure, GatewayHopError, Network as Chain, Permanence,
+    AlpacaAuth, Backpressure, BackpressurePolicy, GatewayHopError, Network as Chain, Permanence,
     response_status_permanence,
 };
 use crate::endpoint::{EndpointError, EndpointRole, validate_origin};
-use crate::rate_limit::{poll_deadline, read_before, retry_after_from_response_headers};
+use crate::rate_limit::{
+    backpressure_wait, next_poll_delay, poll_deadline, read_before,
+    retry_after_from_response_headers,
+};
 use crate::request_id::{GateClosed, SendError};
 use crate::wallet::{Network, PollingConfig};
 
@@ -53,6 +56,7 @@ use crate::wallet::{Network, PollingConfig};
 pub struct AlpacaTokenizationService {
     client: AlpacaTokenizationClient,
     polling_config: PollingConfig,
+    backpressure_policy: BackpressurePolicy,
 }
 
 impl AlpacaTokenizationService {
@@ -76,6 +80,7 @@ impl AlpacaTokenizationService {
         Ok(Self {
             client,
             polling_config: PollingConfig::default(),
+            backpressure_policy: BackpressurePolicy::default(),
         })
     }
 
@@ -83,6 +88,22 @@ impl AlpacaTokenizationService {
     #[must_use]
     pub fn with_polling_config(mut self, polling_config: PollingConfig) -> Self {
         self.polling_config = polling_config;
+        self
+    }
+
+    /// Sets what the mint and redemption polls do with a lookup throttled by
+    /// Alpaca (a 429, or a throttle relayed as one).
+    /// [`BackpressurePolicy::RetryInPlace`], the default, waits it out
+    /// inside the poll; [`BackpressurePolicy::Return`] ends the poll with it
+    /// at once, `Retry-After` hint included, so a caller on a shared worker
+    /// can reschedule instead.
+    ///
+    /// The policy covers this service only. The public `*_with` poll
+    /// functions, which the gateway adapters in `crates/gateway-api` run,
+    /// always retry in place.
+    #[must_use]
+    pub fn with_backpressure_policy(mut self, policy: BackpressurePolicy) -> Self {
+        self.backpressure_policy = policy;
         self
     }
 
@@ -115,12 +136,14 @@ impl AlpacaTokenizationService {
     /// # Errors
     ///
     /// Returns `PollTimeout` on timeout, or the first lookup error that is
-    /// not transient, as [`poll_request_until_complete_with`] describes.
+    /// not transient, as [`poll_request_until_complete_with`] describes; a
+    /// throttled lookup follows [`Self::with_backpressure_policy`].
     pub async fn poll_mint_until_complete(
         &self,
         id: &TokenizationRequestId,
     ) -> Result<TokenizationRequest, AlpacaTokenizationError> {
-        poll_request_until_complete_with(self, id, &self.polling_config).await
+        poll_request_until_complete_under(self, id, &self.polling_config, self.backpressure_policy)
+            .await
     }
 
     /// Find a mint request by our stable internal issuer request id, matched
@@ -157,12 +180,19 @@ impl AlpacaTokenizationService {
     /// # Errors
     ///
     /// Returns `PollTimeout` on timeout, or the first lookup error that is
-    /// not transient, as [`poll_for_redemption_with`] describes.
+    /// not transient, as [`poll_for_redemption_with`] describes; a throttled
+    /// lookup follows [`Self::with_backpressure_policy`].
     pub async fn poll_for_redemption(
         &self,
         tx_hash: &TxHash,
     ) -> Result<TokenizationRequest, AlpacaTokenizationError> {
-        poll_for_redemption_with(self, tx_hash, &self.polling_config).await
+        poll_for_redemption_under(
+            self,
+            tx_hash,
+            &self.polling_config,
+            self.backpressure_policy,
+        )
+        .await
     }
 
     /// Find a redemption request by its onchain token transfer transaction.
@@ -182,12 +212,14 @@ impl AlpacaTokenizationService {
     /// # Errors
     ///
     /// Returns `PollTimeout` on timeout, or the first lookup error that is
-    /// not transient, as [`poll_request_until_complete_with`] describes.
+    /// not transient, as [`poll_request_until_complete_with`] describes; a
+    /// throttled lookup follows [`Self::with_backpressure_policy`].
     pub async fn poll_redemption_until_complete(
         &self,
         id: &TokenizationRequestId,
     ) -> Result<TokenizationRequest, AlpacaTokenizationError> {
-        poll_request_until_complete_with(self, id, &self.polling_config).await
+        poll_request_until_complete_under(self, id, &self.polling_config, self.backpressure_policy)
+            .await
     }
 
     /// List all tokenization requests.
@@ -242,6 +274,7 @@ impl AlpacaTokenizationService {
         Self {
             client,
             polling_config,
+            backpressure_policy: BackpressurePolicy::default(),
         }
     }
 }
@@ -296,16 +329,31 @@ impl TokenizationLookups for AlpacaTokenizationService {
 }
 
 /// Polls a mint or redemption request until it is completed or rejected.
+/// Backpressure follows [`BackpressurePolicy::RetryInPlace`]; see
+/// [`AlpacaTokenizationService::with_backpressure_policy`] to return it
+/// instead.
 ///
 /// # Errors
 ///
 /// `PollTimeout` once `config.timeout` passes, also when a lookup is still
-/// running there or the next lookup is not due before it, or the first
-/// lookup error that is not transient, as `retry_transient` describes.
+/// running there or the next lookup is not due before it; the backpressure
+/// error instead when its wait would reach the timeout or the timeout comes
+/// before the lookup after that wait answers; or the first lookup error that
+/// is not transient, as `retry_transient` describes.
 pub async fn poll_request_until_complete_with(
     lookups: &impl TokenizationLookups,
     id: &TokenizationRequestId,
     config: &PollingConfig,
+) -> Result<TokenizationRequest, AlpacaTokenizationError> {
+    poll_request_until_complete_under(lookups, id, config, BackpressurePolicy::RetryInPlace).await
+}
+
+/// [`poll_request_until_complete_with`] under the backpressure `policy`.
+async fn poll_request_until_complete_under(
+    lookups: &impl TokenizationLookups,
+    id: &TokenizationRequestId,
+    config: &PollingConfig,
+    policy: BackpressurePolicy,
 ) -> Result<TokenizationRequest, AlpacaTokenizationError> {
     let start = Instant::now();
     let deadline = poll_deadline(start, config.timeout);
@@ -314,19 +362,28 @@ pub async fn poll_request_until_complete_with(
     };
     let mut interval = tokio::time::interval(config.interval);
     interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut throttled = None;
 
     loop {
-        tick_before(&mut interval, deadline, timed_out).await?;
+        tick_before(&mut interval, deadline, || {
+            throttled.take().unwrap_or_else(timed_out)
+        })
+        .await?;
 
-        let request = match read_before(deadline, || lookups.get_request(id), timed_out).await {
+        let lookup = read_before(
+            deadline,
+            || lookups.get_request(id),
+            || throttled.take().unwrap_or_else(timed_out),
+        )
+        .await;
+        let request = match lookup {
             Ok(request) => request,
             Err(error) => {
-                if let Some(wait) = retry_transient(error)? {
-                    sleep_before(deadline, wait, timed_out).await?;
-                }
+                throttled = retry_transient(error, policy, deadline).await?;
                 continue;
             }
         };
+        throttled = None;
 
         match request.status {
             TokenizationRequestStatus::Completed | TokenizationRequestStatus::Rejected => {
@@ -351,17 +408,30 @@ pub async fn poll_request_until_complete_with(
 }
 
 /// Polls until the issuer detects the redemption transfer `tx_hash`.
+/// Backpressure follows [`BackpressurePolicy::RetryInPlace`], as in
+/// [`poll_request_until_complete_with`].
 ///
 /// # Errors
 ///
 /// `PollTimeout` once `config.timeout` passes before detection, also when a
-/// lookup is still running there or the next lookup is not due before it,
-/// or the first lookup error that is not transient, as `retry_transient`
-/// describes.
+/// lookup is still running there or the next lookup is not due before it;
+/// the backpressure error instead when its wait would reach the timeout or
+/// the timeout comes before the lookup after that wait answers; or the first
+/// lookup error that is not transient, as `retry_transient` describes.
 pub async fn poll_for_redemption_with(
     lookups: &impl TokenizationLookups,
     tx_hash: &TxHash,
     config: &PollingConfig,
+) -> Result<TokenizationRequest, AlpacaTokenizationError> {
+    poll_for_redemption_under(lookups, tx_hash, config, BackpressurePolicy::RetryInPlace).await
+}
+
+/// [`poll_for_redemption_with`] under the backpressure `policy`.
+async fn poll_for_redemption_under(
+    lookups: &impl TokenizationLookups,
+    tx_hash: &TxHash,
+    config: &PollingConfig,
+    policy: BackpressurePolicy,
 ) -> Result<TokenizationRequest, AlpacaTokenizationError> {
     let start = Instant::now();
     let deadline = poll_deadline(start, config.timeout);
@@ -371,24 +441,25 @@ pub async fn poll_for_redemption_with(
     let mut interval = tokio::time::interval(config.interval);
     interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
-    loop {
-        tick_before(&mut interval, deadline, timed_out).await?;
+    let mut throttled = None;
 
-        match read_before(
+    loop {
+        tick_before(&mut interval, deadline, || {
+            throttled.take().unwrap_or_else(timed_out)
+        })
+        .await?;
+
+        let lookup = read_before(
             deadline,
             || lookups.find_redemption_by_tx(tx_hash),
-            timed_out,
+            || throttled.take().unwrap_or_else(timed_out),
         )
-        .await
-        {
+        .await;
+        throttled = match lookup {
             Ok(Some(request)) => return Ok(request),
-            Ok(None) => {}
-            Err(error) => {
-                if let Some(wait) = retry_transient(error)? {
-                    sleep_before(deadline, wait, timed_out).await?;
-                }
-            }
-        }
+            Ok(None) => None,
+            Err(error) => retry_transient(error, policy, deadline).await?,
+        };
     }
 }
 
@@ -406,31 +477,36 @@ async fn tick_before(
         .map_err(|_| timed_out())
 }
 
-/// Waits out a relayed `Retry-After` unless the poll deadline comes first.
-async fn sleep_before(
-    deadline: Instant,
-    wait: Duration,
-    timed_out: impl FnOnce() -> AlpacaTokenizationError,
-) -> Result<(), AlpacaTokenizationError> {
-    tokio::time::timeout_at(deadline, tokio::time::sleep(wait))
-        .await
-        .map_err(|_| timed_out())
-}
-
 /// The retry rule of the tokenization polls, the one the wallet polls
 /// follow: a lookup error [`AlpacaTokenizationError::permanence`] calls
-/// transient is looked up again, after its `Retry-After` hint when it carries
-/// one; every other lookup error, the poll's own timeout included, ends the
-/// poll.
-fn retry_transient(
+/// transient is looked up again at the next interval; every other lookup
+/// error, the poll's own timeout included, ends the poll. A backpressure
+/// error is first waited out, its `Retry-After` hint capped at five
+/// minutes, and handed back so a deadline before the next lookup answers
+/// ends the poll with it; under [`BackpressurePolicy::Return`], or when the
+/// wait would reach the deadline, it ends the poll at once. The wait itself
+/// never runs past the deadline, so a late timer still ends the poll there
+/// with this error.
+async fn retry_transient(
     error: AlpacaTokenizationError,
-) -> Result<Option<Duration>, AlpacaTokenizationError> {
+    policy: BackpressurePolicy,
+    deadline: Instant,
+) -> Result<Option<AlpacaTokenizationError>, AlpacaTokenizationError> {
     if error.permanence() != Permanence::Transient {
         return Err(error);
     }
 
-    warn!(target: "tokenization", %error, "Tokenization lookup failed, polling again");
-    Ok(error.backpressure().and_then(|hint| hint.retry_after))
+    let Some(backpressure) = error.backpressure() else {
+        warn!(target: "tokenization", %error, "Tokenization lookup failed, polling again");
+        return Ok(None);
+    };
+    let Some(wait) = backpressure_wait(policy, backpressure, Duration::ZERO, deadline) else {
+        return Err(error);
+    };
+
+    warn!(target: "tokenization", %error, ?wait, "Tokenization lookup throttled, polling again");
+    tokio::time::sleep(next_poll_delay(wait, deadline)).await;
+    Ok(Some(error))
 }
 
 /// Type of tokenization request.
@@ -1372,6 +1448,7 @@ mod tests {
     use st0x_float_macro::float;
 
     use super::*;
+    use crate::rate_limit::MAX_RETRY_AFTER_HOLD;
     use crate::tokenization::{issuer_request_id, tokenization_request_id};
 
     const TEST_ACCOUNT_ID: AlpacaAccountId =
@@ -3389,10 +3466,12 @@ mod tests {
             }
         }
     }
-    /// Both polls honor a relayed wait longer than their interval, without
-    /// sleeping beyond their own deadline.
+    /// Both polls honor a relayed wait longer than their interval, capped at
+    /// `MAX_RETRY_AFTER_HOLD`, and a wait that would reach their deadline
+    /// ends them at once with the throttled lookup's error rather than with
+    /// `PollTimeout` at the deadline.
     #[tokio::test(start_paused = true)]
-    async fn tokenization_polls_honor_retry_after_without_exceeding_the_deadline() {
+    async fn tokenization_polls_honor_a_capped_retry_after_without_reaching_the_deadline() {
         let retry_after = Duration::from_mins(10);
         let config = PollingConfig {
             interval: Duration::from_mins(1),
@@ -3411,7 +3490,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(started.elapsed(), retry_after);
+        assert_eq!(started.elapsed(), MAX_RETRY_AFTER_HOLD);
         assert_eq!(requests.calls(), 2);
 
         let redemptions = ScriptedLookups::redemptions(move |call| match call {
@@ -3422,7 +3501,7 @@ mod tests {
         poll_for_redemption_with(&redemptions, &TxHash::ZERO, &config)
             .await
             .unwrap();
-        assert_eq!(started.elapsed(), retry_after);
+        assert_eq!(started.elapsed(), MAX_RETRY_AFTER_HOLD);
         assert_eq!(redemptions.calls(), 2);
 
         let timeout = Duration::from_mins(5);
@@ -3440,11 +3519,12 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(
-            matches!(error, AlpacaTokenizationError::PollTimeout { .. }),
+        assert_eq!(
+            error.backpressure().and_then(|hint| hint.retry_after),
+            Some(retry_after),
             "{error:?}"
         );
-        assert_eq!(started.elapsed(), timeout);
+        assert_eq!(started.elapsed(), Duration::ZERO);
         assert_eq!(requests.calls(), 1);
 
         let redemptions =
@@ -3453,12 +3533,99 @@ mod tests {
         let error = poll_for_redemption_with(&redemptions, &TxHash::ZERO, &config)
             .await
             .unwrap_err();
-        assert!(
-            matches!(error, AlpacaTokenizationError::PollTimeout { .. }),
+        assert_eq!(
+            error.backpressure().and_then(|hint| hint.retry_after),
+            Some(retry_after),
             "{error:?}"
         );
+        assert_eq!(started.elapsed(), Duration::ZERO);
+        assert_eq!(redemptions.calls(), 1);
+    }
+
+    /// A deadline that comes after a backpressure wait but before the next
+    /// lookup is due ends both polls with that 429, not `PollTimeout`.
+    #[tokio::test(start_paused = true)]
+    async fn tokenization_polls_return_the_last_429_when_the_deadline_comes_after_its_wait() {
+        let retry_after = Duration::from_mins(1);
+        let timeout = Duration::from_mins(6);
+        let config = PollingConfig {
+            interval: Duration::from_mins(10),
+            ..fast_polling(timeout)
+        };
+        let throttled = move || AlpacaTokenizationError::ApiError {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            message: AlpacaApiErrorMessage::from_response(String::new()),
+            retry_after: Some(retry_after),
+        };
+
+        let requests = ScriptedLookups::requests(move |_| Err(throttled()));
+        let started = Instant::now();
+        let error = poll_request_until_complete_with(
+            &requests,
+            &tokenization_request_id("MOCK_REQ_ID"),
+            &config,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.to_string(), throttled().to_string());
+        assert_eq!(started.elapsed(), timeout);
+        assert_eq!(requests.calls(), 1);
+
+        let redemptions = ScriptedLookups::redemptions(move |_| Err(throttled()));
+        let started = Instant::now();
+        let error = poll_for_redemption_with(&redemptions, &TxHash::ZERO, &config)
+            .await
+            .unwrap_err();
+        assert_eq!(error.to_string(), throttled().to_string());
         assert_eq!(started.elapsed(), timeout);
         assert_eq!(redemptions.calls(), 1);
+    }
+
+    /// A service set to `BackpressurePolicy::Return` ends both polls on the
+    /// first 429, with its `Retry-After` hint, after one call to Alpaca.
+    #[tokio::test]
+    async fn service_polls_return_a_429_at_once_under_the_return_policy() {
+        for redemption in [false, true] {
+            let server = MockServer::start();
+            let throttled = server.mock(|when, then| {
+                when.method(GET).path(tokenization_requests_path());
+                then.status(429)
+                    .header("Retry-After", "30")
+                    .body("rate limited");
+            });
+            let service = AlpacaTokenizationService::new_with_client(
+                create_test_client(&server),
+                fast_polling(Duration::from_hours(1)),
+            )
+            .with_backpressure_policy(BackpressurePolicy::Return);
+
+            let error = tokio::time::timeout(Duration::from_secs(2), async {
+                if redemption {
+                    service.poll_for_redemption(&TxHash::ZERO).await
+                } else {
+                    service
+                        .poll_mint_until_complete(&tokenization_request_id("req_1"))
+                        .await
+                }
+            })
+            .await
+            .expect("the poll must return the 429 at once")
+            .unwrap_err();
+
+            assert!(
+                matches!(
+                    error,
+                    AlpacaTokenizationError::ApiError { status, .. }
+                        if status == StatusCode::TOO_MANY_REQUESTS
+                ),
+                "{error:?}"
+            );
+            assert_eq!(
+                error.backpressure().and_then(|hint| hint.retry_after),
+                Some(Duration::from_secs(30))
+            );
+            throttled.assert_calls(1);
+        }
     }
 
     /// A poll whose interval is longer than its timeout ends at the timeout,

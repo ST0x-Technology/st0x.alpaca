@@ -14,7 +14,7 @@ use super::auth::{AccountStatus, AlpacaAccountId, AlpacaBrokerApiCtx};
 use super::client::AlpacaBrokerApiClient;
 use super::journal::JournalResponse;
 use super::order::{
-    AlpacaLimitOrder, CONVERSION_POLL_INTERVAL, ConversionOrder, ConversionOrders,
+    AlpacaLimitOrder, ConversionOrder, ConversionOrders, ConversionPollDeadlines,
     CryptoOrderResponse, OrderSide, parse_limit_price,
 };
 use super::positions::{AccountFunds, Inventory};
@@ -24,6 +24,7 @@ use crate::broker::{
     IndicativeQuote, LatestQuote, LimitOrder, MarketOrder, MarketSession, MarketSessionStatus,
     OrderPlacement, OrderState, OrderStatus, Positive, RecoveredOrderPlacement, Symbol, Usd,
 };
+use crate::core::BackpressurePolicy;
 
 /// Response from the asset endpoint.
 ///
@@ -146,6 +147,7 @@ pub struct AlpacaBrokerApi {
     asset_cache_ttl: Duration,
     time_in_force: TimeInForce,
     account_number: Option<Arc<str>>,
+    conversion_backpressure: BackpressurePolicy,
 }
 
 impl Clone for AlpacaBrokerApi {
@@ -156,6 +158,7 @@ impl Clone for AlpacaBrokerApi {
             asset_cache_ttl: self.asset_cache_ttl,
             time_in_force: self.time_in_force,
             account_number: self.account_number.clone(),
+            conversion_backpressure: self.conversion_backpressure,
         }
     }
 }
@@ -167,6 +170,7 @@ impl std::fmt::Debug for AlpacaBrokerApi {
             .field("client", &self.client)
             .field("asset_cache_ttl", &self.asset_cache_ttl)
             .field("time_in_force", &self.time_in_force)
+            .field("conversion_backpressure", &self.conversion_backpressure)
             .finish_non_exhaustive()
     }
 }
@@ -203,7 +207,32 @@ impl AlpacaBrokerApi {
             asset_cache_ttl: ctx.asset_cache_ttl,
             time_in_force: ctx.time_in_force,
             account_number: account.account_number.map(Arc::from),
+            conversion_backpressure: BackpressurePolicy::default(),
         })
+    }
+
+    /// Sets what the conversion polls ([`Self::convert_usdc_usd`],
+    /// [`Self::poll_conversion_to_terminal`]) do with an order read
+    /// throttled by Alpaca (a 429, or a throttle relayed as one).
+    /// [`BackpressurePolicy::RetryInPlace`], the default, waits it out
+    /// inside the poll; [`BackpressurePolicy::Return`] ends the poll with it
+    /// at once, `Retry-After` hint included, leaving the placed order live
+    /// and uncancelled: the caller resumes it with
+    /// [`Self::poll_conversion_to_terminal`], and must not read that 429 as a
+    /// failed placement. No other call is affected.
+    ///
+    /// Each resume starts a fresh order deadline, so under steady throttling
+    /// no resume reaches the deadline cancel. A caller that sets `Return`
+    /// must track the order's original deadline and cancel the order itself
+    /// once it passes.
+    ///
+    /// The policy covers this client only. The public `*_with` poll
+    /// functions, which the gateway adapters in `crates/gateway-api` run,
+    /// always retry in place.
+    #[must_use]
+    pub fn with_backpressure_policy(mut self, policy: BackpressurePolicy) -> Self {
+        self.conversion_backpressure = policy;
+        self
     }
 
     /// Account number Alpaca reported when the account was verified at
@@ -657,21 +686,32 @@ impl AlpacaBrokerApi {
     ///
     /// # Errors
     ///
-    /// Returns the placement error, a crypto-order failure, or a conversion
+    /// Returns the placement error, a crypto-order failure, a conversion
     /// deadline error (`ConversionTimedOut`, `ConversionCancelNotSettled`,
-    /// `ConversionOrderNotFound`).
+    /// `ConversionOrderNotFound`), or, under [`BackpressurePolicy::Return`]
+    /// (see [`Self::with_backpressure_policy`]), the throttled read of the
+    /// placed order.
+    /// That 429 looks the same as a throttled placement and carries no order
+    /// id, so before resuming, the caller looks the order up with
+    /// [`Self::find_conversion_order`] by `client_order_id`: `None` means it
+    /// was never placed, and `Some` gives the id
+    /// [`Self::poll_conversion_to_terminal`] resumes.
     pub async fn convert_usdc_usd(
         &self,
         conversion: ConversionOrder,
         client_order_id: &ClientOrderId,
     ) -> Result<CryptoOrderResponse, AlpacaBrokerApiError> {
-        super::order::convert_usdc_usd_with(
+        super::order::place_and_poll_conversion(
             self,
             conversion,
             client_order_id,
-            CONVERSION_POLL_INTERVAL,
+            self.conversion_poll_deadlines(),
         )
         .await
+    }
+
+    fn conversion_poll_deadlines(&self) -> ConversionPollDeadlines {
+        ConversionPollDeadlines::PRODUCTION.with_backpressure(self.conversion_backpressure)
     }
 
     /// Places a USDC/USD conversion order and returns as soon as Alpaca
@@ -735,13 +775,18 @@ impl AlpacaBrokerApi {
     ///
     /// # Errors
     ///
-    /// Returns the HTTP/parse error or a conversion deadline error.
+    /// Returns the HTTP/parse error or a conversion deadline error; a
+    /// throttled read follows [`Self::with_backpressure_policy`].
     pub async fn poll_conversion_to_terminal(
         &self,
         order_id: Uuid,
     ) -> Result<CryptoOrderResponse, AlpacaBrokerApiError> {
-        super::order::poll_conversion_to_terminal_with(self, order_id, CONVERSION_POLL_INTERVAL)
-            .await
+        super::order::poll_crypto_order_to_terminal(
+            self,
+            order_id,
+            self.conversion_poll_deadlines(),
+        )
+        .await
     }
 
     /// Journal (transfer) equities from the configured account to a
@@ -3183,5 +3228,57 @@ mod tests {
                     if status == reqwest::StatusCode::SERVICE_UNAVAILABLE
             ));
         }
+    }
+
+    /// A client set to `BackpressurePolicy::Return` ends the conversion poll
+    /// on the first 429, with its `Retry-After` hint, after one read and no
+    /// cancel.
+    #[tokio::test]
+    async fn conversion_poll_returns_a_429_at_once_under_the_return_policy() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+        let account_mock = create_account_mock(&server);
+        let order_id = uuid::uuid!("2a3b4c5d-0000-4000-8000-000000000001");
+        let read_mock = server.mock(|when, then| {
+            when.method(GET).path(format!(
+                "/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders/{order_id}"
+            ));
+            then.status(429)
+                .header("Retry-After", "30")
+                .body("rate limited");
+        });
+        let cancel_mock = server.mock(|when, then| {
+            when.method(DELETE);
+            then.status(204);
+        });
+
+        let executor = AlpacaBrokerApi::try_from_ctx(ctx)
+            .await
+            .unwrap()
+            .with_backpressure_policy(BackpressurePolicy::Return);
+        account_mock.assert();
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(2),
+            executor.poll_conversion_to_terminal(order_id),
+        )
+        .await
+        .expect("the poll must return the 429 at once")
+        .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                AlpacaBrokerApiError::ApiError { status, .. }
+                    if status == reqwest::StatusCode::TOO_MANY_REQUESTS
+            ),
+            "{error:?}"
+        );
+        assert_eq!(
+            error.backpressure().and_then(|hint| hint.retry_after),
+            Some(Duration::from_secs(30))
+        );
+        read_mock.assert_calls(1);
+        cancel_mock.assert_calls(0);
     }
 }

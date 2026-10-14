@@ -100,6 +100,40 @@ pub(crate) fn next_poll_delay(scheduled: Duration, deadline: tokio::time::Instan
     scheduled.min(deadline.saturating_duration_since(tokio::time::Instant::now()))
 }
 
+/// The wait a poll that retries in place gives a backpressure error before
+/// its next read: the longer of `scheduled` and the `Retry-After` hint, the
+/// hint capped at [`MAX_RETRY_AFTER_HOLD`] so an unbounded server value
+/// cannot hold the poll to its deadline.
+#[cfg(feature = "broker")]
+pub(crate) fn capped_backpressure_wait(
+    backpressure: crate::core::Backpressure,
+    scheduled: Duration,
+) -> Duration {
+    backpressure.retry_after.map_or(scheduled, |hint| {
+        hint.min(MAX_RETRY_AFTER_HOLD).max(scheduled)
+    })
+}
+
+/// The wait before a poll reads again after a backpressure error, or `None`
+/// when the poll must end with that error now: under
+/// [`BackpressurePolicy::Return`](crate::core::BackpressurePolicy::Return),
+/// or when the [`capped_backpressure_wait`] would reach the poll `deadline`,
+/// so the caller sees the 429 and its hint rather than the poll's timeout.
+#[cfg(feature = "wallet")]
+pub(crate) fn backpressure_wait(
+    policy: crate::core::BackpressurePolicy,
+    backpressure: crate::core::Backpressure,
+    scheduled: Duration,
+    deadline: tokio::time::Instant,
+) -> Option<Duration> {
+    if policy == crate::core::BackpressurePolicy::Return {
+        return None;
+    }
+
+    let wait = capped_backpressure_wait(backpressure, scheduled);
+    (wait < deadline.saturating_duration_since(tokio::time::Instant::now())).then_some(wait)
+}
+
 /// The instant a poll started at `start` with `timeout` must stop reading:
 /// no read starts at or after it, and a read still running there is
 /// dropped. A timeout too long to add to an instant puts the deadline 30
@@ -230,5 +264,54 @@ mod tests {
         headers.insert(RETRY_AFTER, "not-a-value".parse().unwrap());
 
         assert_eq!(retry_after_from_response_headers(&headers), None);
+    }
+
+    #[cfg(feature = "broker")]
+    #[test]
+    fn capped_backpressure_wait_caps_the_hint_at_the_max_hold() {
+        use crate::core::Backpressure;
+
+        let scheduled = Duration::from_secs(1);
+        let hinted = |retry_after| Backpressure { retry_after };
+
+        assert_eq!(
+            capped_backpressure_wait(hinted(Some(Duration::from_secs(86_400))), scheduled),
+            MAX_RETRY_AFTER_HOLD
+        );
+        assert_eq!(
+            capped_backpressure_wait(hinted(Some(Duration::from_secs(30))), scheduled),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            capped_backpressure_wait(hinted(Some(Duration::ZERO)), scheduled),
+            scheduled
+        );
+        assert_eq!(capped_backpressure_wait(hinted(None), scheduled), scheduled);
+    }
+
+    #[cfg(feature = "wallet")]
+    #[tokio::test(start_paused = true)]
+    async fn backpressure_wait_ends_the_poll_under_return_or_when_the_wait_reaches_the_deadline() {
+        use crate::core::{Backpressure, BackpressurePolicy};
+
+        let hinted = Backpressure {
+            retry_after: Some(Duration::from_secs(86_400)),
+        };
+        let scheduled = Duration::from_secs(1);
+        let far = tokio::time::Instant::now() + Duration::from_hours(1);
+        let near = tokio::time::Instant::now() + MAX_RETRY_AFTER_HOLD;
+
+        assert_eq!(
+            backpressure_wait(BackpressurePolicy::RetryInPlace, hinted, scheduled, far),
+            Some(MAX_RETRY_AFTER_HOLD)
+        );
+        assert_eq!(
+            backpressure_wait(BackpressurePolicy::RetryInPlace, hinted, scheduled, near),
+            None
+        );
+        assert_eq!(
+            backpressure_wait(BackpressurePolicy::Return, hinted, scheduled, far),
+            None
+        );
     }
 }
