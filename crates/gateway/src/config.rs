@@ -39,7 +39,9 @@ pub enum ConfigError {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GatewayConfig {
-    /// The deployment this is: its name and its capability matrix.
+    /// The account this deployment serves: its capability matrix and its
+    /// name in audit records. `tiers` picks which part of it this deployment
+    /// runs.
     pub profile: Profile,
     /// Written into every audit record. A production deployment must sign
     /// with its Cloud KMS key.

@@ -30,7 +30,7 @@ One image serves both accounts. `profile` in config picks the account's operatio
 | `t0-humans` | `t0` | `["read", "write"]` | Operators through IAP | Its own KMS key and BrokerDash client, scoped to the operator operations |
 | `s01-alpaca` | `s01` | all three (the default) | The issuance runtime service account and operators | Its own KMS key and BrokerDash client |
 
-Audit records name the deployment by profile (`t0-alpaca` for both T0 deployments); their `tier` tells the bot and the operator deployment apart.
+Audit records name the account, not the deployment: their `deployment` field is `t0-alpaca` for both T0 deployments, kept stable for the audit stream, and the same name is in the `Gateway bound to its Alpaca account` startup log line. Their `tier` tells the bot and the operator deployment apart.
 
 ## Tiers and identity
 

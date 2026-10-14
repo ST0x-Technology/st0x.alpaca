@@ -44,19 +44,23 @@ impl Tier {
     }
 }
 
-/// Which deployment the gateway runs as. It names the deployment in audit
-/// records and picks the capability matrix, see [`crate::Operation::tiers`].
+/// Which account the gateway serves. It picks the capability matrix, see
+/// [`crate::Operation::tiers`], and names the account in audit records. One
+/// profile can run as more than one deployment (`t0-liqbot` and `t0-humans`
+/// both run `t0`); the audit record's `tier` tells them apart.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Profile {
-    /// The T0 trading account (`t0-alpaca`).
+    /// The T0 trading account.
     T0,
-    /// The S01 issuer account (`s01-alpaca`).
+    /// The S01 issuer account.
     S01,
 }
 
 impl Profile {
-    /// Deployment name used in audit records.
+    /// The account's name in the audit record's `deployment` field. It is
+    /// kept stable for the audit stream, so it stays `t0-alpaca` although
+    /// T0 runs as `t0-liqbot` and `t0-humans`.
     #[must_use]
     pub const fn deployment(self) -> &'static str {
         match self {

@@ -44,6 +44,8 @@ pub struct AuditEvent {
     pub request_id: Uuid,
     pub phase: AuditPhase,
     pub at: DateTime<Utc>,
+    /// The account's name ([`crate::Profile::deployment`]), the same for
+    /// every deployment of one account; `tier` tells them apart.
     pub deployment: String,
     pub environment: String,
     pub account_id: String,
