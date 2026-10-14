@@ -4766,7 +4766,7 @@ dependencies = [
 
 [[package]]
 name = "st0x-alpaca"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "alloy",
  "alloy-primitives",
