@@ -1,4 +1,4 @@
-//! The account bound Alpaca gateway (`t0-alpaca`, `s01-alpaca`).
+//! The account bound Alpaca gateway (`t0-liqbot`, `t0-humans`, `s01-alpaca`).
 //!
 //! Holds the deployment's Alpaca credential and serves the operation catalog
 //! of `st0x-alpaca-gateway-api` to bots (Google ID tokens) and operators
@@ -85,7 +85,11 @@ pub async fn run(
 ) -> Result<(), ServeError> {
     let verifiers = Verifiers::from_state(&state)?;
     let app = routes::app(state.clone(), &verifiers);
-    info!(address = %listener.local_addr()?, "Gateway listening");
+    info!(
+        address = %listener.local_addr()?,
+        tiers = ?state.config.tiers.iter().map(|tier| tier.as_str()).collect::<Vec<_>>(),
+        "Gateway listening"
+    );
 
     let signal = state.shutdown.clone();
     let server = axum::serve(listener, app).with_graceful_shutdown({

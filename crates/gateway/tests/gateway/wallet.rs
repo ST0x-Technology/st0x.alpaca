@@ -147,12 +147,15 @@ async fn bot_withdrawal_to_the_market_maker_wallet_is_applied_and_audited() {
 }
 
 /// The bot withdraws only to its pinned destinations, a human never to
-/// them, and nobody to an address whose whitelist entry awaits approval;
-/// each refusal comes before the transfer is sent.
+/// them, also on a deployment that does not serve the bot tier
+/// (`t0-humans`), and nobody to an address whose whitelist entry awaits
+/// approval; each refusal comes before the transfer is sent.
 #[tokio::test]
 async fn a_withdrawal_outside_the_caller_lane_is_refused_before_sending() {
-    for (tier, address, whitelist_status, status, reason) in [
+    let humans: &[Tier] = &[Tier::Read, Tier::Write];
+    for (served, tier, address, whitelist_status, status, reason) in [
         (
+            &Tier::ALL[..],
             Tier::Bot,
             OTHER_WALLET,
             "APPROVED",
@@ -160,6 +163,7 @@ async fn a_withdrawal_outside_the_caller_lane_is_refused_before_sending() {
             "destination_not_allowed",
         ),
         (
+            &Tier::ALL[..],
             Tier::Write,
             MARKET_MAKER_WALLET,
             "APPROVED",
@@ -167,6 +171,15 @@ async fn a_withdrawal_outside_the_caller_lane_is_refused_before_sending() {
             "destination_not_allowed",
         ),
         (
+            humans,
+            Tier::Write,
+            MARKET_MAKER_WALLET,
+            "APPROVED",
+            StatusCode::FORBIDDEN,
+            "destination_not_allowed",
+        ),
+        (
+            &Tier::ALL[..],
             Tier::Write,
             OTHER_WALLET,
             "PENDING",
@@ -174,7 +187,7 @@ async fn a_withdrawal_outside_the_caller_lane_is_refused_before_sending() {
             "address_not_whitelisted",
         ),
     ] {
-        let harness = Harness::start().await;
+        let harness = Harness::start_serving(served).await;
         harness.alpaca.mock(|when, then| {
             when.method(GET).path(whitelist_path());
             then.status(200)
