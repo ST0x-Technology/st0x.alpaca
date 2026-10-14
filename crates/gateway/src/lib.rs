@@ -87,7 +87,7 @@ pub async fn run(
     let app = routes::app(state.clone(), &verifiers);
     info!(
         address = %listener.local_addr()?,
-        tiers = ?state.config.tiers,
+        tiers = ?state.config.tiers.iter().map(|tier| tier.as_str()).collect::<Vec<_>>(),
         "Gateway listening"
     );
 

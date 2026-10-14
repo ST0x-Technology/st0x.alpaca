@@ -217,10 +217,9 @@ impl Harness {
                 .json_body(account_body(ACCOUNT_NUMBER));
         });
 
-        let text = config_text(&alpaca, profile, extra, tables);
         let text = match tiers {
-            Some(tiers) => serving_only(&text, tiers),
-            None => text,
+            Some(tiers) => serving_only(&alpaca, profile, extra, tables, tiers),
+            None => config_text(&alpaca, profile, extra, tables),
         };
         let config = GatewayConfig::parse(&text).unwrap();
         let audit = MemorySink::default();
@@ -313,13 +312,20 @@ pub async fn answer(app: Router, request: Request<Body>) -> (StatusCode, Value) 
     (status, value)
 }
 
-/// `text` serving only `tiers`: the `tiers` key added and the identity
-/// fields of every other tier removed.
-fn serving_only(text: &str, tiers: &[Tier]) -> String {
+/// [`config_text`] serving only `tiers`: the `tiers` key added and the
+/// identity fields of every other tier removed.
+fn serving_only(
+    alpaca: &MockServer,
+    profile: &str,
+    extra: &str,
+    tables: &str,
+    tiers: &[Tier],
+) -> String {
     let names: Vec<String> = tiers
         .iter()
-        .map(|tier| serde_json::to_string(tier).unwrap())
+        .map(|tier| format!("\"{}\"", tier.as_str()))
         .collect();
+    let extra = format!("{extra}\ntiers = [{}]", names.join(", "));
     let fields: [(Tier, &[&str]); 3] = [
         (Tier::Bot, &["bot_audience", "bot_principals"]),
         (Tier::Read, &["read_audience"]),
@@ -331,19 +337,15 @@ fn serving_only(text: &str, tiers: &[Tier]) -> String {
         .flat_map(|(_, names)| names.iter().copied())
         .collect();
 
-    let kept: Vec<&str> = text
+    config_text(alpaca, profile, &extra, tables)
         .lines()
         .filter(|line| {
             !unserved
                 .iter()
                 .any(|field| line.starts_with(&format!("{field} =")))
         })
-        .collect();
-    kept.join("\n").replacen(
-        "\n[broker]",
-        &format!("tiers = [{}]\n\n[broker]", names.join(", ")),
-        1,
-    )
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Waits until `mock` has received a request. The hit is counted before

@@ -28,6 +28,16 @@ impl Tier {
         }
     }
 
+    /// The tier's name in config and on the wire.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Bot => "bot",
+            Self::Read => "read",
+            Self::Write => "write",
+        }
+    }
+
     #[must_use]
     pub const fn is_human(self) -> bool {
         matches!(self, Self::Read | Self::Write)
@@ -52,6 +62,21 @@ impl Profile {
         match self {
             Self::T0 => "t0-alpaca",
             Self::S01 => "s01-alpaca",
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tier_names_are_their_wire_names() {
+        for tier in Tier::ALL {
+            assert_eq!(
+                serde_json::to_value(tier).unwrap(),
+                serde_json::json!(tier.as_str())
+            );
         }
     }
 }

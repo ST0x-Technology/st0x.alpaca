@@ -178,7 +178,9 @@ pub struct WalletConfig {
     /// The only addresses the bot tier may withdraw to. The write tier may
     /// withdraw to any approved whitelist entry except these. Empty means
     /// the bot's withdrawals answer `403 capability_disabled` while the
-    /// write tier's keep serving.
+    /// write tier's keep serving. A `t0` deployment that serves the write
+    /// tier but not the bot tier must still list them, since they are what
+    /// keeps its operators off the bot's destinations.
     #[serde(default)]
     pub bot_withdrawal_destinations: Vec<Address>,
     /// Travel Rule beneficiary the whitelist operations attach. Never taken
@@ -331,7 +333,11 @@ impl GatewayConfig {
     }
 
     /// Each served tier has its identity fields and each other tier has
-    /// none, so a field never sits in config for a tier nobody serves.
+    /// none, so a field never sits in config for a tier nobody serves. The
+    /// one exception is `wallet.bot_withdrawal_destinations`: where the
+    /// profile's bot tier withdraws, a deployment serving the write tier
+    /// without it must still list them, since they are its operators' deny
+    /// list.
     fn validate_tiers(&self) -> Result<(), ConfigError> {
         let invalid = |message: String| Err(ConfigError::Invalid(message));
 
@@ -344,12 +350,15 @@ impl GatewayConfig {
 
         let identity = &self.identity;
         for tier in Tier::ALL {
-            let name = tier_name(tier);
+            let name = tier.as_str();
             match (self.serves(tier), identity.audience(tier)) {
                 (true, None) => {
                     return invalid(format!(
                         "identity.{name}_audience is required when tiers lists {name}"
                     ));
+                }
+                (true, Some(audience)) if audience.trim().is_empty() => {
+                    return invalid(format!("identity.{name}_audience must not be blank"));
                 }
                 (false, Some(_)) => {
                     return invalid(format!(
@@ -365,9 +374,15 @@ impl GatewayConfig {
                     "identity.bot_principals is required when tiers lists bot".to_string(),
                 );
             }
-            (true, Some(principals)) if principals.is_empty() => {
+            (true, Some(principals))
+                if principals.is_empty()
+                    || principals
+                        .iter()
+                        .any(|principal| principal.trim().is_empty()) =>
+            {
                 return invalid(
-                    "identity.bot_principals must list at least one service account".to_string(),
+                    "identity.bot_principals must list at least one service account and no blank id"
+                        .to_string(),
                 );
             }
             (false, Some(_)) => {
@@ -385,6 +400,18 @@ impl GatewayConfig {
         if audiences.iter().collect::<HashSet<_>>().len() != audiences.len() {
             return invalid("the served tiers' audiences must differ".to_string());
         }
+
+        if Operation::WalletWithdraw.allows(self.profile, Tier::Bot)
+            && self.serves(Tier::Write)
+            && !self.serves(Tier::Bot)
+            && self.wallet.bot_withdrawal_destinations.is_empty()
+        {
+            return invalid(
+                "wallet.bot_withdrawal_destinations must list the bot's destinations when tiers \
+                 lists write but not bot: the write tier is refused them"
+                    .to_string(),
+            );
+        }
         Ok(())
     }
 
@@ -397,15 +424,6 @@ impl GatewayConfig {
     #[must_use]
     pub fn is_disabled(&self, operation: Operation) -> bool {
         self.disabled_operations.contains(&operation)
-    }
-}
-
-/// The name `tiers` and the identity fields use for `tier`.
-const fn tier_name(tier: Tier) -> &'static str {
-    match tier {
-        Tier::Bot => "bot",
-        Tier::Read => "read",
-        Tier::Write => "write",
     }
 }
 
@@ -558,6 +576,21 @@ mint_recipients = ["0x2222222222222222222222222222222222222222"]
                 format!("{bot_audience}bot_principals = []\n"),
                 "at least one service account",
             ),
+            (
+                "[\"bot\"]",
+                format!("{bot_audience}bot_principals = [\"111\", \" \"]\n"),
+                "no blank id",
+            ),
+            (
+                "[\"bot\"]",
+                format!("bot_audience = \" \"\n{bot_principals}"),
+                "bot_audience must not be blank",
+            ),
+            (
+                humans,
+                format!("{READ_FIELD}write_audience = \"\"\n"),
+                "write_audience must not be blank",
+            ),
             ("[]", String::new(), "at least one tier"),
             ("[\"bot\", \"bot\"]", BOT_FIELDS.to_string(), "twice"),
             (
@@ -575,6 +608,34 @@ mint_recipients = ["0x2222222222222222222222222222222222222222"]
 
         let error = GatewayConfig::parse(&serving("[\"admin\"]", "")).unwrap_err();
         assert!(matches!(error, ConfigError::Parse(_)), "{error}");
+    }
+
+    /// On `t0-humans` the bot's destinations are the write tier's deny
+    /// list, so dropping them would let an operator withdraw to them.
+    #[test]
+    fn a_t0_write_tier_without_the_bot_tier_needs_the_bots_destinations() {
+        let destinations =
+            "bot_withdrawal_destinations = [\"0x1111111111111111111111111111111111111111\"]";
+        let humans = serving(
+            "[\"read\", \"write\"]",
+            &format!("{READ_FIELD}{WRITE_FIELD}"),
+        );
+        assert!(humans.contains(destinations), "the sample's wallet changed");
+        let error =
+            GatewayConfig::parse(&humans.replace(destinations, "bot_withdrawal_destinations = []"))
+                .unwrap_err();
+        assert!(
+            matches!(&error, ConfigError::Invalid(message)
+                if message.contains("wallet.bot_withdrawal_destinations")),
+            "{error}"
+        );
+
+        let all_tiers = sample("").replace(destinations, "bot_withdrawal_destinations = []");
+        GatewayConfig::parse(&all_tiers).unwrap();
+        let s01 = humans
+            .replace(destinations, "bot_withdrawal_destinations = []")
+            .replace("profile = \"t0\"", "profile = \"s01\"");
+        GatewayConfig::parse(&s01).unwrap();
     }
 
     /// A config error is logged at startup and by `--validate-config`, so

@@ -75,8 +75,6 @@ expected_account_number = "<T0 account number>"
 tiers = ["bot"]
 # Operations switched off without a redeploy of the image (403 capability_disabled).
 disabled_operations = []
-# Per process, and a rollout runs two: half the human share of the credential's rate limit.
-human_budget_per_minute = 60
 
 [broker]
 # Keyless: Cloud KMS signs the private_key_jwt assertion with the runtime service account.
@@ -90,30 +88,36 @@ bot_audience = "<Cloud Run service URL>"
 bot_principals = ["<unique id of the liquidity runtime service account>"]
 
 [wallet]
-# Empty: the bot's wallet.withdraw answers 403 capability_disabled and the write tier's keeps serving; disabled_operations switches wallet.withdraw off on the write tier too.
+# The only addresses the bot may withdraw to. Empty: the bot's wallet.withdraw answers 403 capability_disabled.
 bot_withdrawal_destinations = ["<liquidity market maker wallet>"]
-travel_rule_beneficiary = "<beneficiary entity name>"
 
 [tokenization]
 # Empty: every tokenization operation answers 422 unsupported_network or 403 capability_disabled.
 networks = ["base"]
 # Empty: every mint answers 403 destination_not_allowed.
 mint_recipients = ["<liquidity bot wallet>"]
-
-# Empty: journals.create answers 403 capability_disabled.
-[journal.counterparties]
 ```
 
 The account id, the account number and every pinned address live in this reviewed file and nowhere else.
 
-The `t0-humans` config has the same shape with its own `[broker]` credential and these differences. It keeps the market maker wallet in `wallet.bot_withdrawal_destinations`, because the write tier never withdraws to those addresses, and `human_budget_per_minute` applies to it alone:
+The `t0-humans` config keeps the top level keys other than `tiers`, the `[broker]` table (with its own credential) and the `[tokenization]` table of the `t0-liqbot` config. Everything that only the read and write tiers use lives here:
 
 ```toml
 tiers = ["read", "write"]
+# Per process, and a rollout runs two: half the human share of the credential's rate limit.
+human_budget_per_minute = 60
 
 [identity]
 read_audience = "/projects/<number>/global/backendServices/<read backend id>"
 write_audience = "/projects/<number>/global/backendServices/<write backend id>"
+
+[wallet]
+# Every address the t0-liqbot config lists: an operator withdrawal to any of them is refused. Add a bot destination here before t0-liqbot, and remove one from t0-liqbot before here. Validation refuses an empty list here.
+bot_withdrawal_destinations = ["<liquidity market maker wallet>"]
+travel_rule_beneficiary = "<beneficiary entity name>"
+
+# Empty: journals.create answers 403 capability_disabled.
+[journal.counterparties]
 ```
 
 An `s01` config serves all three tiers, so it leaves `tiers` out and sets all four identity fields, with the S01 account and credential, the unique id of the issuance runtime service account in `bot_principals`, the issuer wallet in `tokenization.mint_recipients`, and an empty `wallet.bot_withdrawal_destinations` (the `s01` bot tier has no wallet operation). Only `s01` reads `[corporate_actions]`; both keys are optional:
@@ -201,7 +205,7 @@ Use the same controls in the production project, with the production account, th
 Min and max instances 1 does not make the gateway a single process. Cloud Run caps instances per revision, so the old and the new revision run side by side while traffic moves and while the old one finishes the requests it already admitted and their detached work; shutdown ends its open corporate action stream before draining connections so detached work gets the remaining grace period. A platform replacement of the instance overlaps two processes the same way. Each process keeps its own human budget. Its broker, wallet, each tokenization client, the three issuer clients, and corporate action stream client each keep an independent credential token cache, mint lock, and `Retry-After` hold, so a hold one client takes does not stop its siblings or any client in the other process. Together the two processes can admit twice `human_budget_per_minute` in one minute. Two rules keep the humans within their share of the credential's Alpaca rate limit:
 
 1. Set `human_budget_per_minute` to half the intended human share, so two processes together stay within it.
-2. Deploy every revision (a new digest, a new config version, a rollback) with no traffic, then move all traffic to it at once. A revision without traffic admits nothing, so the overlap lasts only while the old revision drains. Never split traffic between two revisions: both keep admitting for as long as the split lasts. A config roll runs the same two commands with `--update-secrets` in place of `--image`. A release that adds a required config field (as `profile` does) cannot start on the previous config, and the previous image refuses the new field, so roll it with `--image` and `--update-secrets` in the same command, and roll it back the same way to the previous digest and config version.
+2. Deploy every revision (a new digest, a new config version, a rollback) with no traffic, then move all traffic to it at once. A revision without traffic admits nothing, so the overlap lasts only while the old revision drains. Never split traffic between two revisions: both keep admitting for as long as the split lasts. A config roll runs the same two commands with `--update-secrets` in place of `--image`. A release whose configs the previous image cannot parse cannot be rolled in two steps: a new required field (as `profile` does) stops the new image on the previous config, and a new key (as `tiers` is, with the identity fields of the tiers a split config leaves out) stops the previous image on the new config. Roll such a release with `--image` and `--update-secrets` in the same command, and roll it back the same way to the previous digest and config version.
 
 ```bash
 gcloud run services update <service> --project <project> --region <region> --image <digest> --no-traffic
@@ -211,16 +215,16 @@ gcloud run services update-traffic <service> --project <project> --region <regio
 
 ## Rollback
 
-Both deployments roll back the same way.
+All three deployments roll back the same way. Every action below changes one deployment, its config or its service. To change the whole T0 account, apply it to both `t0-liqbot` and `t0-humans`. When the change moves `wallet.bot_withdrawal_destinations`, the `t0-humans` list must hold every `t0-liqbot` address at every moment: roll `t0-humans` first when a change adds an address, and `t0-liqbot` first, serving before `t0-humans` moves, when it removes one (a rollback that restores an older list included).
 
 | Problem | Action | Effect |
 | --- | --- | --- |
 | A bad gateway release | Redeploy the previous attested digest as in [Rollouts](#rollouts), with the previous config version when the release changed the config fields | Callers see the previous behavior; the `/v1` contract only ever adds operations and optional response fields |
-| One operation misbehaves | Add it to `disabled_operations`, publish the config, roll the revision | That operation answers `403 capability_disabled` on every tier; the rest keep serving |
-| The bot must stop withdrawing while operators keep withdrawing | Empty `wallet.bot_withdrawal_destinations`, publish the config, roll the revision | The bot's `wallet.withdraw` answers `403 capability_disabled`; operator withdrawals and every other bot operation keep serving |
+| One operation misbehaves | Add it to `disabled_operations`, publish the config, roll the revision. On T0, do it in both configs for an operation both serve, for example `wallet.withdraw` or `tokenization.mint` | That operation answers `403 capability_disabled` on that deployment's tiers; the rest keep serving |
+| The bot must stop withdrawing while operators keep withdrawing | Empty `wallet.bot_withdrawal_destinations` in the `t0-liqbot` config only, publish it, roll the revision. Never empty it in the `t0-humans` config: there it is the list operators are refused, and validation refuses an empty one | The bot's `wallet.withdraw` answers `403 capability_disabled`; operator withdrawals and every other bot operation keep serving |
 | A caller must lose access | Remove its `run.invoker` binding (bots) or group membership (humans) | Its requests stop at the platform |
-| All human access must stop | Remove the IAP service agent's `run.invoker` binding | Every human request stops; bots keep serving |
-| The gateway credential is suspect | Revoke its BrokerDash credential. While bots still call Alpaca directly, revoke their credentials too for a full account stop. To restore the gateway, register a new BrokerDash client against the existing KMS key's public half, replace `client_id` in config, validate and publish the config, then roll the revision. | Revocation stops only traffic signed with each revoked client id. The KMS key remains nonextractable and can sign for the replacement client. |
-| The gateway is unusable | No caller depends on the gateway yet: liquidity and issuance still call Alpaca directly with their own credential, so stopping or rolling back either deployment affects only human callers | Once a bot ships the `[alpaca] transport` switch (liquidity [RAI-1935](https://linear.app/makeitrain/issue/RAI-1935), issuance [RAI-1936](https://linear.app/makeitrain/issue/RAI-1936)), the rollback becomes: set it back to the direct transport. Its direct credential stays provisioned until that switch has been tested, and [RAI-1938](https://linear.app/makeitrain/issue/RAI-1938) removes it only after that |
+| All human access must stop | Remove the IAP service agent's `run.invoker` binding on `t0-humans` (and on `s01-alpaca` for S01) | Every human request stops; bots keep serving |
+| The gateway credential is suspect | Revoke the deployment's BrokerDash credential. `t0-liqbot` signs with the liquidity bot's own credential, so revoking it also stops the bot's direct Alpaca calls. While bots still call Alpaca directly, revoke their credentials too for a full account stop. To restore, register a new BrokerDash client against the existing KMS key's public half, replace `client_id` in the gateway config (for `t0-liqbot`, also in the liquidity config), validate and publish the config, then roll the revision. | Revocation stops only traffic signed with each revoked client id. The KMS key remains nonextractable and can sign for the replacement client. |
+| The gateway is unusable | No caller depends on the gateway yet: liquidity and issuance still call Alpaca directly with their own credential, so stopping or rolling back any deployment affects only human callers | Once a bot ships the `[alpaca] transport` switch (liquidity [RAI-1935](https://linear.app/makeitrain/issue/RAI-1935), issuance [RAI-1936](https://linear.app/makeitrain/issue/RAI-1936)), the rollback becomes: set it back to the direct transport. Its direct credential stays provisioned until that switch has been tested, and [RAI-1938](https://linear.app/makeitrain/issue/RAI-1938) removes it only after that |
 
 The gateway never undoes an Alpaca action by itself. Undoing an order, a conversion or a transfer is the caller's decision, through the same operations.
