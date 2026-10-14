@@ -1,4 +1,4 @@
-# Alpaca gateway (`t0-liqbot`, `t0-humans`, `s01-alpaca`)
+# Alpaca gateway (`t0-liqbot`, `t0-humans`, `s01-issuancebot`, `s01-humans`)
 
 `st0x-alpaca-gateway` holds one Alpaca account's credential and serves the operation catalog of `st0x-alpaca-gateway-api` to bots and operators. Every operation runs bounded `st0x-alpaca` calls against the account fixed in config; [docs/parity.md](parity.md#gateway-st0x-alpaca-gateway) lists the library methods each operation runs. No request names an account or an Alpaca URL, the gateway signs nothing onchain, and it keeps no state.
 
@@ -22,15 +22,16 @@ One image serves both accounts. `profile` in config picks the account's operatio
 
 `t0` serves none of the four issuer and stream operations on any tier.
 
-`tiers` in config picks which tiers a deployment serves, so one profile can run as more than one deployment, each with its own config and runtime service account. The T0 account runs two:
+`tiers` in config picks which tiers a deployment serves, so one profile can run as more than one deployment, each with its own config and runtime service account. Each account runs two:
 
 | Deployment | `profile` | `tiers` | Caller | Credential |
 | --- | --- | --- | --- | --- |
 | `t0-liqbot` | `t0` | `["bot"]` | The liquidity runtime service account | The liquidity bot's KMS key and BrokerDash client, with their current scopes until direct use ends (see the staging steps) |
 | `t0-humans` | `t0` | `["read", "write"]` | Operators through IAP | Its own KMS key and BrokerDash client, scoped to the operator operations |
-| `s01-alpaca` | `s01` | all three (the default) | The issuance runtime service account and operators | Its own KMS key and BrokerDash client |
+| `s01-issuancebot` | `s01` | `["bot"]` | The issuance runtime service account | The issuance bot's KMS key and BrokerDash client, with their current scopes until direct use ends (see the S01 deployment steps) |
+| `s01-humans` | `s01` | `["read", "write"]` | Operators through IAP | Its own KMS key and BrokerDash client, scoped to the operator operations |
 
-Audit records name the account, not the deployment: their `deployment` field is `t0-alpaca` for both T0 deployments, kept stable for the audit stream, and the same name is in the `Gateway bound to its Alpaca account` startup log line. Their `tier` tells the bot and the operator deployment apart.
+Audit records name the account, not the deployment: their `deployment` field is `t0-alpaca` for both T0 deployments and `s01-alpaca` for both S01 deployments, kept stable for the audit stream, and the same name is in the `Gateway bound to its Alpaca account` startup log line. Their `tier` tells the bot and the operator deployment apart.
 
 ## Tiers and identity
 
@@ -120,10 +121,15 @@ travel_rule_beneficiary = "<beneficiary entity name>"
 [journal.counterparties]
 ```
 
-An `s01` config serves all three tiers, so it leaves `tiers` out and sets all four identity fields, with the S01 account and credential, the unique id of the issuance runtime service account in `bot_principals`, the issuer wallet in `tokenization.mint_recipients`, and an empty `wallet.bot_withdrawal_destinations` (the `s01` bot tier has no wallet operation). Only `s01` reads `[corporate_actions]`; both keys are optional:
+The S01 account splits the same way. The `s01-issuancebot` config has the S01 account and the issuance bot's credential in `[broker]`, the unique id of the issuance runtime service account in `bot_principals`, and the `[corporate_actions]` table, whose keys are both optional. Its bot tier serves no wallet, tokenization or journal operation, so it needs no `[wallet]`, `[tokenization]` or `[journal.counterparties]`:
 
 ```toml
 profile = "s01"
+tiers = ["bot"]
+
+[identity]
+bot_audience = "<Cloud Run service URL>"
+bot_principals = ["<unique id of the issuance runtime service account>"]
 
 [corporate_actions]
 # Default: Alpaca's stream filtered to US cash and stock dividends. Any URL but HTTPS on stream.data.alpaca.markets fails startup.
@@ -131,6 +137,8 @@ stream_url = "https://stream.data.alpaca.markets/v1beta1/events/corporate-action
 # The relay ends after this many seconds without a chunk.
 idle_timeout_secs = 90
 ```
+
+The `s01-humans` config has the shape of the `t0-humans` config, with the S01 account and its own credential, and the issuer wallet in `tokenization.mint_recipients`. It leaves out `[corporate_actions]`: validation refuses that table in any config that does not serve `corporate_actions.stream`, every `t0` config included. Its `wallet.bot_withdrawal_destinations` may stay empty, since the `s01` bot tier never withdraws.
 
 ## Startup and health
 
@@ -189,16 +197,16 @@ Then, for each:
 
 Use the same controls in the production project, with the production account, the production liquidity bot's KMS key and BrokerDash credential for `t0-liqbot`, a separate production KMS key and BrokerDash credential for `t0-humans`, and their own service accounts, configs, and artifact digest. As in staging, the production liquidity bot's credential keeps its current scopes until [RAI-1938](https://linear.app/makeitrain/issue/RAI-1938) has removed direct use and operators have moved to `t0-humans`, and only then is trimmed to the bot tier's operations. Both production configs set `environment = "production"` and must use the Cloud KMS credential; validation refuses any other shape. Production `t0-liqbot` `bot_principals` lists only the production liquidity runtime service account.
 
-## Deploying `s01-alpaca`
+## Deploying the S01 gateways
 
-`s01.devops` deploys each environment into its own `<project>` in `<s01 org>` as one service serving all three tiers, with the T0 steps above and these differences:
+`s01.devops` deploys each environment into its own `<project>` in `<s01 org>` as two Cloud Run services from the same image, `s01-issuancebot` for the issuance runtime and `s01-humans` for operators, with the T0 steps above (`s01-issuancebot` as `t0-liqbot`, `s01-humans` as `t0-humans`) and these differences:
 
-1. The runtime service account is `<runtime service account>`, with its own KMS key `<KMS key>` and a BrokerDash credential scoped to the S01 account and the `s01` matrix. No T0 principal holds a role in either project.
-2. Cloud Run service `s01-alpaca` with an `s01` config.
-3. `run.invoker` for that environment's issuance runtime service account from its own `<project>` and the gateway project's IAP service agent only. Production `bot_principals` lists only the production issuance runtime service account.
-4. IAP on the read backend admits `<reader group>` and `<admin group>`; on the write backend only `<admin group>`.
+1. `s01-issuancebot` gets `signerVerifier` on the issuance bot's existing Alpaca KMS key and uses the issuance bot's existing BrokerDash credential with its current scopes. The issuance runtime still calls Alpaca directly with that credential, for its own mint and redemption work and for operators through its IAP route [`POST /ops/debug/recover/redemption/{issuer_request_id}`](https://github.com/ST0x-Technology/st0x.issuance/blob/816414650f44d57a7a805eaac280b450a372118b/src/admin.rs#L604-L629), so its scopes are trimmed to the bot tier's operations only after [RAI-1938](https://linear.app/makeitrain/issue/RAI-1938) has removed direct use.
+2. `s01-humans` gets a new KMS key and a new BrokerDash credential scoped to the S01 account and the operator operations of the `s01` matrix, with its runtime service account as the only `signerVerifier`. No T0 principal holds a role in either project.
+3. `run.invoker` on `s01-issuancebot` for that environment's issuance runtime service account from its own `<project>` only, and on `s01-humans` for the gateway project's IAP service agent only. Production `bot_principals` lists only the production issuance runtime service account.
+4. IAP on the `s01-humans` read backend admits `<reader group>` and `<admin group>`; on the write backend only `<admin group>`.
 5. The S01 org's CI builds and attests the image from the same st0x.alpaca tag into `<artifact registry>`, and the project sink and audit bucket are the S01 org's.
-6. To check a deployment, call `GET /bot/v1/issuer/requests/{tokenization_request_id}` for a known request from the issuance runtime with its ID token, and `<read-prefix>/v1/account/funds` from a laptop through the load balancer.
+6. To check the deployments, call `GET /bot/v1/issuer/requests/{tokenization_request_id}` on `s01-issuancebot` for a known request from the issuance runtime with its ID token, and `<read-prefix>/v1/account/funds` on `s01-humans` from a laptop through the load balancer.
 
 ## Rollouts
 
@@ -215,7 +223,7 @@ gcloud run services update-traffic <service> --project <project> --region <regio
 
 ## Rollback
 
-All three deployments roll back the same way. Every action below changes one deployment, its config or its service. To change the whole T0 account, apply it to both `t0-liqbot` and `t0-humans`. When the change moves `wallet.bot_withdrawal_destinations`, the `t0-humans` list must hold every `t0-liqbot` address at every moment, so every change (a rollback that restores an older list included) takes three rolls, each serving before the next starts: `t0-humans` to the old and new addresses together, then `t0-liqbot` to the new list, then `t0-humans` to the new list. A change that only adds an address skips the last roll, and one that only removes an address skips the first. Emptying the `t0-liqbot` list to stop the bot (the row below) is the one change that leaves `t0-humans` as it is: validation refuses an empty list there, and an extra address there only refuses operators an address the bot no longer uses.
+All four deployments roll back the same way. Every action below changes one deployment, its config or its service. To change a whole account, apply it to both of its deployments: `t0-liqbot` and `t0-humans`, or `s01-issuancebot` and `s01-humans`. When the change moves `wallet.bot_withdrawal_destinations`, the `t0-humans` list must hold every `t0-liqbot` address at every moment, so every change (a rollback that restores an older list included) takes three rolls, each serving before the next starts: `t0-humans` to the old and new addresses together, then `t0-liqbot` to the new list, then `t0-humans` to the new list. A change that only adds an address skips the last roll, and one that only removes an address skips the first. Emptying the `t0-liqbot` list to stop the bot (the row below) is the one change that leaves `t0-humans` as it is: validation refuses an empty list there, and an extra address there only refuses operators an address the bot no longer uses.
 
 | Problem | Action | Effect |
 | --- | --- | --- |
@@ -223,8 +231,8 @@ All three deployments roll back the same way. Every action below changes one dep
 | One operation misbehaves | Add it to `disabled_operations`, publish the config, roll the revision. On T0, do it in both configs for an operation both serve, for example `wallet.withdraw` or `tokenization.mint` | That operation answers `403 capability_disabled` on that deployment's tiers; the rest keep serving |
 | The bot must stop withdrawing while operators keep withdrawing | Empty `wallet.bot_withdrawal_destinations` in the `t0-liqbot` config only, publish it, roll the revision. Never empty it in the `t0-humans` config: there it is the list operators are refused, and validation refuses an empty one | The bot's `wallet.withdraw` answers `403 capability_disabled`; operator withdrawals and every other bot operation keep serving |
 | A caller must lose access | Remove its `run.invoker` binding (bots) or group membership (humans) | Its requests stop at the platform |
-| All human access must stop | Remove the IAP service agent's `run.invoker` binding on `t0-humans` (and on `s01-alpaca` for S01) | Every human request stops; bots keep serving |
-| The gateway credential is suspect | Revoke the deployment's BrokerDash credential. `t0-liqbot` signs with the liquidity bot's own credential, so revoking it also stops the bot's direct Alpaca calls. While bots still call Alpaca directly, revoke their credentials too for a full account stop. To restore, register a new BrokerDash client against the existing KMS key's public half, replace `client_id` in the gateway config (for `t0-liqbot`, also in the liquidity config), validate and publish the config, then roll the revision. | Revocation stops only traffic signed with each revoked client id. The KMS key remains nonextractable and can sign for the replacement client. |
+| All human access must stop | Remove the IAP service agent's `run.invoker` binding on `t0-humans` and `s01-humans` | Every human request stops; bots keep serving |
+| The gateway credential is suspect | Revoke the deployment's BrokerDash credential. `t0-liqbot` signs with the liquidity bot's own credential and `s01-issuancebot` with the issuance bot's, so revoking either also stops that bot's direct Alpaca calls. While bots still call Alpaca directly, revoke their credentials too for a full account stop. To restore, register a new BrokerDash client against the existing KMS key's public half, replace `client_id` in the gateway config (for `t0-liqbot` and `s01-issuancebot`, also in that bot's own config), validate and publish the config, then roll the revision. | Revocation stops only traffic signed with each revoked client id. The KMS key remains nonextractable and can sign for the replacement client. |
 | The gateway is unusable | No caller depends on the gateway yet: liquidity and issuance still call Alpaca directly with their own credential, so stopping or rolling back any deployment affects only human callers | Once a bot ships the `[alpaca] transport` switch (liquidity [RAI-1935](https://linear.app/makeitrain/issue/RAI-1935), issuance [RAI-1936](https://linear.app/makeitrain/issue/RAI-1936)), the rollback becomes: set it back to the direct transport. Its direct credential stays provisioned until that switch has been tested, and [RAI-1938](https://linear.app/makeitrain/issue/RAI-1938) removes it only after that |
 
 The gateway never undoes an Alpaca action by itself. Undoing an order, a conversion or a transfer is the caller's decision, through the same operations.

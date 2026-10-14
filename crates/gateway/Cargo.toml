@@ -2,7 +2,7 @@
 name = "st0x-alpaca-gateway"
 version = "0.1.0"
 edition = "2024"
-description = "Account bound Alpaca gateway service (t0-liqbot, t0-humans, s01-alpaca)"
+description = "Account bound Alpaca gateway service (t0-liqbot, t0-humans, s01-issuancebot, s01-humans)"
 license = "LicenseRef-Proprietary"
 publish = false
 

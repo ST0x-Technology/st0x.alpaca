@@ -132,16 +132,17 @@ impl IssuerClients {
                 ISSUER_REQUEST_TIMEOUT,
             )
         };
+        let stream = config.corporate_actions();
         Ok(Self {
             mint_callbacks: client()?,
             redemptions: client()?,
             requests: client()?,
             corporate_actions: CorporateActionStreamClient::new(
-                config.corporate_actions.endpoint()?,
+                stream.endpoint()?,
                 broker.auth.clone(),
                 &token_url,
                 ISSUER_CONNECT_TIMEOUT,
-                Duration::from_secs(config.corporate_actions.idle_timeout_secs),
+                Duration::from_secs(stream.idle_timeout_secs),
             )?,
         })
     }

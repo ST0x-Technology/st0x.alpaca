@@ -73,9 +73,9 @@ pub struct GatewayConfig {
     pub wallet: WalletConfig,
     #[serde(default)]
     pub tokenization: TokenizationConfig,
-    /// Read by the `s01` profile only.
-    #[serde(default)]
-    pub corporate_actions: CorporateActionsConfig,
+    /// Set only on a deployment that serves `corporate_actions.stream`;
+    /// absent means the defaults.
+    pub corporate_actions: Option<CorporateActionsConfig>,
 }
 
 fn default_tiers() -> Vec<Tier> {
@@ -322,14 +322,27 @@ impl GatewayConfig {
         check_jwks_url("google_jwks_url", &self.identity.google_jwks_url)?;
         check_jwks_url("iap_jwks_url", &self.identity.iap_jwks_url)?;
 
-        if self.profile == Profile::S01 {
-            let stream = &self.corporate_actions;
-            if let Err(error) = stream.endpoint() {
-                return invalid(&format!("corporate_actions.stream_url: {error}"));
+        let streams = self
+            .tiers
+            .iter()
+            .any(|&tier| Operation::CorporateActionsStream.allows(self.profile, tier));
+        match (&self.corporate_actions, streams) {
+            (Some(_), false) => {
+                return invalid(
+                    "[corporate_actions] is set but this deployment does not serve \
+                     corporate_actions.stream",
+                );
             }
-            if stream.idle_timeout_secs == 0 {
-                return invalid("corporate_actions.idle_timeout_secs must be above 0");
+            (_, true) => {
+                let stream = self.corporate_actions();
+                if let Err(error) = stream.endpoint() {
+                    return invalid(&format!("corporate_actions.stream_url: {error}"));
+                }
+                if stream.idle_timeout_secs == 0 {
+                    return invalid("corporate_actions.idle_timeout_secs must be above 0");
+                }
             }
+            (None, false) => {}
         }
         Ok(())
     }
@@ -421,6 +434,13 @@ impl GatewayConfig {
     #[must_use]
     pub fn serves(&self, tier: Tier) -> bool {
         self.tiers.contains(&tier)
+    }
+
+    /// The corporate action stream settings: the table, or its defaults
+    /// when the config leaves it out.
+    #[must_use]
+    pub fn corporate_actions(&self) -> CorporateActionsConfig {
+        self.corporate_actions.clone().unwrap_or_default()
     }
 
     #[must_use]
@@ -769,5 +789,29 @@ mint_recipients = ["0x2222222222222222222222222222222222222222"]
             );
         }
         GatewayConfig::parse(&s01("")).unwrap();
+    }
+
+    /// `[corporate_actions]` sits only in a config that serves the stream:
+    /// the `s01` bot tier. `s01-humans` and every `t0` config leave it out.
+    #[test]
+    fn the_stream_table_is_refused_where_the_stream_is_not_served() {
+        let s01 = |text: String| text.replace("profile = \"t0\"", "profile = \"s01\"");
+        let table = "\n[corporate_actions]\nidle_timeout_secs = 90\n";
+        let bot = s01(serving("[\"bot\"]", BOT_FIELDS));
+        let humans = s01(serving(
+            "[\"read\", \"write\"]",
+            &format!("{READ_FIELD}{WRITE_FIELD}"),
+        ));
+
+        GatewayConfig::parse(&format!("{bot}{table}")).unwrap();
+        GatewayConfig::parse(&bot).unwrap();
+        GatewayConfig::parse(&humans).unwrap();
+        for text in [format!("{humans}{table}"), format!("{}{table}", sample(""))] {
+            let error = GatewayConfig::parse(&text).unwrap_err();
+            assert!(
+                matches!(&error, ConfigError::Invalid(message) if message.contains("[corporate_actions]")),
+                "{error}"
+            );
+        }
     }
 }

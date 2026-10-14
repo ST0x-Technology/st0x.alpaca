@@ -104,8 +104,17 @@ pub fn account_body(account_number: &str) -> Value {
 /// Config text for a `profile` gateway pointed at the mock server, which
 /// serves Alpaca, the corporate action stream and, through [`serve_keys`],
 /// the signing keys. `extra` is spliced in as top level keys; `tables` is
-/// appended as extra tables.
+/// appended as extra tables. Only `s01` gets the `[corporate_actions]`
+/// table, since only its bot tier serves the stream.
 pub fn config_text(alpaca: &MockServer, profile: &str, extra: &str, tables: &str) -> String {
+    let stream = if profile == "s01" {
+        format!(
+            "[corporate_actions]\nstream_url = \"{}{STREAM_PATH}?type=cash_dividend_corporateaction_event&region=us\"",
+            alpaca.base_url()
+        )
+    } else {
+        String::new()
+    };
     format!(
         r#"
 profile = "{profile}"
@@ -139,8 +148,7 @@ mint_recipients = ["{BOT_WALLET}"]
 [journal.counterparties]
 issuer = "{JOURNAL_COUNTERPARTY}"
 
-[corporate_actions]
-stream_url = "{alpaca}{STREAM_PATH}?type=cash_dividend_corporateaction_event&region=us"
+{stream}
 {tables}
 "#,
         alpaca = alpaca.base_url(),
@@ -198,6 +206,11 @@ impl Harness {
     /// A `t0` gateway serving only `tiers`, with only their identity fields.
     pub async fn start_serving(tiers: &[Tier]) -> Self {
         Self::start_full("t0", "", "", None, Some(tiers)).await
+    }
+
+    /// An `s01` gateway serving only `tiers`, as [`Self::start_serving`].
+    pub async fn start_s01_serving(tiers: &[Tier]) -> Self {
+        Self::start_full("s01", "", "", None, Some(tiers)).await
     }
 
     async fn start_full(
@@ -312,8 +325,9 @@ pub async fn answer(app: Router, request: Request<Body>) -> (StatusCode, Value) 
     (status, value)
 }
 
-/// [`config_text`] serving only `tiers`: the `tiers` key added and the
-/// identity fields of every other tier removed.
+/// [`config_text`] serving only `tiers`: the `tiers` key added, and the
+/// identity fields of every other tier removed, with the
+/// `[corporate_actions]` table when the bot tier is not served.
 fn serving_only(
     alpaca: &MockServer,
     profile: &str,
@@ -327,7 +341,7 @@ fn serving_only(
         .collect();
     let extra = format!("{extra}\ntiers = [{}]", names.join(", "));
     let fields: [(Tier, &[&str]); 3] = [
-        (Tier::Bot, &["bot_audience", "bot_principals"]),
+        (Tier::Bot, &["bot_audience", "bot_principals", "stream_url"]),
         (Tier::Read, &["read_audience"]),
         (Tier::Write, &["write_audience"]),
     ];
@@ -336,13 +350,15 @@ fn serving_only(
         .filter(|(tier, _)| !tiers.contains(tier))
         .flat_map(|(_, names)| names.iter().copied())
         .collect();
+    let no_stream = !tiers.contains(&Tier::Bot);
 
     config_text(alpaca, profile, &extra, tables)
         .lines()
         .filter(|line| {
-            !unserved
-                .iter()
-                .any(|field| line.starts_with(&format!("{field} =")))
+            (!no_stream || *line != "[corporate_actions]")
+                && !unserved
+                    .iter()
+                    .any(|field| line.starts_with(&format!("{field} =")))
         })
         .collect::<Vec<_>>()
         .join("\n")

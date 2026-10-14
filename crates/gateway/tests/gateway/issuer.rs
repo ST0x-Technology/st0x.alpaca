@@ -534,6 +534,53 @@ async fn humans_cannot_reach_the_issuer_posts_nor_the_s01_bot_orders() {
     }
 }
 
+/// `s01-issuancebot` serves `issuer.request` to the bot only and
+/// `s01-humans` to the human tiers only; each answers `unknown_operation`
+/// on the tiers it does not serve, even to that tier's valid credential,
+/// and audits nothing for them.
+#[tokio::test]
+async fn each_s01_deployment_answers_the_issuer_request_read_only_on_its_tiers() {
+    let request = format!("/issuer/requests/{TOKENIZATION_REQUEST_ID}");
+    for (served, unserved) in [
+        (&[Tier::Bot][..], &[Tier::Read, Tier::Write][..]),
+        (&[Tier::Read, Tier::Write][..], &[Tier::Bot][..]),
+    ] {
+        let harness = Harness::start_s01_serving(served).await;
+        harness.alpaca.mock(|when, then| {
+            when.method(GET).path(format!(
+                "/v1/accounts/{ACCOUNT_ID}/tokenization/requests/{TOKENIZATION_REQUEST_ID}"
+            ));
+            then.status(404).body("not found");
+        });
+
+        for tier in unserved {
+            let (status, body) = harness.call(*tier, "GET", &request, None).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{tier:?}: {body}");
+            assert_eq!(body["code"], "unknown_operation", "{tier:?}");
+        }
+        if unserved.contains(&Tier::Bot) {
+            let (status, body) = harness
+                .call(
+                    Tier::Bot,
+                    "POST",
+                    "/issuer/mint-callbacks",
+                    Some(mint_callback_body()),
+                )
+                .await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+            assert_eq!(body["code"], "unknown_operation");
+        }
+        assert!(harness.audit_events().is_empty(), "{served:?}");
+
+        for tier in served {
+            let (status, body) = harness.call(*tier, "GET", &request, None).await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{tier:?}: {body}");
+            assert_eq!(body["reason"], "request_not_found", "{tier:?}");
+        }
+        assert_eq!(harness.audit_events().len(), served.len(), "{served:?}");
+    }
+}
+
 #[tokio::test]
 async fn a_t0_deployment_serves_none_of_the_issuer_routes() {
     let harness = Harness::start().await;
