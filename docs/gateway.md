@@ -26,7 +26,7 @@ One image serves both accounts. `profile` in config picks the account's operatio
 
 | Deployment | `profile` | `tiers` | Caller | Credential |
 | --- | --- | --- | --- | --- |
-| `t0-liqbot` | `t0` | `["bot"]` | The liquidity runtime service account | The liquidity bot's KMS key and BrokerDash client, scoped to the bot operations |
+| `t0-liqbot` | `t0` | `["bot"]` | The liquidity runtime service account | The liquidity bot's KMS key and BrokerDash client, with their current scopes until direct use ends (see the staging steps) |
 | `t0-humans` | `t0` | `["read", "write"]` | Operators through IAP | Its own KMS key and BrokerDash client, scoped to the operator operations |
 | `s01-alpaca` | `s01` | all three (the default) | The issuance runtime service account and operators | Its own KMS key and BrokerDash client |
 
@@ -164,7 +164,7 @@ The T0 account runs two Cloud Run services from the same image, each with its ow
 `t0-liqbot` needs:
 
 1. A dedicated runtime service account with `signerVerifier` on the liquidity bot's existing Cloud KMS key, and KMS Data Access audit logging enabled on that key. The liquidity runtime service account keeps its own `signerVerifier` while liquidity still calls Alpaca directly; [RAI-1938](https://linear.app/makeitrain/issue/RAI-1938) removes it once liquidity calls `t0-liqbot` ([RAI-1935](https://linear.app/makeitrain/issue/RAI-1935)).
-2. The liquidity bot's existing BrokerDash credential for that key, its scopes trimmed to the operations the bot tier serves.
+2. The liquidity bot's existing BrokerDash credential for that key, with its current scopes. The liquidity runtime and its operator CLI share this credential and still call Alpaca directly, including operations the bot tier does not serve (whitelist changes, journals, exact limit orders, overnight quotes). Trim its scopes to the operations the bot tier serves only after [RAI-1938](https://linear.app/makeitrain/issue/RAI-1938) has removed direct use and operators have moved to `t0-humans`; a trim before that makes those direct actions fail at Alpaca with a permission error.
 3. A Cloud Run service using the attested image digest, min and max instances 1, CPU always allocated, ingress all, request timeout 300 s, and a config with `tiers = ["bot"]` mounted from Secret Manager at `<config-mount-path>`.
 4. `run.invoker` for the staging liquidity runtime service account only. No load balancer and no IAP.
 
@@ -187,7 +187,7 @@ Then, for each:
 
 ## Deploying the T0 gateways to production
 
-Use the same controls in the production project, with the production account, the production liquidity bot's KMS key and BrokerDash credential for `t0-liqbot`, a separate production KMS key and BrokerDash credential for `t0-humans`, and their own service accounts, configs, and artifact digest. Both production configs set `environment = "production"` and must use the Cloud KMS credential; validation refuses any other shape. Production `t0-liqbot` `bot_principals` lists only the production liquidity runtime service account.
+Use the same controls in the production project, with the production account, the production liquidity bot's KMS key and BrokerDash credential for `t0-liqbot`, a separate production KMS key and BrokerDash credential for `t0-humans`, and their own service accounts, configs, and artifact digest. As in staging, the production liquidity bot's credential keeps its current scopes until [RAI-1938](https://linear.app/makeitrain/issue/RAI-1938) has removed direct use and operators have moved to `t0-humans`, and only then is trimmed to the bot tier's operations. Both production configs set `environment = "production"` and must use the Cloud KMS credential; validation refuses any other shape. Production `t0-liqbot` `bot_principals` lists only the production liquidity runtime service account.
 
 ## Deploying `s01-alpaca`
 
