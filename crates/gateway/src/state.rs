@@ -24,8 +24,8 @@ use st0x_alpaca::request_id::{self, SendGate, Traffic};
 use st0x_alpaca::tokenization::{AlpacaTokenizationError, AlpacaTokenizationService};
 use st0x_alpaca::wallet::{AlpacaWalletError, AlpacaWalletService};
 use st0x_alpaca_gateway_api::{
-    AuditEvent, AuditPhase, ErrorCode, ON_BEHALF_OF_HEADER, Operation, Outcome, Profile,
-    REQUEST_ID_HEADER, RejectionReason, Tier,
+    AuditEvent, AuditPhase, ErrorCode, ON_BEHALF_OF_HEADER, Operation, Outcome, REQUEST_ID_HEADER,
+    RejectionReason, Tier,
 };
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
@@ -106,43 +106,55 @@ pub enum StartupError {
     StreamClient(#[from] CorporateActionStreamBuildError),
 }
 
-/// The `s01` profile's clients. Mint callbacks, redemptions and request
-/// status reads each have their own issuer client, so a `Retry-After` hold
-/// on one (a human polling `issuer.request` included) does not stall the
-/// others.
+/// The `s01` issuer and stream clients. Each is built only when this
+/// deployment serves its operation, so `s01-humans` holds the `issuer.request`
+/// client alone and a `t0` deployment none. Mint callbacks, redemptions and
+/// request status reads each have their own issuer client, so a
+/// `Retry-After` hold on one (a human polling `issuer.request` included)
+/// does not stall the others.
 pub struct IssuerClients {
-    pub mint_callbacks: AlpacaClient,
-    pub redemptions: AlpacaClient,
-    pub requests: AlpacaClient,
-    pub corporate_actions: CorporateActionStreamClient,
+    pub mint_callbacks: Option<AlpacaClient>,
+    pub redemptions: Option<AlpacaClient>,
+    pub requests: Option<AlpacaClient>,
+    pub corporate_actions: Option<CorporateActionStreamClient>,
 }
 
 impl IssuerClients {
-    /// Builds the clients with the broker credential, account and token URL.
+    /// Builds the served clients with the broker credential, account and
+    /// token URL.
     fn new(config: &GatewayConfig) -> Result<Self, StartupError> {
         let broker = &config.broker;
         let token_url = broker.mode().token_url();
-        let client = || {
-            AlpacaClient::with_auth(
+        let client = |operation| -> Result<Option<AlpacaClient>, StartupError> {
+            if !config.serves_operation(operation) {
+                return Ok(None);
+            }
+            Ok(Some(AlpacaClient::with_auth(
                 broker.base_url(),
                 broker.account_id.to_string(),
                 broker.auth.clone(),
                 &token_url,
                 ISSUER_CONNECT_TIMEOUT,
                 ISSUER_REQUEST_TIMEOUT,
-            )
+            )?))
         };
-        Ok(Self {
-            mint_callbacks: client()?,
-            redemptions: client()?,
-            requests: client()?,
-            corporate_actions: CorporateActionStreamClient::new(
-                config.corporate_actions.endpoint()?,
+        let corporate_actions = if config.serves_operation(Operation::CorporateActionsStream) {
+            let stream = config.corporate_actions();
+            Some(CorporateActionStreamClient::new(
+                stream.endpoint()?,
                 broker.auth.clone(),
                 &token_url,
                 ISSUER_CONNECT_TIMEOUT,
-                Duration::from_secs(config.corporate_actions.idle_timeout_secs),
-            )?,
+                Duration::from_secs(stream.idle_timeout_secs),
+            )?)
+        } else {
+            None
+        };
+        Ok(Self {
+            mint_callbacks: client(Operation::IssuerMintCallback)?,
+            redemptions: client(Operation::IssuerRedeem)?,
+            requests: client(Operation::IssuerRequest)?,
+            corporate_actions,
         })
     }
 }
@@ -152,8 +164,8 @@ pub struct Inner {
     pub broker: AlpacaBrokerApi,
     pub wallet: AlpacaWalletService,
     pub tokenizers: HashMap<Network, AlpacaTokenizationService>,
-    /// Built for the `s01` profile only.
-    pub issuer_clients: Option<IssuerClients>,
+    /// Holds only the issuer and stream clients this deployment serves.
+    pub issuer_clients: IssuerClients,
     pub audit: Arc<dyn AuditSink>,
     pub budget: HumanBudget,
     /// Detached work; shutdown waits for it.
@@ -220,10 +232,7 @@ impl AppState {
             )?;
             tokenizers.insert(*network, service);
         }
-        let issuer_clients = match config.profile {
-            Profile::T0 => None,
-            Profile::S01 => Some(IssuerClients::new(&config)?),
-        };
+        let issuer_clients = IssuerClients::new(&config)?;
 
         info!(
             deployment = config.profile.deployment(),
@@ -288,17 +297,21 @@ impl AppState {
         })
     }
 
-    /// The `s01` clients, or a refusal on a profile without them.
+    /// The issuer or stream client `client` picks, or a refusal when this
+    /// deployment does not serve its operation. Unserved operations have no
+    /// route, so a handler only reaches the refusal through a bug.
     ///
     /// # Errors
     ///
-    /// Returns `403 capability_disabled` when the profile builds no issuer
-    /// clients.
-    pub fn issuer(&self) -> Result<&IssuerClients, Failure> {
-        self.issuer_clients.as_ref().ok_or_else(|| {
+    /// Returns `403 capability_disabled` when the client was not built.
+    pub fn issuer<'a, T>(
+        &'a self,
+        client: impl FnOnce(&'a IssuerClients) -> Option<&'a T>,
+    ) -> Result<&'a T, Failure> {
+        client(&self.issuer_clients).ok_or_else(|| {
             Failure::new(
                 ErrorCode::CapabilityDisabled,
-                "this deployment holds no issuer clients",
+                "this deployment holds no client for this operation",
             )
         })
     }

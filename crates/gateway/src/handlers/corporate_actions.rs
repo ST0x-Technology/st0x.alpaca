@@ -64,8 +64,7 @@ async fn stream(
                 .map_err(|error| Failure::invalid(error.to_string()))?;
             let shutdown = open_state.shutdown.clone();
             let response = open_state
-                .issuer()?
-                .corporate_actions
+                .issuer(|clients| clients.corporate_actions.as_ref())?
                 .connect_raw(&replay)
                 .await
                 .map_err(|error| corporate_actions(&error))?;
