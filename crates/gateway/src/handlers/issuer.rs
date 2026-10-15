@@ -33,8 +33,7 @@ async fn mint_callback(
         .run(call, intent, move |state, _| async move {
             let request_id = request.tokenization_request_id.clone();
             state
-                .issuer()?
-                .mint_callbacks
+                .issuer(|clients| clients.mint_callbacks.as_ref())?
                 .send_mint_callback_reporting(request.into())
                 .await
                 .map(|()| Done::new((), &request_id))
@@ -58,8 +57,7 @@ async fn redeem(
     state
         .run(call, intent, move |state, _| async move {
             let redeemed = state
-                .issuer()?
-                .redemptions
+                .issuer(|clients| clients.redemptions.as_ref())?
                 .call_redeem_endpoint_reporting(request.into())
                 .await
                 .map_err(|failure| issuer_call(&failure))?;
@@ -81,8 +79,7 @@ async fn request(
     state
         .read(call, intent, |state| async move {
             state
-                .issuer()?
-                .requests
+                .issuer(|clients| clients.requests.as_ref())?
                 .poll_request_status_reporting(&request_id)
                 .await
                 .map_err(|failure| issuer_call(&failure))

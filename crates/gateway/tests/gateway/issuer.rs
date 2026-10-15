@@ -537,7 +537,8 @@ async fn humans_cannot_reach_the_issuer_posts_nor_the_s01_bot_orders() {
 /// `s01-issuancebot` serves `issuer.request` to the bot only and
 /// `s01-humans` to the human tiers only; each answers `unknown_operation`
 /// on the tiers it does not serve, even to that tier's valid credential,
-/// and audits nothing for them.
+/// and audits nothing for them. `s01-humans` builds the `issuer.request`
+/// client alone, with no mint callback, redemption or stream client.
 #[tokio::test]
 async fn each_s01_deployment_answers_the_issuer_request_read_only_on_its_tiers() {
     let request = format!("/issuer/requests/{TOKENIZATION_REQUEST_ID}");
@@ -546,6 +547,18 @@ async fn each_s01_deployment_answers_the_issuer_request_read_only_on_its_tiers()
         (&[Tier::Read, Tier::Write][..], &[Tier::Bot][..]),
     ] {
         let harness = Harness::start_s01_serving(served).await;
+        let clients = &harness.state.issuer_clients;
+        let bot = served.contains(&Tier::Bot);
+        assert!(clients.requests.is_some(), "{served:?}");
+        assert_eq!(
+            [
+                clients.mint_callbacks.is_some(),
+                clients.redemptions.is_some(),
+                clients.corporate_actions.is_some(),
+            ],
+            [bot; 3],
+            "{served:?}"
+        );
         harness.alpaca.mock(|when, then| {
             when.method(GET).path(format!(
                 "/v1/accounts/{ACCOUNT_ID}/tokenization/requests/{TOKENIZATION_REQUEST_ID}"

@@ -121,7 +121,7 @@ travel_rule_beneficiary = "<beneficiary entity name>"
 [journal.counterparties]
 ```
 
-The S01 account splits the same way. The `s01-issuancebot` config has the S01 account and the issuance bot's credential in `[broker]`, the unique id of the issuance runtime service account in `bot_principals`, and the `[corporate_actions]` table, whose keys are both optional. Its bot tier serves no wallet, tokenization or journal operation, so it needs no `[wallet]`, `[tokenization]` or `[journal.counterparties]`:
+The S01 account splits the same way. The `s01-issuancebot` config keeps the top level keys `environment`, `listen`, `expected_account_number` and `disabled_operations` of the `t0-liqbot` config, with the S01 account number, and its `[broker]` table, with the S01 account and the issuance bot's credential. Its bot tier serves no wallet, tokenization or journal operation, so it needs no `[wallet]`, `[tokenization]` or `[journal.counterparties]`. Everything else it sets is here, the `[corporate_actions]` keys both optional:
 
 ```toml
 profile = "s01"

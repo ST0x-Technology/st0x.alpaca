@@ -322,10 +322,7 @@ impl GatewayConfig {
         check_jwks_url("google_jwks_url", &self.identity.google_jwks_url)?;
         check_jwks_url("iap_jwks_url", &self.identity.iap_jwks_url)?;
 
-        let streams = self
-            .tiers
-            .iter()
-            .any(|&tier| Operation::CorporateActionsStream.allows(self.profile, tier));
+        let streams = self.serves_operation(Operation::CorporateActionsStream);
         match (&self.corporate_actions, streams) {
             (Some(_), false) => {
                 return invalid(
@@ -434,6 +431,14 @@ impl GatewayConfig {
     #[must_use]
     pub fn serves(&self, tier: Tier) -> bool {
         self.tiers.contains(&tier)
+    }
+
+    /// Whether any tier this deployment serves mounts `operation`.
+    #[must_use]
+    pub fn serves_operation(&self, operation: Operation) -> bool {
+        self.tiers
+            .iter()
+            .any(|&tier| operation.allows(self.profile, tier))
     }
 
     /// The corporate action stream settings: the table, or its defaults
